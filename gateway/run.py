@@ -4626,7 +4626,10 @@ class GatewayRunner:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        TERMINAL_KINDS = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            "human_review_requested", "approved", "rejected",
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -4843,6 +4846,36 @@ class GatewayRunner:
                             msg = (
                                 f"⏱ {tag}Kanban {sub['task_id']} timed out "
                                 f"(max_runtime={limit}s); will retry"
+                            )
+                        elif kind == "human_review_requested":
+                            note = ""
+                            if ev.payload and ev.payload.get("reason"):
+                                note = (
+                                    f": {str(ev.payload['reason'])[:NOTIFY_BLOCKED_REASON_MAX]}"
+                                )
+                            msg = (
+                                f"⏳ {tag}Kanban {sub['task_id']} ready for "
+                                f"your review — {title}{note}"
+                            )
+                        elif kind == "approved":
+                            note = ""
+                            if ev.payload and ev.payload.get("reason"):
+                                note = (
+                                    f": {str(ev.payload['reason'])[:NOTIFY_BLOCKED_REASON_MAX]}"
+                                )
+                            msg = (
+                                f"✅ {tag}Kanban {sub['task_id']} approved "
+                                f"— {title}{note}"
+                            )
+                        elif kind == "rejected":
+                            note = ""
+                            if ev.payload and ev.payload.get("reason"):
+                                note = (
+                                    f"\n{str(ev.payload['reason'])[:NOTIFY_BLOCKED_REASON_MAX]}"
+                                )
+                            msg = (
+                                f"↩ {tag}Kanban {sub['task_id']} rejected "
+                                f"— back to ready{note}"
                             )
                         else:
                             continue
