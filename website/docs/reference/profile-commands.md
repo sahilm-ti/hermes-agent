@@ -85,7 +85,8 @@ Creates a new profile.
 | `--clone-from <profile>` | Clone config/skills/SOUL from a specific profile instead of the current one. Implies `--clone` unless paired with `--clone-all`. |
 | `--no-alias` | Skip wrapper script creation. |
 | `--description "<text>"` | One- or two-sentence description of what this profile is good at. Used by the kanban orchestrator to route tasks based on role instead of profile name alone. Skip and add later via `hermes profile describe`. Persisted in `<profile_dir>/profile.yaml`. |
-| `--no-skills` | Create an **empty** profile with zero bundled skills enabled. Writes a `.no-bundled-skills` marker into the profile so future `hermes update` runs won't re-seed the bundled set, and refuses to combine with `--clone`, `--clone-from`, or `--clone-all` (which would copy skills in anyway). Useful for narrow orchestrator profiles or sandbox profiles that should not inherit the full skill catalog. To toggle this on an already-created profile (including the default `~/.hermes`), use `hermes skills opt-out` / `hermes skills opt-in`. |
+| `--no-skills` | **(Default since v2.)** Create a profile with an empty `skills/` directory; skills are inherited from the canonical root tree (`~/.hermes/skills/`) via `skills.external_dirs`. Writes a `.no-bundled-skills` marker so future `hermes update` runs and gateway start don't re-seed bundled skills. Refuses to combine with `--clone` / `--clone-from` / `--clone-all` (which would copy skills in anyway). To toggle this on an already-created profile (including the default `~/.hermes`), use `hermes skills opt-out` / `hermes skills opt-in`. |
+| `--with-bundled-skills` | Opt back into the pre-v2 behavior: bootstrap a full per-profile copy of the bundled skills tree. Use this only when you want a writeable profile-local `skills/` dir (e.g. for agent-modified skills that should stay private to one profile). Mutually exclusive with `--no-skills` and the clone flags. |
 
 Creating a profile does **not** make that profile directory the default project/workspace directory for terminal commands. If you want a profile to start in a specific project, set `terminal.cwd` in that profile's `config.yaml`.
 
@@ -165,6 +166,48 @@ hermes profile delete mybot --yes
 :::warning
 This permanently deletes the profile's entire directory including all config, memories, sessions, and skills. Cannot delete the currently active profile.
 :::
+
+## `hermes profile prune-skills`
+
+```bash
+hermes profile prune-skills <name> [options]
+```
+
+Move stale duplicate skill copies out of a profile's `skills/` directory.
+Used to clean up profiles created before the v2 root-canonical migration
+that already have per-profile bundled-skill copies drifting out of sync
+with `~/.hermes/skills/`.
+
+| Argument / Option | Description |
+|-------------------|-------------|
+| `<name>` | Profile to prune. The default profile (`~/.hermes`) is rejected — it IS the canonical source. |
+| `--backup <path>` | Destination for moved skill directories. Defaults to `~/.hermes/_backups/profile-prune-<utc-iso>/<profile>/`. |
+| `--dry-run` | Report what would happen without touching the filesystem. |
+| `--force` | Also prune skills whose profile copy is **newer** than the root copy (i.e. the user has edited the profile copy). Default behavior keeps user edits. |
+
+For each `SKILL.md` under `<profile>/skills/`, the command compares against `~/.hermes/skills/<rel>/SKILL.md`:
+
+- **same content** → safe to prune; the skill directory is moved to the backup location.
+- **profile copy is newer** → kept by default (user edited); pass `--force` to prune anyway.
+- **absent from root** → kept (profile-local skill).
+
+After a non-dry-run prune with one or more skills moved, the command writes the `.no-bundled-skills` marker and adds `~/.hermes/skills` to the profile's `skills.external_dirs` so future syncs don't recreate the drift.
+
+**Examples:**
+
+```bash
+# Preview what would be pruned
+hermes profile prune-skills coder --dry-run
+
+# Move stale duplicates to the default backup location
+hermes profile prune-skills coder
+
+# Also prune user-edited copies (the user's changes survive in the backup)
+hermes profile prune-skills coder --force
+
+# Custom backup location
+hermes profile prune-skills coder --backup ~/profile-backups/coder-prune
+```
 
 ## `hermes profile show`
 
