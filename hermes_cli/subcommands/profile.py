@@ -200,4 +200,31 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
     )
     profile_info.add_argument("profile_name", help="Profile to inspect")
 
+    profile_prune_skills = profile_subparsers.add_parser(
+        "prune-skills",
+        help="Move stale duplicate skill copies out of a profile's skills/ "
+             "directory (root tree wins). Adds .no-bundled-skills marker so "
+             "future syncs don't recreate the drift.",
+    )
+    profile_prune_skills.add_argument(
+        "profile_name", help="Profile to prune"
+    )
+    profile_prune_skills.add_argument(
+        "--backup",
+        default=None,
+        help="Backup directory for moved skills. Defaults to "
+             "~/.hermes/_backups/profile-prune-<utc-iso>/<profile>/",
+    )
+    profile_prune_skills.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would happen without touching the filesystem.",
+    )
+    profile_prune_skills.add_argument(
+        "--force",
+        action="store_true",
+        help="Also prune skills whose profile copy is NEWER than the root "
+             "(by default user-edited copies are kept).",
+    )
+
     profile_parser.set_defaults(func=cmd_profile)
