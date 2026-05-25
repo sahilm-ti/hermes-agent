@@ -320,6 +320,61 @@ skills:
 
 Paths support `~` expansion and `${VAR}` environment variable substitution.
 
+### Profile-skills model (root-canonical)
+
+Since v2 of the profile-skills migration, **named profiles do not get
+per-profile bundled-skill copies by default**. The canonical source of truth
+is `~/.hermes/skills/`. When you run `hermes profile create <name>`, the
+new profile is created with:
+
+- an **empty** `skills/` directory,
+- a `.no-bundled-skills` marker at the profile root that tells
+  `hermes update` and gateway start to skip re-seeding bundled skills, and
+- a `skills.external_dirs` stanza in the profile's `config.yaml` pointing
+  at `~/.hermes/skills`.
+
+The result: every profile sees the same set of bundled and user-created
+skills (from the root tree), and edits to a skill in the root tree
+propagate to every profile automatically. No drift, no duplicate-skill
+collisions in `skill_view`.
+
+**Per-profile `skills/` directories exist only for skills truly local to
+one profile** — e.g. a customer-private skill that should not appear
+elsewhere. Drop the SKILL.md into the profile's `skills/` directory
+manually; nothing seeds it there.
+
+**Opt out of the new default** with `--with-bundled-skills`:
+
+```bash
+hermes profile create coder --with-bundled-skills   # old per-profile-copy behavior
+```
+
+Use this when you want an isolated, writeable `skills/` dir for a profile
+(e.g. agent-modified skills that should not be shared with other
+profiles).
+
+**Migrate an existing profile** that already has stale duplicate copies
+(common after a sequence of pre-v2 `hermes update` runs) with
+`hermes profile prune-skills`:
+
+```bash
+hermes profile prune-skills coder              # dry-defaults to actual move
+hermes profile prune-skills coder --dry-run    # show what would happen
+hermes profile prune-skills coder --force      # also prune user-modified copies (keeps backup)
+```
+
+The command compares every `SKILL.md` under `<profile>/skills/` against
+`~/.hermes/skills/<rel>/SKILL.md`:
+
+- **same content** → safe to prune; the directory is moved to
+  `~/.hermes/_backups/profile-prune-<utc-iso>/<profile>/<rel>/`.
+- **profile copy is newer** (user edited) → kept by default; pass
+  `--force` to prune those too.
+- **absent from root** → kept (profile-local skill).
+
+After pruning, the marker file and `external_dirs` stanza are written so
+future syncs don't recreate the drift.
+
 ### How it works
 
 - **Create locally, update in place**: New agent-created skills are written to `~/.hermes/skills/`. Existing skills are modified where they are found, including skills under `external_dirs`, when the agent uses `skill_manage` actions such as `patch`, `edit`, `write_file`, `remove_file`, or `delete`.
