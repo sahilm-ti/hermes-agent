@@ -4959,3 +4959,77 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+# Skill liveness check (collision-resolution regression)
+# ---------------------------------------------------------------------------
+
+
+class TestKanbanWorkerSkillAvailable:
+    """Regression coverage for ``_kanban_worker_skill_available``.
+
+    The bare check used to look only at ``<home>/skills`` (canonical
+    bundled path + bounded rglob). That missed two real-world cases that
+    crashed worker spawn:
+
+      1. The skill lives under an ``external_dirs`` entry (the
+         ``braintrusteng`` profile pattern — every profile points at
+         ``~/.hermes/skills`` instead of duplicating the tree).
+      2. A stale per-profile copy collides with the external canonical
+         copy and the bare loader bails out as "ambiguous". This is now
+         resolved deterministically by ``skill_view`` (local wins, WARN
+         logged), so this helper must return True in that case too.
+
+    The helper now delegates to ``_resolve_skill_under_home``, which
+    walks the same dir set (``<home>/skills`` + ``skills.external_dirs``
+    from ``<home>/config.yaml``) as the spawned worker.
+    """
+
+    def _write_skill(self, root: Path, *, category: str, body: str = "stub") -> Path:
+        skill_dir = root / category / "kanban-worker"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text(
+            f"---\nname: kanban-worker\ndescription: stub\n---\n\n{body}\n",
+            encoding="utf-8",
+        )
+        return skill_md
+
+    def test_returns_true_when_skill_in_local_skills_dir(self, tmp_path):
+        home = tmp_path / ".hermes"
+        (home / "skills").mkdir(parents=True)
+        self._write_skill(home / "skills", category="devops")
+        assert kb._kanban_worker_skill_available(str(home)) is True
+
+    def test_returns_false_when_no_skill_anywhere(self, tmp_path):
+        home = tmp_path / ".hermes"
+        (home / "skills").mkdir(parents=True)
+        assert kb._kanban_worker_skill_available(str(home)) is False
+
+    def test_returns_true_when_skill_only_in_external_dir(self, tmp_path):
+        """Profile-with-external-dirs pattern: the profile's own
+        ``skills/`` is empty, but ``skills.external_dirs`` points at a
+        shared root that hosts the skill. The helper must see it."""
+        home = tmp_path / ".hermes"
+        (home / "skills").mkdir(parents=True)
+        shared = tmp_path / "shared-skills"
+        shared.mkdir()
+        self._write_skill(shared, category="devops")
+        (home / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {shared}\n", encoding="utf-8",
+        )
+        assert kb._kanban_worker_skill_available(str(home)) is True
+
+    def test_returns_true_when_local_and_external_collide(self, tmp_path):
+        """Today's incident shape: stale per-profile copy (v2.0.0) +
+        canonical external copy (v2.2.0). The bare loader resolves the
+        collision deterministically; the helper must report True."""
+        home = tmp_path / ".hermes"
+        (home / "skills").mkdir(parents=True)
+        shared = tmp_path / "shared-skills"
+        shared.mkdir()
+        self._write_skill(home / "skills", category="devops", body="STALE V2.0.0")
+        self._write_skill(shared, category="devops", body="CANONICAL V2.2.0")
+        (home / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {shared}\n", encoding="utf-8",
+        )
+        assert kb._kanban_worker_skill_available(str(home)) is True
