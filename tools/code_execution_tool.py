@@ -1834,7 +1834,13 @@ def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "") -> str:
         expanded = os.path.expanduser(raw)
         if os.path.isdir(expanded):
             return expanded
-    here = os.getcwd()
+    # Defensive: os.getcwd() raises FileNotFoundError when the worker's
+    # cwd has been deleted out from under it (observed in kanban-worker
+    # scratch-workspace race). Fall through to staging_dir in that case.
+    try:
+        here = os.getcwd()
+    except (FileNotFoundError, OSError):
+        return staging_dir
     if os.path.isdir(here):
         return here
     return staging_dir
