@@ -5264,24 +5264,29 @@ def dispatch_once(
         # consecutive_crashes diagnostic in May 2026). Auto-block with a
         # precise diagnostic so the operator can fix the missing skill
         # (install it, or add the source dir to skills.external_dirs).
-        try:
-            from hermes_cli.profiles import resolve_profile_env as _resolve_profile_env
-            _worker_home = _resolve_profile_env(claimed.assignee) if claimed.assignee else None
-        except Exception:
-            _worker_home = None
-        _missing_skills = _validate_task_skills(claimed, _worker_home)
-        if _missing_skills:
-            _reason = (
-                f"missing skills under HERMES_HOME={_worker_home or '<default>'}: "
-                f"{', '.join(_missing_skills)}. Install them or add their source "
-                f"dir to skills.external_dirs in the profile's config.yaml."
-            )
+        #
+        # Skipped when an injected spawn_fn is provided: tests stub the
+        # spawn out, so the CLI never runs, so the skill check is a
+        # spurious failure path.
+        if spawn_fn is None:
             try:
-                block_task(conn, claimed.id, reason=_reason)
+                from hermes_cli.profiles import resolve_profile_env as _resolve_profile_env
+                _worker_home = _resolve_profile_env(claimed.assignee) if claimed.assignee else None
             except Exception:
-                pass
-            result.auto_blocked.append(claimed.id)
-            continue
+                _worker_home = None
+            _missing_skills = _validate_task_skills(claimed, _worker_home)
+            if _missing_skills:
+                _reason = (
+                    f"missing skills under HERMES_HOME={_worker_home or '<default>'}: "
+                    f"{', '.join(_missing_skills)}. Install them or add their source "
+                    f"dir to skills.external_dirs in the profile's config.yaml."
+                )
+                try:
+                    block_task(conn, claimed.id, reason=_reason)
+                except Exception:
+                    pass
+                result.auto_blocked.append(claimed.id)
+                continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
@@ -5367,26 +5372,26 @@ def dispatch_once(
         # and sdlc-review (review logic: AC verification, merge, etc.).
         claimed.skills = ["sdlc-review"]
         # Pre-flight: same missing-skill auto-block guard as the main
-        # spawn path (above). sdlc-review must resolve under the
-        # reviewer's HERMES_HOME or the CLI dies at startup.
-        try:
-            from hermes_cli.profiles import resolve_profile_env as _resolve_profile_env
-            _worker_home = _resolve_profile_env(claimed.assignee) if claimed.assignee else None
-        except Exception:
-            _worker_home = None
-        _missing_skills = _validate_task_skills(claimed, _worker_home)
-        if _missing_skills:
-            _reason = (
-                f"missing review skills under HERMES_HOME={_worker_home or '<default>'}: "
-                f"{', '.join(_missing_skills)}. Install them or add their source "
-                f"dir to skills.external_dirs in the profile's config.yaml."
-            )
+        # spawn path (above). Skipped when spawn_fn is injected (tests).
+        if spawn_fn is None:
             try:
-                block_task(conn, claimed.id, reason=_reason)
+                from hermes_cli.profiles import resolve_profile_env as _resolve_profile_env
+                _worker_home = _resolve_profile_env(claimed.assignee) if claimed.assignee else None
             except Exception:
-                pass
-            result.auto_blocked.append(claimed.id)
-            continue
+                _worker_home = None
+            _missing_skills = _validate_task_skills(claimed, _worker_home)
+            if _missing_skills:
+                _reason = (
+                    f"missing review skills under HERMES_HOME={_worker_home or '<default>'}: "
+                    f"{', '.join(_missing_skills)}. Install them or add their source "
+                    f"dir to skills.external_dirs in the profile's config.yaml."
+                )
+                try:
+                    block_task(conn, claimed.id, reason=_reason)
+                except Exception:
+                    pass
+                result.auto_blocked.append(claimed.id)
+                continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
