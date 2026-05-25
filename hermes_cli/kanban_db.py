@@ -8425,6 +8425,33 @@ def _resolve_hermes_argv() -> list[str]:
     return _module_hermes_argv()
 
 
+def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
+    """True if the bundled ``kanban-worker`` skill resolves for the home the
+    spawned worker will run under.
+
+    The dispatcher injects ``--skills kanban-worker`` into every worker. When
+    the worker activates a profile (``hermes -p <name>``), its ``SKILLS_DIR``
+    becomes ``<profile_home>/skills`` — which on many profiles does NOT contain
+    the bundled skill (it ships in the *default* root home, not every
+    profile-scoped skills dir). Preloading a missing skill is fatal at CLI
+    startup (``ValueError: Unknown skill(s): kanban-worker``), aborting the
+    worker before the agent loop runs. Gate the flag on actual resolvability;
+    the kanban lifecycle contract is still injected via ``KANBAN_GUIDANCE``, so
+    omitting the flag only drops the supplementary pattern library.
+
+    Reuses ``_resolve_skill_under_home`` so the liveness check is exactly the
+    same lookup the spawned worker will perform — including a recursive scan
+    of ``<home>/skills`` and every ``skills.external_dirs`` entry declared in
+    the profile's config.yaml. The previous bespoke check only looked at the
+    canonical bundled path and a bounded rglob of ``<home>/skills``, missing
+    cases where the skill lived in an external dir (the profile pattern used
+    by ``braintrusteng``, which keeps a single shared skills tree under
+    ``~/.hermes/skills`` and points every profile's ``external_dirs`` at it).
+    """
+    return _resolve_skill_under_home("kanban-worker", hermes_home)
+
+
+
 def _worker_terminal_timeout_env(
     max_runtime_seconds: Optional[int],
     current_timeout: Optional[str],
