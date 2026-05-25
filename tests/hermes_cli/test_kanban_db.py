@@ -770,6 +770,24 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
 # Scratch cleanup containment (#28818)
 # ---------------------------------------------------------------------------
 
+def test_cleanup_workspace_removes_managed_scratch_dir(kanban_home):
+    """A scratch workspace under the kanban workspaces root is removed.
+
+    Fork PR #6 moved the inline rmtree out of complete_task into
+    gc_scratch_workspaces (run by the dispatcher) so the worker process
+    doesn't delete its own cwd. The cleanup must still happen — just on
+    the dispatcher's next tick.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="scratchy")
+        task = kb.get_task(conn, t)
+        assert task is not None
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        assert ws.is_dir()
+        kb.complete_task(conn, t, result="ok")
+        kb.gc_scratch_workspaces(conn)
+    assert not ws.exists(), "Hermes-managed scratch dir should be cleaned up"
 
 
 def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
@@ -808,6 +826,199 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     ]
 
 
+def test_complete_task_rejects_missing_declared_scratch_artifact(kanban_home):
+    """A declared scratch deliverable must not disappear behind a false Done."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="missing report")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        missing = ws / "report.md"
+
+        with pytest.raises(kb.ArtifactPreservationError, match="unavailable"):
+            kb.complete_task(
+                conn,
+                t,
+                result="report complete",
+                metadata={"artifacts": [str(missing)]},
+            )
+
+        assert kb.get_task(conn, t).status == "ready"
+        assert kb.list_attachments(conn, t) == []
+    assert ws.exists(), "failed completion must keep scratch available for retry"
+
+
+def test_complete_task_preserves_legacy_artifact_path_from_summary(kanban_home):
+    """Summary-only workers keep the file they tell the user was delivered."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="legacy report")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        report = ws / "report.md"
+        report.write_text("legacy deliverable", encoding="utf-8")
+
+        assert kb.complete_task(
+            conn,
+            t,
+            summary=f"Task complete — delivered {report}",
+        )
+        run = kb.latest_run(conn, t)
+
+    persisted = Path(run.metadata["artifacts"][0])
+    assert not ws.exists()
+    assert persisted.read_text(encoding="utf-8") == "legacy deliverable"
+    assert persisted.parent == kb.task_attachments_dir(t)
+
+
+def test_complete_task_leaves_non_scratch_artifact_paths_unchanged(
+    kanban_home,
+    tmp_path,
+):
+    """Only artifacts inside the managed scratch workspace are copied."""
+    external = tmp_path / "report.md"
+    external.write_text("keep me here", encoding="utf-8")
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="external report")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+
+        assert kb.complete_task(
+            conn,
+            t,
+            result="ok",
+            metadata={"artifacts": [str(external)]},
+        )
+
+        completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
+        run = kb.latest_run(conn, t)
+
+    assert not ws.exists(), "scratch workspace should still be cleaned up"
+    assert external.exists()
+    assert completed.payload["artifacts"] == [str(external)]
+    assert run is not None
+    assert run.metadata["artifacts"] == [str(external)]
+
+
+def test_complete_task_persists_duplicate_scratch_artifact_names(kanban_home):
+    """Scratch artifact persistence does not overwrite duplicate basenames."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="render reports")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        first = ws / "a" / "report.txt"
+        second = ws / "b" / "report.txt"
+        first.parent.mkdir(parents=True)
+        second.parent.mkdir(parents=True)
+        first.write_text("first", encoding="utf-8")
+        second.write_text("second", encoding="utf-8")
+
+        assert kb.complete_task(
+            conn,
+            t,
+            result="ok",
+            metadata={"artifacts": [str(first), str(second)]},
+        )
+
+        completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
+        persisted = [Path(p) for p in completed.payload["artifacts"]]
+
+    assert not ws.exists(), "scratch workspace should still be cleaned up"
+    assert [p.name for p in persisted] == ["report.txt", "report_1.txt"]
+    assert [p.read_text(encoding="utf-8") for p in persisted] == ["first", "second"]
+    assert all(p.parent == kb.task_attachments_dir(t) for p in persisted)
+
+
+def test_complete_task_persists_board_scratch_artifacts_to_board_attachments(kanban_home):
+    """Board scratch artifacts are copied under that board's attachment root."""
+    kb.create_board("work-proj")
+
+    with kb.connect(board="work-proj") as conn:
+        t = kb.create_task(conn, title="board chart", board="work-proj")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task, board="work-proj")
+        kb.set_workspace_path(conn, t, ws)
+        artifact = ws / "chart.png"
+        artifact.write_bytes(b"board-png")
+
+        assert kb.complete_task(
+            conn,
+            t,
+            result="ok",
+            metadata={"artifacts": [str(artifact)]},
+        )
+
+        completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
+        persisted = Path(completed.payload["artifacts"][0])
+
+    assert not ws.exists(), "board scratch workspace should still be cleaned up"
+    assert persisted.exists()
+    assert persisted.parent == kb.task_attachments_dir(t, board="work-proj")
+
+
+def test_cleanup_workspace_refuses_path_outside_scratch_root(kanban_home, tmp_path):
+    """A scratch task with a user path outside the workspaces root must NOT be deleted (#28818).
+
+    Reproduces the data-loss vector where a board's ``default_workdir`` is set
+    to a real source directory; tasks created without an explicit
+    ``workspace_kind`` inherit ``scratch`` semantics, and the old cleanup path
+    would ``shutil.rmtree`` the user's source tree on task completion.
+    """
+    real_source = tmp_path / "real-source"
+    real_source.mkdir()
+    (real_source / ".git").mkdir()
+    (real_source / "README.md").write_text("important", encoding="utf-8")
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ship")
+        # Simulate the bad state directly: workspace_kind='scratch' (default)
+        # but workspace_path pointing at the user's real source tree, which is
+        # exactly what board.default_workdir produces when the task is created
+        # without an explicit workspace_kind.
+        conn.execute(
+            "UPDATE tasks SET workspace_kind=?, workspace_path=? WHERE id=?",
+            ("scratch", str(real_source), t),
+        )
+        conn.commit()
+        kb.complete_task(conn, t, result="ok")
+
+    assert real_source.exists(), "User source tree must not be deleted by scratch cleanup"
+    assert (real_source / ".git").exists()
+    assert (real_source / "README.md").read_text(encoding="utf-8") == "important"
+
+
+def test_cleanup_workspace_honors_workspaces_root_env_override(tmp_path, monkeypatch):
+    """``HERMES_KANBAN_WORKSPACES_ROOT`` extends the managed-scratch set.
+
+    Worker subprocesses run with this env var injected by the dispatcher. The
+    cleanup containment check must treat paths under it as managed even when
+    they sit outside the active kanban home.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    workspaces_override = tmp_path / "ext-workspaces"
+    workspaces_override.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(workspaces_override))
+    kb.init_db()
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ext")
+        scratch_dir = workspaces_override / t
+        scratch_dir.mkdir()
+        conn.execute(
+            "UPDATE tasks SET workspace_kind=?, workspace_path=? WHERE id=?",
+            ("scratch", str(scratch_dir), t),
+        )
+        conn.commit()
+        kb.complete_task(conn, t, result="ok")
+        kb.gc_scratch_workspaces(conn)
+
+    assert not scratch_dir.exists(), "Override-root scratch dir should be cleaned up"
 
 
 # ---------------------------------------------------------------------------
