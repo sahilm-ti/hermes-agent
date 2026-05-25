@@ -2468,6 +2468,93 @@ class TestSharedBoardPaths:
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
 
+    def test_worker_spawn_sets_git_identity(
+        self, tmp_path, monkeypatch
+    ):
+        # Workers must inherit a known git author/committer identity so
+        # the Contributor Attribution Check workflow passes on PRs they
+        # open. The dispatcher injects defaults from the constants /
+        # config knob; tests assert the env var shape.
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+
+        # Strip any inherited GIT_* from the parent env so the test
+        # exercises the default path. monkeypatch restores them after.
+        for var in (
+            "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+        captured = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["env"] = kwargs.get("env", {})
+                self.pid = 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        task = kb.Task(
+            id="t_git_identity",
+            title="x", body=None, assignee="coder", status="ready",
+            priority=0, created_by=None, created_at=0,
+            started_at=None, completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None, claim_expires=None, tenant=None,
+            branch_name=None,
+        )
+        kb._default_spawn(task, str(tmp_path / "ws"))
+
+        env = captured["env"]
+        assert env["GIT_AUTHOR_NAME"] == kb.DEFAULT_KANBAN_GIT_IDENTITY_NAME
+        assert env["GIT_AUTHOR_EMAIL"] == kb.DEFAULT_KANBAN_GIT_IDENTITY_EMAIL
+        assert env["GIT_COMMITTER_NAME"] == env["GIT_AUTHOR_NAME"]
+        assert env["GIT_COMMITTER_EMAIL"] == env["GIT_AUTHOR_EMAIL"]
+
+    def test_worker_spawn_respects_user_git_identity_override(
+        self, tmp_path, monkeypatch
+    ):
+        # Power users who export GIT_AUTHOR_* in their shell or .env
+        # should see their override survive into the spawned worker.
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+
+        monkeypatch.setenv("GIT_AUTHOR_NAME", "Custom User")
+        monkeypatch.setenv("GIT_AUTHOR_EMAIL", "custom@example.com")
+        monkeypatch.setenv("GIT_COMMITTER_NAME", "Committer User")
+        monkeypatch.setenv("GIT_COMMITTER_EMAIL", "committer@example.com")
+
+        captured = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["env"] = kwargs.get("env", {})
+                self.pid = 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        task = kb.Task(
+            id="t_git_override",
+            title="x", body=None, assignee="coder", status="ready",
+            priority=0, created_by=None, created_at=0,
+            started_at=None, completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None, claim_expires=None, tenant=None,
+            branch_name=None,
+        )
+        kb._default_spawn(task, str(tmp_path / "ws"))
+
+        env = captured["env"]
+        assert env["GIT_AUTHOR_NAME"] == "Custom User"
+        assert env["GIT_AUTHOR_EMAIL"] == "custom@example.com"
+        assert env["GIT_COMMITTER_NAME"] == "Committer User"
+        assert env["GIT_COMMITTER_EMAIL"] == "committer@example.com"
+
 
 # ---------------------------------------------------------------------------
 # latest_summary / latest_summaries — surface task_runs.summary handoffs
