@@ -44,6 +44,7 @@ from hermes_cli.profiles import (
     NO_BUNDLED_SKILLS_MARKER,
     backfill_profile_envs,
     profiles_to_serve,
+    prune_profile_skills,
 )
 from hermes_cli.config import DEFAULT_CONFIG
 
@@ -404,7 +405,7 @@ class TestNoSkillsOptOut:
         # Marker file is present
         marker = profile_dir / NO_BUNDLED_SKILLS_MARKER
         assert marker.is_file(), "expected .no-bundled-skills marker in profile root"
-        assert "--no-skills" in marker.read_text()
+        assert "--with-bundled-skills" in marker.read_text()
 
         # has_bundled_skills_opt_out() agrees
         assert has_bundled_skills_opt_out(profile_dir) is True
@@ -448,13 +449,15 @@ class TestNoSkillsOptOut:
         assert list((profile_dir / "skills").iterdir()) == []
 
     def test_default_profile_gets_skills_seeded(self, profile_env, monkeypatch):
-        """Sanity: without --no-skills, seed_profile_skills() runs the real
-        subprocess path. Mock the subprocess so the test is hermetic, and
-        just confirm the marker is NOT checked in the non-opt-out case."""
+        """Sanity: passing with_bundled_skills=True (opt-in) restores the old
+        per-profile bundled-copy path. Mock the subprocess so the test is
+        hermetic, and confirm the opt-out branch did NOT short-circuit."""
         import subprocess as _sp
 
-        profile_dir = create_profile("coder", no_alias=True)
-        # No marker — not opted out
+        profile_dir = create_profile(
+            "coder", no_alias=True, with_bundled_skills=True
+        )
+        # No marker — opted IN to bundled-skill seeding
         assert not (profile_dir / NO_BUNDLED_SKILLS_MARKER).exists()
         assert has_bundled_skills_opt_out(profile_dir) is False
 
@@ -1896,3 +1899,166 @@ class TestProfilesToServe:
     def test_on_no_named_profiles_returns_just_default(self, profile_env):
         serve = profiles_to_serve(multiplex=True)
         assert [n for n, _ in serve] == ["default"]
+
+# ===================================================================
+# TestNewSkillsDefault — canonical-root-skills migration
+# ===================================================================
+
+class TestNewSkillsDefault:
+    """`hermes profile create` now defaults to no-skills mode: an empty
+    profile skills/ dir and skills.external_dirs pointing at the root tree."""
+
+    def test_default_create_writes_marker(self, profile_env):
+        # No --with-bundled-skills, no --clone — default path
+        profile_dir = create_profile("coder", no_alias=True)
+        assert (profile_dir / NO_BUNDLED_SKILLS_MARKER).is_file()
+        assert has_bundled_skills_opt_out(profile_dir) is True
+
+    def test_default_create_writes_external_dirs_pointing_at_root(self, profile_env):
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        # Make sure default skills dir exists so the helper resolves it
+        (default_home / "skills").mkdir(parents=True, exist_ok=True)
+
+        profile_dir = create_profile("coder", no_alias=True)
+        config_path = profile_dir / "config.yaml"
+        assert config_path.is_file()
+        text = config_path.read_text()
+        assert str((default_home / "skills").resolve()) in text
+        assert "external_dirs" in text
+
+    def test_with_bundled_skills_opts_back_in(self, profile_env):
+        profile_dir = create_profile(
+            "coder", no_alias=True, with_bundled_skills=True
+        )
+        assert not (profile_dir / NO_BUNDLED_SKILLS_MARKER).exists()
+        assert has_bundled_skills_opt_out(profile_dir) is False
+
+    def test_with_bundled_and_no_skills_conflict(self, profile_env):
+        # Calling create_profile() directly with both flags True is a
+        # programmer error — should raise.
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            create_profile(
+                "coder",
+                no_alias=True,
+                no_skills=True,
+                with_bundled_skills=True,
+            )
+
+
+# ===================================================================
+# TestPruneProfileSkills
+# ===================================================================
+
+class TestPruneProfileSkills:
+    """Tests for prune_profile_skills() — clean up stale duplicate copies."""
+
+    def _make_skill(self, root: Path, rel: str, content: str, mtime: float = None):
+        skill_dir = root / rel
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text(content, encoding="utf-8")
+        if mtime is not None:
+            import os
+            os.utime(skill_md, (mtime, mtime))
+        return skill_md
+
+    def test_prune_identical_skill_moves_to_backup(self, profile_env):
+        tmp_path = profile_env
+        root_skills = tmp_path / ".hermes" / "skills"
+        root_skills.mkdir(parents=True, exist_ok=True)
+        self._make_skill(root_skills, "devops/alpha", "---\nname: alpha\n---\nbody\n")
+
+        # Create profile with bundled skills (opt-in), then drop the same
+        # skill into the profile by hand.
+        profile_dir = create_profile(
+            "coder", no_alias=True, with_bundled_skills=False
+        )
+        # We're in no-skills mode now; manually drop a duplicate skill copy
+        # to simulate the pre-migration state.
+        profile_skills = profile_dir / "skills"
+        profile_skills.mkdir(parents=True, exist_ok=True)
+        self._make_skill(profile_skills, "devops/alpha", "---\nname: alpha\n---\nbody\n")
+
+        result = prune_profile_skills("coder")
+
+        assert "devops/alpha" in result["pruned"]
+        assert not (profile_skills / "devops" / "alpha" / "SKILL.md").exists()
+        # Backup contains the moved skill
+        backup = Path(result["backup_dir"])
+        assert (backup / "devops" / "alpha" / "SKILL.md").is_file()
+
+    def test_prune_keeps_user_modified(self, profile_env):
+        tmp_path = profile_env
+        root_skills = tmp_path / ".hermes" / "skills"
+        root_skills.mkdir(parents=True, exist_ok=True)
+        # root is older
+        self._make_skill(root_skills, "devops/beta", "old\n", mtime=1_000_000.0)
+
+        profile_dir = create_profile("coder", no_alias=True)
+        profile_skills = profile_dir / "skills"
+        profile_skills.mkdir(parents=True, exist_ok=True)
+        # profile copy is NEWER (user edited)
+        self._make_skill(profile_skills, "devops/beta", "edited\n", mtime=2_000_000.0)
+
+        result = prune_profile_skills("coder")
+
+        assert "devops/beta" in result["kept_user_modified"]
+        assert (profile_skills / "devops" / "beta" / "SKILL.md").exists()
+
+    def test_prune_force_removes_user_modified(self, profile_env):
+        tmp_path = profile_env
+        root_skills = tmp_path / ".hermes" / "skills"
+        root_skills.mkdir(parents=True, exist_ok=True)
+        self._make_skill(root_skills, "devops/beta", "old\n", mtime=1_000_000.0)
+
+        profile_dir = create_profile("coder", no_alias=True)
+        profile_skills = profile_dir / "skills"
+        profile_skills.mkdir(parents=True, exist_ok=True)
+        self._make_skill(profile_skills, "devops/beta", "edited\n", mtime=2_000_000.0)
+
+        result = prune_profile_skills("coder", force=True)
+
+        assert "devops/beta" in result["pruned"]
+        assert not (profile_skills / "devops" / "beta" / "SKILL.md").exists()
+
+    def test_prune_keeps_profile_local_only_skills(self, profile_env):
+        tmp_path = profile_env
+        # Root has no skills
+        (tmp_path / ".hermes" / "skills").mkdir(parents=True, exist_ok=True)
+
+        profile_dir = create_profile("coder", no_alias=True)
+        profile_skills = profile_dir / "skills"
+        profile_skills.mkdir(parents=True, exist_ok=True)
+        self._make_skill(profile_skills, "private/customer-x", "---\nname: x\n---\n")
+
+        result = prune_profile_skills("coder")
+
+        assert "private/customer-x" in result["kept_profile_local"]
+        assert (profile_skills / "private" / "customer-x" / "SKILL.md").exists()
+
+    def test_prune_dry_run_touches_nothing(self, profile_env):
+        tmp_path = profile_env
+        root_skills = tmp_path / ".hermes" / "skills"
+        root_skills.mkdir(parents=True, exist_ok=True)
+        self._make_skill(root_skills, "devops/alpha", "same\n")
+
+        profile_dir = create_profile("coder", no_alias=True)
+        profile_skills = profile_dir / "skills"
+        profile_skills.mkdir(parents=True, exist_ok=True)
+        self._make_skill(profile_skills, "devops/alpha", "same\n")
+
+        result = prune_profile_skills("coder", dry_run=True)
+
+        assert result["dry_run"] is True
+        assert "devops/alpha" in result["pruned"]
+        # File still in profile
+        assert (profile_skills / "devops" / "alpha" / "SKILL.md").exists()
+
+    def test_prune_rejects_default_profile(self, profile_env):
+        with pytest.raises(ValueError, match="default"):
+            prune_profile_skills("default")
+
+    def test_prune_rejects_nonexistent_profile(self, profile_env):
+        with pytest.raises(FileNotFoundError):
+            prune_profile_skills("nonexistent")
