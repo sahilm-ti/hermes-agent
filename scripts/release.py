@@ -509,6 +509,7 @@ AUTHOR_MAP = {
     "marek.les@seznam.cz": "maxcz79",
     # sahilm-ti
     "sahil.marwaha@trilogy.com": "sahilm-ti",
+    "sahil@nousresearch.com": "sahilm-ti",
     # teknium (multiple emails)
     "teknium1@gmail.com": "teknium1",
     "kenyon1977@gmail.com": "kenyonxu",
