@@ -11599,6 +11599,7 @@ def cmd_profile(args):
         remove_wrapper_script,
         _is_wrapper_dir_in_path,
         _get_wrapper_dir,
+        prune_profile_skills,
     )
     from hermes_constants import display_hermes_home
 
@@ -11684,7 +11685,20 @@ def cmd_profile(args):
         clone = getattr(args, "clone", False)
         clone_all = getattr(args, "clone_all", False)
         no_alias = getattr(args, "no_alias", False)
-        no_skills = getattr(args, "no_skills", False)
+        with_bundled_skills = getattr(args, "with_bundled_skills", False)
+        # New default: no_skills=True (canonical-root-skills model). Clone
+        # flows manage their own skills, so we leave no_skills False in
+        # those cases — create_profile rejects no_skills+clone explicitly.
+        explicit_no_skills = getattr(args, "no_skills", False)
+        if clone or clone_all:
+            no_skills = False
+        elif with_bundled_skills:
+            no_skills = False
+        else:
+            no_skills = True
+        if explicit_no_skills and with_bundled_skills:
+            print("Error: --no-skills and --with-bundled-skills are mutually exclusive.")
+            sys.exit(1)
 
         try:
             clone_from = getattr(args, "clone_from", None)
@@ -11697,6 +11711,7 @@ def cmd_profile(args):
                 no_alias=no_alias,
                 no_skills=no_skills,
                 description=getattr(args, "description", None),
+                with_bundled_skills=with_bundled_skills,
             )
             print(f"\nProfile '{name}' created at {profile_dir}")
 
@@ -11722,15 +11737,26 @@ def cmd_profile(args):
                     pass  # Honcho plugin not installed or not configured
 
             # Seed bundled skills (skip if --clone-all already copied them, or
-            # if --no-skills was passed — in which case seed_profile_skills()
-            # honors the marker file and returns skipped_opt_out=True).
+            # if the profile is in default (no_skills=True) mode — in which
+            # case seed_profile_skills() honors the marker file and returns
+            # skipped_opt_out=True). The new default since v2 is no-skills:
+            # the profile inherits skills from ~/.hermes/skills via
+            # skills.external_dirs, no per-profile copies.
             if not clone_all:
                 result = seed_profile_skills(profile_dir)
                 if result and result.get("skipped_opt_out"):
-                    print(
-                        "No bundled skills seeded (--no-skills). "
-                        "Delete .no-bundled-skills in the profile to opt back in."
-                    )
+                    if no_skills and not explicit_no_skills:
+                        # Default path — quiet, friendly message.
+                        print(
+                            "Skills inherited from ~/.hermes/skills "
+                            "(skills.external_dirs). Pass --with-bundled-skills "
+                            "to seed per-profile copies instead."
+                        )
+                    else:
+                        print(
+                            "No bundled skills seeded (--no-skills). "
+                            "Delete .no-bundled-skills in the profile to opt back in."
+                        )
                 elif result:
                     copied = len(result.get("copied", []))
                     print(f"{copied} bundled skills synced.")
@@ -11795,6 +11821,58 @@ def cmd_profile(args):
         except (ValueError, FileNotFoundError) as e:
             print(f"Error: {e}")
             sys.exit(1)
+
+    elif action == "prune-skills":
+        name = args.profile_name
+        backup = getattr(args, "backup", None)
+        dry_run = getattr(args, "dry_run", False)
+        force = getattr(args, "force", False)
+        try:
+            result = prune_profile_skills(
+                name,
+                backup_dir=Path(backup) if backup else None,
+                dry_run=dry_run,
+                force=force,
+            )
+        except (ValueError, FileNotFoundError) as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+
+        pruned = result["pruned"]
+        kept_mod = result["kept_user_modified"]
+        kept_local = result["kept_profile_local"]
+        backup_dir = result["backup_dir"]
+        prefix = "[dry-run] " if dry_run else ""
+
+        if pruned:
+            print(
+                f"{prefix}Pruned {len(pruned)} stale profile skill "
+                f"{'copy' if len(pruned) == 1 else 'copies'} from '{name}'."
+            )
+            if not dry_run and backup_dir:
+                print(f"  Backup at: {backup_dir}")
+        else:
+            print(f"{prefix}No stale skill copies to prune in '{name}'.")
+        if kept_mod:
+            print(
+                f"  Kept {len(kept_mod)} user-modified "
+                f"({'pass --force to prune anyway' if not force else 'force-pruned would be empty'}):"
+            )
+            for rel in kept_mod[:10]:
+                print(f"    ~ {rel}")
+            if len(kept_mod) > 10:
+                print(f"    ... and {len(kept_mod) - 10} more")
+        if kept_local:
+            print(f"  Kept {len(kept_local)} profile-local (absent from root):")
+            for rel in kept_local[:10]:
+                print(f"    · {rel}")
+            if len(kept_local) > 10:
+                print(f"    ... and {len(kept_local) - 10} more")
+        if not dry_run and pruned:
+            print(
+                "  Wrote .no-bundled-skills marker and pointed "
+                "skills.external_dirs at ~/.hermes/skills."
+            )
 
     elif action == "describe":
         # Read or write a profile's description. The description is
@@ -15445,7 +15523,16 @@ Examples:
     profile_create.add_argument(
         "--no-skills",
         action="store_true",
-        help="Create an empty profile with no bundled skills (opts out of `hermes update` skill sync)",
+        help="(default) Create a profile with no bundled-skill copies; "
+             "the profile inherits skills from the canonical root tree "
+             "(~/.hermes/skills) via skills.external_dirs.",
+    )
+    profile_create.add_argument(
+        "--with-bundled-skills",
+        action="store_true",
+        help="Opt back into per-profile bundled-skill copies (the pre-v2 "
+             "behavior). Use this only when you want a writeable profile-local "
+             "skills/ dir; otherwise prefer the default (root tree wins).",
     )
     profile_create.add_argument(
         "--description",
@@ -15459,6 +15546,33 @@ Examples:
     profile_delete.add_argument("profile_name", help="Profile to delete")
     profile_delete.add_argument(
         "-y", "--yes", action="store_true", help="Skip confirmation prompt"
+    )
+
+    profile_prune_skills = profile_subparsers.add_parser(
+        "prune-skills",
+        help="Move stale duplicate skill copies out of a profile's skills/ "
+             "directory (root tree wins). Adds .no-bundled-skills marker so "
+             "future syncs don't recreate the drift.",
+    )
+    profile_prune_skills.add_argument(
+        "profile_name", help="Profile to prune"
+    )
+    profile_prune_skills.add_argument(
+        "--backup",
+        default=None,
+        help="Backup directory for moved skills. Defaults to "
+             "~/.hermes/_backups/profile-prune-<utc-iso>/<profile>/",
+    )
+    profile_prune_skills.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would happen without touching the filesystem.",
+    )
+    profile_prune_skills.add_argument(
+        "--force",
+        action="store_true",
+        help="Also prune skills whose profile copy is NEWER than the root "
+             "(by default user-edited copies are kept).",
     )
 
     profile_describe = profile_subparsers.add_parser(
