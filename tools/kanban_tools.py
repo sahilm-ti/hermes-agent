@@ -1215,7 +1215,8 @@ def _handle_reject(args: dict, **kw) -> str:
             ok = kb.reject_task(conn, str(tid), reason=reason)
             if not ok:
                 return tool_error(
-                    f"could not reject {tid} (not in review/human_review)"
+                    f"could not reject {tid} (not in review/human_review, "
+                    f"and not a running task claimed from review)"
                 )
             return _ok(task_id=str(tid), status="ready")
         finally:
