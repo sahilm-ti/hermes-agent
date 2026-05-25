@@ -2314,8 +2314,24 @@ DEFAULT_CONFIG = {
     # Skills — external skill directories for sharing skills across tools/agents.
     # Each path is expanded (~, ${VAR}) and resolved.  Read-only — skill creation
     # always goes to ~/.hermes/skills/.
+    #
+    # CANONICAL MODEL (since v2 of the profile-skills migration):
+    #   - ~/.hermes/skills/ is the SINGLE source of truth for bundled skills.
+    #   - Named profiles inherit by listing it in external_dirs (the default
+    #     `hermes profile create` writes this stanza automatically).
+    #   - Per-profile skills/ directories exist only for skills truly local to
+    #     one profile (e.g. customer-private overrides). Most profiles should
+    #     have an empty skills/ dir.
+    #   - Pass `--with-bundled-skills` to `hermes profile create` to opt back
+    #     into the old per-profile bundled-copy behavior. Use
+    #     `hermes profile prune-skills <name>` to clean up an existing profile
+    #     that already has stale duplicate copies.
     "skills": {
-        "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # External skill directories (sharing / inheritance).  Profile-create
+        # writes ~/.hermes/skills here automatically when --no-skills is on
+        # (the default since v2).  Add more entries for shared team skill
+        # repos: e.g. ["~/.agents/skills", "/shared/team-skills"].
+        "external_dirs": [],
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled
