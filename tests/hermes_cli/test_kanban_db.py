@@ -1335,6 +1335,42 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
 
 
+def test_backfill_null_notifier_profile(kanban_home):
+    """Regression for t_b212a749: legacy subscription rows with
+    ``notifier_profile = NULL`` (created by the pre-fix auto-subscribe
+    path) get claimed on demand by the current gateway's profile, and
+    rows that already have an owner are left alone."""
+    with kb.connect() as conn:
+        t1 = kb.create_task(conn, title="null sub", assignee="worker")
+        t2 = kb.create_task(conn, title="claimed sub", assignee="worker")
+        t3 = kb.create_task(conn, title="empty-string sub", assignee="worker")
+        kb.add_notify_sub(conn, task_id=t1, platform="telegram", chat_id="c1")
+        kb.add_notify_sub(
+            conn, task_id=t2, platform="telegram", chat_id="c2",
+            notifier_profile="braintrustorch",
+        )
+        conn.execute(
+            "INSERT INTO kanban_notify_subs(task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at) "
+            "VALUES (?, 'telegram', 'c3', '', 'u', '', 0)",
+            (t3,),
+        )
+        conn.commit()
+
+        n = kb.backfill_null_notifier_profile(conn, "braintrusteng")
+        assert n == 2
+
+        rows = {row["task_id"]: row for row in kb.list_notify_subs(conn)}
+        assert rows[t1]["notifier_profile"] == "braintrusteng"
+        assert rows[t2]["notifier_profile"] == "braintrustorch"  # untouched
+        assert rows[t3]["notifier_profile"] == "braintrusteng"
+
+        # Re-running is a no-op.
+        assert kb.backfill_null_notifier_profile(conn, "braintrusteng") == 0
+        # Empty profile arg is a guarded no-op (defensive — never claim
+        # rows for a phantom owner).
+        assert kb.backfill_null_notifier_profile(conn, "") == 0
+
+
 def test_delete_archived_task_rejects_non_archived_rows(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="live")
