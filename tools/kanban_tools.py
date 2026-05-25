@@ -841,7 +841,20 @@ def _auto_subscribe_origin(kb, conn, task_id: str) -> bool:
             return False
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or ""
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or ""
+        # HERMES_PROFILE is set by the dispatcher when it spawns workers, but
+        # the gateway process itself never exports it. Fall back to the
+        # active-profile resolver so gateway-originated auto-subscriptions
+        # always record the notifier profile of the gateway that owns this
+        # chat — otherwise the notifier loop in gateway/run.py filters them
+        # out (sub.notifier_profile != current profile) and the originating
+        # chat silently never gets pinged. See task t_b212a749.
         notifier_profile = os.environ.get("HERMES_PROFILE") or None
+        if not notifier_profile:
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                notifier_profile = get_active_profile_name() or None
+            except Exception:
+                notifier_profile = None
         kb.add_notify_sub(
             conn,
             task_id=task_id,
