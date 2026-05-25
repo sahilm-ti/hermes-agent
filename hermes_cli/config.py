@@ -1268,6 +1268,18 @@ DEFAULT_CONFIG = {
     # Skills — external skill directories for sharing skills across tools/agents.
     # Each path is expanded (~, ${VAR}) and resolved.  Read-only — skill creation
     # always goes to ~/.hermes/skills/.
+    #
+    # The canonical model: the default hermes home's ``skills/`` directory
+    # (``~/.hermes/skills/``) is the source of truth for shared skills.
+    # Named profiles inherit from it via ``external_dirs`` and only use
+    # their own ``skills/`` dir for profile-specific overrides.  When
+    # ``hermes profile create <name>`` runs without ``--with-bundled-skills``
+    # (the default), the new profile's ``skills/`` dir is left empty and
+    # its ``config.yaml`` is pre-seeded with
+    # ``external_dirs: [~/.hermes/skills]``.  This avoids the ambiguous-skill
+    # collisions that occur when the root tree drifts from per-profile
+    # copies.  See ``hermes profile prune-skills <name>`` for cleaning up
+    # legacy profiles that still carry duplicate copies.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md

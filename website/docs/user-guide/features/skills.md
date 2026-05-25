@@ -234,6 +234,20 @@ skills:
 
 Paths support `~` expansion and `${VAR}` environment variable substitution.
 
+### Profiles inherit shared skills via `external_dirs`
+
+The canonical model is: **`~/.hermes/skills/` (the default hermes home's skills dir) is the source of truth.** Named profiles inherit from it via `external_dirs` and only use their own `skills/` dir for profile-specific overrides.
+
+When `hermes profile create <name>` runs (without `--with-bundled-skills`), the new profile's `skills/` is left empty and its `config.yaml` is pre-seeded with `external_dirs: [~/.hermes/skills]`. This avoids the ambiguous-skill collisions that occur when the root tree drifts from per-profile copies.
+
+To migrate an existing profile that still carries duplicate copies of bundled skills:
+
+```
+hermes profile prune-skills <name>
+```
+
+This moves byte-identical or older skill copies into `~/.hermes/_backups/profile-prune-<timestamp>/<name>/` and leaves profile-only or profile-newer skills in place. Pass `--dry-run` first to preview.
+
 ### How it works
 
 - **Create locally, update in place**: New agent-created skills are written to `~/.hermes/skills/`. Existing skills are modified where they are found, including skills under `external_dirs`, when the agent uses `skill_manage` actions such as `patch`, `edit`, `write_file`, `remove_file`, or `delete`.

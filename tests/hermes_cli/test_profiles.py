@@ -315,23 +315,60 @@ class TestCreateProfile:
 # ===================================================================
 
 class TestNoSkillsOptOut:
-    """Tests for `hermes profile create --no-skills` and the opt-out marker."""
+    """Tests for `hermes profile create`'s default opt-out behaviour and
+    the legacy --no-skills / --with-bundled-skills flags.
 
-    def test_no_skills_writes_marker_and_skips_seeding(self, profile_env):
-        profile_dir = create_profile("orchestrator", no_alias=True, no_skills=True)
+    The new default (since the per-profile drift fix): fresh profiles are
+    created with an empty skills/ dir and a ``.no-bundled-skills`` marker,
+    and they resolve skills via ``skills.external_dirs`` (pre-seeded to
+    ``~/.hermes/skills`` in the new profile's config.yaml).  Bundled-skill
+    seeding only happens when the user explicitly opts in with
+    ``--with-bundled-skills``.
+    """
 
-        # Marker file is present
+    def test_default_writes_marker_and_skips_seeding(self, profile_env):
+        """Fresh `hermes profile create <name>` MUST NOT copy bundled skills
+        into the new profile's skills/ dir.  Instead it writes the
+        ``.no-bundled-skills`` marker and pre-seeds external_dirs.
+        """
+        profile_dir = create_profile("orchestrator", no_alias=True)
+
         marker = profile_dir / NO_BUNDLED_SKILLS_MARKER
-        assert marker.is_file(), "expected .no-bundled-skills marker in profile root"
-        assert "--no-skills" in marker.read_text()
-
-        # has_bundled_skills_opt_out() agrees
+        assert marker.is_file(), (
+            "expected .no-bundled-skills marker in profile root by default"
+        )
         assert has_bundled_skills_opt_out(profile_dir) is True
 
-        # skills/ dir exists (profile bootstrapping still creates the dir) but
-        # contains nothing yet because create_profile itself doesn't seed.
-        assert (profile_dir / "skills").is_dir()
-        assert list((profile_dir / "skills").iterdir()) == []
+        # skills/ exists but is empty — no SKILL.md was bootstrapped.
+        skills_dir = profile_dir / "skills"
+        assert skills_dir.is_dir()
+        assert not list(skills_dir.rglob("SKILL.md"))
+
+        # config.yaml is pre-seeded with external_dirs pointing at root.
+        config_path = profile_dir / "config.yaml"
+        assert config_path.is_file()
+        config_text = config_path.read_text()
+        assert "external_dirs" in config_text
+        root_skills = (_get_default_hermes_home() / "skills").resolve()
+        assert str(root_skills) in config_text
+
+    def test_no_skills_alias_still_works(self, profile_env):
+        """The deprecated --no-skills flag is equivalent to the default and
+        must continue to produce a marker without raising."""
+        profile_dir = create_profile("orchestrator", no_alias=True, no_skills=True)
+
+        marker = profile_dir / NO_BUNDLED_SKILLS_MARKER
+        assert marker.is_file()
+        assert has_bundled_skills_opt_out(profile_dir) is True
+
+    def test_with_bundled_skills_omits_marker(self, profile_env):
+        """--with-bundled-skills opts in to legacy bundled-seed behaviour:
+        no marker, so seed_profile_skills() WILL run the real sync."""
+        profile_dir = create_profile(
+            "legacy-air-gapped", no_alias=True, with_bundled_skills=True
+        )
+        assert not (profile_dir / NO_BUNDLED_SKILLS_MARKER).exists()
+        assert has_bundled_skills_opt_out(profile_dir) is False
 
     def test_no_skills_conflicts_with_clone(self, profile_env):
         with pytest.raises(ValueError, match="mutually exclusive"):
@@ -351,28 +388,41 @@ class TestNoSkillsOptOut:
                 clone_all=True,
             )
 
+    def test_with_bundled_skills_conflicts_with_clone(self, profile_env):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            create_profile(
+                "x", no_alias=True, with_bundled_skills=True, clone_config=True
+            )
+
+    def test_with_bundled_skills_conflicts_with_no_skills(self, profile_env):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            create_profile(
+                "x", no_alias=True, with_bundled_skills=True, no_skills=True
+            )
+
     def test_seed_profile_skills_respects_marker(self, profile_env):
         """seed_profile_skills() must no-op on opted-out profiles even when
         called directly (e.g. by `hermes update`'s all-profile sync loop)."""
-        profile_dir = create_profile("orchestrator", no_alias=True, no_skills=True)
+        profile_dir = create_profile("orchestrator", no_alias=True)
 
-        # Call seed_profile_skills() directly — it should NOT invoke subprocess,
-        # NOT modify the skills/ dir, and return a dict with skipped_opt_out=True.
+        # Default is opt-out, so calling seed_profile_skills() must not
+        # invoke a subprocess and must return skipped_opt_out=True.
         result = seed_profile_skills(profile_dir, quiet=True)
 
         assert result is not None
         assert result.get("skipped_opt_out") is True
         assert result.get("copied") == []
         # skills/ stays empty — no subprocess ran
-        assert list((profile_dir / "skills").iterdir()) == []
+        assert not list((profile_dir / "skills").rglob("SKILL.md"))
 
-    def test_default_profile_gets_skills_seeded(self, profile_env, monkeypatch):
-        """Sanity: without --no-skills, seed_profile_skills() runs the real
-        subprocess path. Mock the subprocess so the test is hermetic, and
-        just confirm the marker is NOT checked in the non-opt-out case."""
+    def test_with_bundled_skills_runs_real_seed(self, profile_env, monkeypatch):
+        """With --with-bundled-skills, seed_profile_skills() runs the real
+        subprocess path. Mock the subprocess so the test is hermetic."""
         import subprocess as _sp
 
-        profile_dir = create_profile("coder", no_alias=True)
+        profile_dir = create_profile(
+            "coder", no_alias=True, with_bundled_skills=True
+        )
         # No marker — not opted out
         assert not (profile_dir / NO_BUNDLED_SKILLS_MARKER).exists()
         assert has_bundled_skills_opt_out(profile_dir) is False
@@ -1181,3 +1231,166 @@ class TestEdgeCases:
             delete_profile("coder", yes=True)
 
         assert get_active_profile() == "default"
+
+
+# ===================================================================
+# TestPruneProfileSkills
+# ===================================================================
+
+class TestPruneProfileSkills:
+    """Tests for prune_profile_skills() — the cleanup tool that moves
+    stale per-profile skill copies into a backup dir so the canonical
+    root-tree wins on the next skill resolve.
+    """
+
+    @pytest.fixture
+    def root_and_profile(self, profile_env):
+        """Build a fresh profile + a root skills tree with a single shared
+        skill so the prune scenarios can override per-test."""
+        root_skills = _get_default_hermes_home() / "skills"
+        root_skills.mkdir(parents=True, exist_ok=True)
+        (root_skills / "shared").mkdir()
+        (root_skills / "shared" / "SKILL.md").write_text(
+            "---\nname: shared\n---\nbody v2\n"
+        )
+
+        from hermes_cli.profiles import create_profile as _create
+        profile_dir = _create("legacy", no_alias=True)
+        # Pretend this profile was created before the fix and has a
+        # duplicate copy of the root skill.
+        prof_skill = profile_dir / "skills" / "shared"
+        prof_skill.mkdir(parents=True)
+        return profile_env, root_skills, profile_dir, prof_skill
+
+    def test_identical_skill_is_pruned(self, root_and_profile):
+        _, root_skills, profile_dir, prof_skill = root_and_profile
+        # Profile copy is byte-identical to root copy → stale.
+        (prof_skill / "SKILL.md").write_text(
+            (root_skills / "shared" / "SKILL.md").read_text()
+        )
+
+        from hermes_cli.profiles import prune_profile_skills
+
+        result = prune_profile_skills("legacy", quiet=True)
+
+        assert result["pruned"] == ["shared"]
+        assert result["user_modified"] == []
+        assert result["profile_only"] == []
+        assert result["scanned"] == 1
+        # Profile copy moved out of the way
+        assert not prof_skill.exists()
+        # Backup contains the moved skill
+        backup_dir = result["backup_dir"]
+        assert (backup_dir / "shared" / "SKILL.md").is_file()
+
+    def test_older_profile_copy_is_pruned(self, root_and_profile):
+        _, root_skills, profile_dir, prof_skill = root_and_profile
+        # Profile copy differs from root but is older → still considered stale
+        # (root tree is the source of truth, profile copy lost the race).
+        (prof_skill / "SKILL.md").write_text(
+            "---\nname: shared\n---\nbody v1 (older)\n"
+        )
+        old = (root_skills / "shared" / "SKILL.md").stat().st_mtime - 60
+        os.utime(prof_skill / "SKILL.md", (old, old))
+
+        from hermes_cli.profiles import prune_profile_skills
+
+        result = prune_profile_skills("legacy", quiet=True)
+
+        assert result["pruned"] == ["shared"]
+        assert not prof_skill.exists()
+
+    def test_newer_profile_copy_is_kept(self, root_and_profile):
+        _, root_skills, profile_dir, prof_skill = root_and_profile
+        # Profile copy is newer AND differs → user has local changes
+        # they may want to push to root.  Keep in place.
+        (prof_skill / "SKILL.md").write_text(
+            "---\nname: shared\n---\nlocal mods\n"
+        )
+        newer = (root_skills / "shared" / "SKILL.md").stat().st_mtime + 60
+        os.utime(prof_skill / "SKILL.md", (newer, newer))
+
+        from hermes_cli.profiles import prune_profile_skills
+
+        result = prune_profile_skills("legacy", quiet=True)
+
+        assert result["pruned"] == []
+        assert result["user_modified"] == ["shared"]
+        assert prof_skill.exists()
+        assert (prof_skill / "SKILL.md").read_text().endswith("local mods\n")
+
+    def test_profile_only_skill_is_kept(self, profile_env):
+        """A skill that only exists in the profile (no root counterpart)
+        must be left alone — that's the legitimate use of per-profile skills/."""
+        root_skills = _get_default_hermes_home() / "skills"
+        root_skills.mkdir(parents=True, exist_ok=True)
+
+        from hermes_cli.profiles import create_profile as _create
+        profile_dir = _create("solo", no_alias=True)
+        prof_skill = profile_dir / "skills" / "profile-only"
+        prof_skill.mkdir(parents=True)
+        (prof_skill / "SKILL.md").write_text(
+            "---\nname: profile-only\n---\nlocal\n"
+        )
+
+        from hermes_cli.profiles import prune_profile_skills
+
+        result = prune_profile_skills("solo", quiet=True)
+
+        assert result["pruned"] == []
+        assert result["profile_only"] == ["profile-only"]
+        assert prof_skill.exists()
+
+    def test_dry_run_does_not_move(self, root_and_profile):
+        _, root_skills, profile_dir, prof_skill = root_and_profile
+        (prof_skill / "SKILL.md").write_text(
+            (root_skills / "shared" / "SKILL.md").read_text()
+        )
+
+        from hermes_cli.profiles import prune_profile_skills
+
+        result = prune_profile_skills("legacy", quiet=True, dry_run=True)
+
+        assert result["pruned"] == ["shared"]
+        # Nothing actually moved
+        assert prof_skill.exists()
+
+    def test_default_profile_rejected(self, profile_env):
+        """Pruning the default profile is meaningless — ~/.hermes/skills IS
+        the canonical root tree."""
+        from hermes_cli.profiles import prune_profile_skills
+
+        with pytest.raises(ValueError, match="default profile"):
+            prune_profile_skills("default", quiet=True)
+
+    def test_nonexistent_profile_raises(self, profile_env):
+        from hermes_cli.profiles import prune_profile_skills
+
+        with pytest.raises(FileNotFoundError):
+            prune_profile_skills("nonexistent", quiet=True)
+
+    def test_empty_skills_dir_is_noop(self, profile_env):
+        from hermes_cli.profiles import create_profile as _create
+        from hermes_cli.profiles import prune_profile_skills
+
+        _create("empty", no_alias=True)
+
+        result = prune_profile_skills("empty", quiet=True)
+        assert result["scanned"] == 0
+        assert result["pruned"] == []
+        assert result["backup_dir"] is None
+
+    def test_custom_backup_dir_is_honored(self, root_and_profile, tmp_path):
+        _, root_skills, profile_dir, prof_skill = root_and_profile
+        (prof_skill / "SKILL.md").write_text(
+            (root_skills / "shared" / "SKILL.md").read_text()
+        )
+
+        from hermes_cli.profiles import prune_profile_skills
+
+        custom = tmp_path / "my-backup"
+        result = prune_profile_skills(
+            "legacy", backup_root=custom, quiet=True
+        )
+        assert result["backup_dir"] == custom
+        assert (custom / "shared" / "SKILL.md").is_file()

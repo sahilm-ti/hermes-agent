@@ -9969,6 +9969,7 @@ def cmd_profile(args):
         clone_all = getattr(args, "clone_all", False)
         no_alias = getattr(args, "no_alias", False)
         no_skills = getattr(args, "no_skills", False)
+        with_bundled_skills = getattr(args, "with_bundled_skills", False)
 
         try:
             clone_from = getattr(args, "clone_from", None)
@@ -9980,6 +9981,7 @@ def cmd_profile(args):
                 clone_config=clone,
                 no_alias=no_alias,
                 no_skills=no_skills,
+                with_bundled_skills=with_bundled_skills,
                 description=getattr(args, "description", None),
             )
             print(f"\nProfile '{name}' created at {profile_dir}")
@@ -10438,6 +10440,39 @@ def cmd_profile(args):
                 if er.get("default") is not None:
                     print(f"      default: {er['default']}")
         print()
+
+    elif action == "prune-skills":
+        from hermes_cli.profiles import prune_profile_skills
+
+        backup_arg = getattr(args, "prune_backup", None)
+        dry_run = getattr(args, "prune_dry_run", False)
+        backup_path = Path(backup_arg).expanduser().resolve() if backup_arg else None
+
+        try:
+            result = prune_profile_skills(
+                args.profile_name,
+                backup_root=backup_path,
+                dry_run=dry_run,
+                quiet=False,
+            )
+        except (ValueError, FileNotFoundError) as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+
+        n_pruned = len(result["pruned"])
+        n_kept = len(result["user_modified"])
+        n_only = len(result["profile_only"])
+        verb = "Would prune" if dry_run else "Pruned"
+        print()
+        print(
+            f"{verb} {n_pruned} stale skill copies from profile "
+            f"'{args.profile_name}' "
+            f"(scanned {result['scanned']}, kept {n_kept} user-modified, "
+            f"kept {n_only} profile-only)."
+        )
+        if result["backup_dir"] is not None:
+            label = "Would back up to" if dry_run else "Backup at"
+            print(f"{label}: {result['backup_dir']}")
 
 
 def _render_distribution_plan(plan) -> None:
@@ -13415,7 +13450,15 @@ Examples:
     profile_create.add_argument(
         "--no-skills",
         action="store_true",
-        help="Create an empty profile with no bundled skills (opts out of `hermes update` skill sync)",
+        help="(deprecated alias) Same as the default behaviour — create the "
+             "profile with an empty skills/ dir and rely on skills.external_dirs.",
+    )
+    profile_create.add_argument(
+        "--with-bundled-skills",
+        action="store_true",
+        help="Opt in to legacy behaviour: copy the full bundled skills tree "
+             "into this profile's skills/. Default is to leave skills/ empty "
+             "and resolve skills via the root tree at ~/.hermes/skills.",
     )
     profile_create.add_argument(
         "--description",
@@ -13561,6 +13604,35 @@ Examples:
         help="Show a profile's distribution manifest (version, requirements, source)",
     )
     profile_info.add_argument("profile_name", help="Profile to inspect")
+
+    profile_prune = profile_subparsers.add_parser(
+        "prune-skills",
+        help="Move stale per-profile skill copies into a backup dir",
+        description=(
+            "Move any SKILL.md under ~/.hermes/profiles/<name>/skills/ that "
+            "is byte-identical to (or older than) the same-named one under "
+            "the canonical ~/.hermes/skills/ tree into "
+            "~/.hermes/_backups/profile-prune-<timestamp>/<name>/. "
+            "Profile-newer or profile-only skills are left in place."
+        ),
+    )
+    profile_prune.add_argument(
+        "profile_name", help="Profile whose skills/ should be pruned"
+    )
+    profile_prune.add_argument(
+        "--backup",
+        dest="prune_backup",
+        default=None,
+        metavar="DIR",
+        help="Override the backup destination (default: "
+             "~/.hermes/_backups/profile-prune-<timestamp>/<profile>/)",
+    )
+    profile_prune.add_argument(
+        "--dry-run",
+        dest="prune_dry_run",
+        action="store_true",
+        help="Report what would be moved without modifying anything",
+    )
 
     profile_parser.set_defaults(func=cmd_profile)
 
