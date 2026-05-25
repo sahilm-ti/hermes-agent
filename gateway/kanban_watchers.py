@@ -22,6 +22,24 @@ from typing import Any, Callable, Optional
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
 
+# Kanban terminal-event notification truncation caps. These gate the snippets
+# of worker handoff / blocked-reason / error inlined into a single chat
+# message so the human doesn't need to open the dashboard for routine pings.
+# Each cap is sized for its payload kind and the worst-case platform message
+# limit (Telegram: 4096; Discord/Slack: ~2000). They're per-kind so a chatty
+# ``done`` summary can't crowd out a critical ``blocked`` reason. ``blocked``
+# (and the human-review reason, which a human acts on) gets the largest
+# budget; ``result`` is the legacy ``task.result`` field kept smaller because
+# new code uses structured ``summary`` instead.
+#
+# Defined here rather than imported from gateway.run: gateway.run imports this
+# mixin, so a reverse import would risk a cycle, and these constants have no
+# consumer outside the watcher loops that now live on this mixin.
+NOTIFY_BLOCKED_REASON_MAX = 1500
+NOTIFY_DONE_SUMMARY_MAX = 800
+NOTIFY_DONE_RESULT_LEGACY_MAX = 400
+NOTIFY_GAVE_UP_ERROR_MAX = 600
+
 
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
@@ -160,7 +178,10 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        TERMINAL_KINDS = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            "human_review_requested", "approved", "rejected",
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -338,11 +359,19 @@ class GatewayKanbanWatchersMixin:
                                 payload_summary = str(ev.payload["summary"])
                             if payload_summary:
                                 lines = payload_summary.strip().splitlines()
-                                h = lines[0][:200] if lines else payload_summary[:200]
+                                h = (
+                                    lines[0][:NOTIFY_DONE_SUMMARY_MAX]
+                                    if lines
+                                    else payload_summary[:NOTIFY_DONE_SUMMARY_MAX]
+                                )
                                 handoff = f"\n{h}"
                             elif task and task.result:
                                 lines = task.result.strip().splitlines()
-                                r = lines[0][:160] if lines else task.result[:160]
+                                r = (
+                                    lines[0][:NOTIFY_DONE_RESULT_LEGACY_MAX]
+                                    if lines
+                                    else task.result[:NOTIFY_DONE_RESULT_LEGACY_MAX]
+                                )
                                 handoff = f"\n{r}"
                             msg = (
                                 f"✔ {tag}Kanban {sub['task_id']} done"
@@ -351,12 +380,12 @@ class GatewayKanbanWatchersMixin:
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
+                                reason = f": {str(ev.payload['reason'])[:NOTIFY_BLOCKED_REASON_MAX]}"
                             msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
+                                err = f"\n{str(ev.payload['error'])[:NOTIFY_GAVE_UP_ERROR_MAX]}"
                             msg = (
                                 f"✖ {tag}Kanban {sub['task_id']} gave up "
                                 f"after repeated spawn failures{err}"
@@ -373,6 +402,36 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"⏱ {tag}Kanban {sub['task_id']} timed out "
                                 f"(max_runtime={limit}s); will retry"
+                            )
+                        elif kind == "human_review_requested":
+                            note = ""
+                            if ev.payload and ev.payload.get("reason"):
+                                note = (
+                                    f": {str(ev.payload['reason'])[:NOTIFY_BLOCKED_REASON_MAX]}"
+                                )
+                            msg = (
+                                f"⏳ {tag}Kanban {sub['task_id']} ready for "
+                                f"your review — {title}{note}"
+                            )
+                        elif kind == "approved":
+                            note = ""
+                            if ev.payload and ev.payload.get("reason"):
+                                note = (
+                                    f": {str(ev.payload['reason'])[:NOTIFY_BLOCKED_REASON_MAX]}"
+                                )
+                            msg = (
+                                f"✅ {tag}Kanban {sub['task_id']} approved "
+                                f"— {title}{note}"
+                            )
+                        elif kind == "rejected":
+                            note = ""
+                            if ev.payload and ev.payload.get("reason"):
+                                note = (
+                                    f"\n{str(ev.payload['reason'])[:NOTIFY_BLOCKED_REASON_MAX]}"
+                                )
+                            msg = (
+                                f"↩ {tag}Kanban {sub['task_id']} rejected "
+                                f"— back to ready{note}"
                             )
                         else:
                             continue

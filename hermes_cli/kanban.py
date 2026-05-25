@@ -602,6 +602,47 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit machine-readable JSON result",
     )
 
+    # --- review / human-review / approve / reject ---
+    p_review = sub.add_parser(
+        "review",
+        help="Move a running task to 'review' (worker→auto-review agent handoff)",
+    )
+    p_review.add_argument("task_id")
+    p_review.add_argument(
+        "reason", nargs="*",
+        help="Handoff note — typically the PR URL plus a one-line summary",
+    )
+
+    p_hreview = sub.add_parser(
+        "human-review",
+        help="Move a running or review task to 'human_review' (auto-review passed; awaits Sahil)",
+    )
+    p_hreview.add_argument("task_id")
+    p_hreview.add_argument(
+        "reason", nargs="*",
+        help="Human-facing handoff (PR URL, merged-commit hint, etc.)",
+    )
+
+    p_approve = sub.add_parser(
+        "approve",
+        help="Approve a human_review task (→ done)",
+    )
+    p_approve.add_argument("task_id")
+    p_approve.add_argument(
+        "--reason", default=None,
+        help="Optional approval note (audit-only)",
+    )
+
+    p_reject = sub.add_parser(
+        "reject",
+        help="Reject a review/human_review task (→ ready, with audit comment)",
+    )
+    p_reject.add_argument("task_id")
+    p_reject.add_argument(
+        "--reason", default=None,
+        help="Why the work was rejected — surfaced to the next worker via the comment thread",
+    )
+
     p_archive = sub.add_parser("archive", help="Archive one or more tasks")
     p_archive.add_argument("task_ids", nargs="*",
                            help="Task ids to archive (default mode)")
@@ -942,6 +983,10 @@ def kanban_command(args: argparse.Namespace) -> int:
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
+            "review":   _cmd_review,
+            "human-review": _cmd_human_review,
+            "approve":  _cmd_approve,
+            "reject":   _cmd_reject,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
@@ -2035,6 +2080,96 @@ def _cmd_promote(args: argparse.Namespace) -> int:
         else:
             print(f"cannot promote {r['task_id']}: {r['error']}", file=sys.stderr)
     return 0 if not failed else 1
+
+
+def _cmd_review(args: argparse.Namespace) -> int:
+    reason = " ".join(args.reason).strip() if args.reason else None
+    author = _profile_author()
+    tid = args.task_id
+    with kb.connect() as conn:
+        if reason:
+            kb.add_comment(conn, tid, author, f"REVIEW: {reason}")
+        ok = kb.move_to_review(
+            conn,
+            tid,
+            reason=reason,
+            expected_run_id=_worker_run_id_for(tid),
+        )
+    if not ok:
+        print(
+            f"cannot move {tid} to review (not running/ready?)",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Sent {tid} to review" + (f": {reason}" if reason else ""))
+    return 0
+
+
+def _cmd_human_review(args: argparse.Namespace) -> int:
+    reason = " ".join(args.reason).strip() if args.reason else None
+    author = _profile_author()
+    tid = args.task_id
+    with kb.connect() as conn:
+        if reason:
+            kb.add_comment(conn, tid, author, f"HUMAN-REVIEW: {reason}")
+        ok = kb.move_to_human_review(
+            conn,
+            tid,
+            reason=reason,
+            expected_run_id=_worker_run_id_for(tid),
+        )
+    if not ok:
+        print(
+            f"cannot move {tid} to human_review (not running/review?)",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"Sent {tid} to human_review"
+        + (f": {reason}" if reason else "")
+    )
+    return 0
+
+
+def _cmd_approve(args: argparse.Namespace) -> int:
+    reason = (args.reason or "").strip() or None
+    author = _profile_author()
+    tid = args.task_id
+    with kb.connect() as conn:
+        if reason:
+            kb.add_comment(conn, tid, author, f"APPROVED: {reason}")
+        ok = kb.approve_task(conn, tid, reason=reason)
+    if not ok:
+        print(
+            f"cannot approve {tid} (not in human_review?)",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Approved {tid}" + (f": {reason}" if reason else ""))
+    return 0
+
+
+def _cmd_reject(args: argparse.Namespace) -> int:
+    reason = (args.reason or "").strip() or None
+    author = _profile_author()
+    tid = args.task_id
+    if not reason:
+        print(
+            "--reason is required for reject — the next worker needs context",
+            file=sys.stderr,
+        )
+        return 1
+    with kb.connect() as conn:
+        kb.add_comment(conn, tid, author, f"REJECTED: {reason}")
+        ok = kb.reject_task(conn, tid, reason=reason)
+    if not ok:
+        print(
+            f"cannot reject {tid} (not in review/human_review?)",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Rejected {tid}: {reason}")
+    return 0
 
 
 def _cmd_archive(args: argparse.Namespace) -> int:

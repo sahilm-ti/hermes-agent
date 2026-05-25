@@ -97,7 +97,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "human_review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
@@ -4560,6 +4560,250 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             {"status": new_status} if new_status != "ready" else None,
         )
         return True
+
+
+def move_to_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Transition ``running -> review`` (worker-initiated handoff to the
+    auto-review agent).
+
+    Closes the worker's current run with ``outcome='review_requested'`` so the
+    review agent's lifecycle is tracked on its own run row when the dispatcher
+    claims this task next tick. ``reason`` is the human-facing PR URL / handoff
+    note carried on the closing run and the ``review_requested`` event payload.
+
+    Returns ``False`` when the task is missing or not in ``running``/``ready``
+    state. Atomic CAS: a concurrent ``complete_task`` / ``block_task`` will win
+    the race and this call returns ``False``.
+    """
+    with write_txn(conn):
+        if expected_run_id is None:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'review',
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL
+                 WHERE id = ?
+                   AND status IN ('running', 'ready')
+                """,
+                (task_id,),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'review',
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL
+                 WHERE id = ?
+                   AND status IN ('running', 'ready')
+                   AND current_run_id = ?
+                """,
+                (task_id, int(expected_run_id)),
+            )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="review_requested", status="review_requested",
+            summary=reason,
+        )
+        if run_id is None and reason:
+            run_id = _synthesize_ended_run(
+                conn, task_id,
+                outcome="review_requested",
+                summary=reason,
+            )
+        _append_event(
+            conn, task_id, "review_requested",
+            {"reason": reason} if reason else None,
+            run_id=run_id,
+        )
+        return True
+
+
+def move_to_human_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Transition ``running|review -> human_review`` (auto-review agent passed;
+    waiting on a human decision).
+
+    Called by the auto-review agent after it verifies the PR and merges. The
+    dispatcher does **not** auto-spawn anything for ``human_review`` — the
+    task parks until a human runs ``hermes kanban approve <id>`` /
+    ``reject <id>`` or the equivalent tools fire.
+
+    ``reason`` (e.g. the PR URL + one-line summary) is carried on the
+    ``human_review_requested`` event so gateway notifiers can render it to the
+    subscribed human directly without a second SQL round-trip.
+    """
+    with write_txn(conn):
+        if expected_run_id is None:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'human_review',
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL
+                 WHERE id = ?
+                   AND status IN ('running', 'review')
+                """,
+                (task_id,),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'human_review',
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL
+                 WHERE id = ?
+                   AND status IN ('running', 'review')
+                   AND current_run_id = ?
+                """,
+                (task_id, int(expected_run_id)),
+            )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="human_review_requested",
+            status="human_review_requested",
+            summary=reason,
+        )
+        if run_id is None and reason:
+            run_id = _synthesize_ended_run(
+                conn, task_id,
+                outcome="human_review_requested",
+                summary=reason,
+            )
+        _append_event(
+            conn, task_id, "human_review_requested",
+            {"reason": reason} if reason else None,
+            run_id=run_id,
+        )
+        return True
+
+
+def approve_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+) -> bool:
+    """Transition ``human_review -> done`` (human approval).
+
+    The closing audit event is ``approved`` (distinct from ``completed`` so
+    the dashboard / notifier can render a different glyph). Triggers the same
+    downstream effects as ``complete_task``: clears the failure counter,
+    recomputes ready for dependents, and cleans up the workspace.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status       = 'done',
+                   completed_at = ?,
+                   claim_lock   = NULL,
+                   claim_expires= NULL,
+                   worker_pid   = NULL
+             WHERE id = ?
+               AND status = 'human_review'
+            """,
+            (now, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _synthesize_ended_run(
+            conn, task_id,
+            outcome="approved",
+            summary=reason,
+        )
+        _append_event(
+            conn, task_id, "approved",
+            {"reason": reason} if reason else None,
+            run_id=run_id,
+        )
+    _clear_failure_counter(conn, task_id)
+    recompute_ready(conn)
+    _cleanup_workspace(conn, task_id)
+    return True
+
+
+def reject_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+) -> bool:
+    """Transition ``review|human_review -> running`` (rejection bounces the
+    work back to the original worker with an audit comment for the next run).
+
+    Used by both:
+
+    * the auto-review agent — when it finds the PR doesn't satisfy AC, it
+      calls this to bounce the task back so the original worker can iterate,
+    * the human reviewer — when they reject what landed in ``human_review``.
+
+    ``reason`` is captured both on the ``rejected`` event payload and as a
+    synthesized closing run summary so the next worker's ``kanban_show``
+    surfaces the rejection rationale via the normal prior-runs path.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'running',
+                   started_at    = COALESCE(started_at, ?),
+                   completed_at  = NULL,
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL
+             WHERE id = ?
+               AND status IN ('review', 'human_review')
+            """,
+            (now, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        # Synthesize a closing run so prior attempt history captures the
+        # rejection rationale even though no worker was actively claimed.
+        # The next ready->running transition will open a fresh run.
+        run_id = _synthesize_ended_run(
+            conn, task_id,
+            outcome="rejected",
+            summary=reason,
+        )
+        # Flip status back to 'ready' so the dispatcher picks it up on the
+        # next tick: 'running' with no claim_lock would otherwise live in
+        # limbo until release_stale_claims swept it.
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', current_run_id = NULL "
+            "WHERE id = ? AND status = 'running' AND claim_lock IS NULL",
+            (task_id,),
+        )
+        _append_event(
+            conn, task_id, "rejected",
+            {"reason": reason} if reason else None,
+            run_id=run_id,
+        )
+    return True
 
 
 def specify_triage_task(
