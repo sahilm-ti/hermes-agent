@@ -965,32 +965,64 @@ def skill_view(
                 if found_md.name != "SKILL.md":
                     _record(None, found_md)
 
-        if len(candidates) > 1:
-            paths = [str(smd) for _, smd in candidates]
-            logging.getLogger(__name__).warning(
-                "Skill name collision for '%s': %d candidates — %s",
-                name, len(candidates), "; ".join(paths),
-            )
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": (
-                        f"Ambiguous skill name '{name}': {len(candidates)} skills "
-                        "match across your local skills dir and external_dirs. "
-                        "Refusing to guess — load one explicitly by its categorized path."
-                    ),
-                    "matches": paths,
-                    "hint": (
-                        "Pass the full relative path instead of the bare name "
-                        "(e.g., 'category/skill-name'), or rename one of the "
-                        "colliding skills so each name is unique."
-                    ),
-                },
-                ensure_ascii=False,
-            )
-
         if candidates:
-            skill_dir, skill_md = candidates[0]
+            # Deterministic resolution: prefer the highest-priority tier
+            # (SKILLS_DIR first, then each external_dir in declaration order).
+            # Within a tier, if multiple candidates collide, pick the
+            # most-recently modified SKILL.md. Surfacing a *crashing* error
+            # on collision proved too brittle for the worker preload path
+            # (see issue: stale profile skill copy crashed every kanban
+            # worker spawn). The CLI has no human to disambiguate, so we
+            # pick — loudly — and surface the collision via a WARN log so
+            # an operator can clean up the stale copy.
+            #
+            # Tier assignment: a candidate's tier is the index of the
+            # first ``all_dirs`` entry it lives under. Candidates outside
+            # any known dir (shouldn't happen with the strategies above)
+            # are sorted to the end.
+            try:
+                resolved_dirs = [d.resolve() for d in all_dirs]
+            except OSError:
+                resolved_dirs = list(all_dirs)
+
+            def _tier_of(smd: Path) -> int:
+                try:
+                    rmd = smd.resolve()
+                except OSError:
+                    rmd = smd
+                for i, d in enumerate(resolved_dirs):
+                    try:
+                        rmd.relative_to(d)
+                        return i
+                    except ValueError:
+                        continue
+                return len(resolved_dirs)
+
+            def _mtime(smd: Path) -> float:
+                try:
+                    return smd.stat().st_mtime
+                except OSError:
+                    return 0.0
+
+            # Sort: by tier ascending, then mtime descending (newest first).
+            ranked = sorted(
+                candidates,
+                key=lambda item: (_tier_of(item[1]), -_mtime(item[1])),
+            )
+            skill_dir, skill_md = ranked[0]
+
+            if len(candidates) > 1:
+                chosen_path = str(skill_md)
+                other_paths = [str(smd) for _, smd in ranked[1:]]
+                logging.getLogger(__name__).warning(
+                    "Skill name collision for '%s' resolved to %s "
+                    "(tier=%d). Shadowed candidates: %s. "
+                    "Remove the stale copies to silence this warning.",
+                    name,
+                    chosen_path,
+                    _tier_of(skill_md),
+                    "; ".join(other_paths),
+                )
 
         if not skill_md or not skill_md.exists():
             available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
