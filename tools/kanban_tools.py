@@ -1099,6 +1099,11 @@ def _handle_create(args: dict, **kw) -> str:
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
+    auto_subscribe, bool_error = _parse_bool_arg(
+        args, "auto_subscribe", default=True,
+    )
+    if bool_error:
+        return tool_error(bool_error)
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -1271,8 +1276,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         logger.warning(
             "_maybe_auto_subscribe failed: %r (platform=%r key_set=%r)",
             _exc, platform, bool(chat_id),
-        )
-        return False
+        )        return False
 
 
 def _handle_unblock(args: dict, **kw) -> str:
@@ -1997,6 +2001,23 @@ KANBAN_CREATE_SCHEMA = {
                     "continuation turns the worker may take before the task "
                     "is blocked for review. Ignored unless goal_mode is "
                     "true. Defaults to the goal-engine default (20)."
+                ),
+            },
+            "auto_subscribe": {
+                "type": "boolean",
+                "description": (
+                    "Default true. When this tool is called inside a "
+                    "gateway message handler (e.g. orchestrator agent "
+                    "creating a task in response to a Telegram message), "
+                    "auto-subscribe the originating chat to the new "
+                    "task's terminal events so the user gets a "
+                    "notification on completed / blocked / "
+                    "human_review_requested. Outside the gateway "
+                    "(CLI, cron, dispatcher-spawned worker) no session "
+                    "origin exists and this is a no-op regardless. Set "
+                    "false to suppress even when origin is present "
+                    "(e.g. internal fan-out where the user only wants "
+                    "the parent's notification)."
                 ),
             },
             "board": _board_schema_prop(),
