@@ -57,6 +57,8 @@ AUTHOR_MAP = {
     "wangpuv@hotmail.com": "wangpuv",
     "202622897+ticketclosed-wontfix@users.noreply.github.com": "ticketclosed-wontfix",
     "wuxuebin1993@gmail.com": "victorGPT",
+    # sahilm-ti
+    "sahil.marwaha@trilogy.com": "sahilm-ti",
     # teknium (multiple emails)
     "teknium1@gmail.com": "teknium1",
     "kenyon1977@gmail.com": "kenyonxu",
