@@ -5876,13 +5876,16 @@ def _is_managed_scratch_path(p: Path) -> bool:
 
 
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
-    """Remove a task's scratch workspace dir and kill its stale tmux session.
+    """Clean a completed task's worktree and stale tmux session.
 
     Called from :func:`complete_task` after the DB transaction commits.
     Best-effort — any error is swallowed so cleanup never blocks task completion.
-    ``scratch`` workspaces are removed; ``worktree`` workspaces are removed only
-    when provably free of work (clean tree, every commit reachable from a
-    remote-tracking ref); ``dir`` workspaces are intentionally preserved.
+    Scratch paths are deliberately not removed here: this function runs inside
+    the completing worker, which can still have its scratch directory as its
+    current working directory. Dispatcher-driven ``gc_scratch_workspaces``
+    removes settled scratch paths after the worker has exited. Worktrees are
+    removed only when provably free of work (clean tree, every commit reachable
+    from a remote-tracking ref); ``dir`` workspaces are intentionally preserved.
     """
     try:
         row = conn.execute(
@@ -5924,26 +5927,8 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             _cleanup_worktree_workspace(task_id, path, row["branch_name"])
             _try_cleanup_parent_workspaces(conn, task_id)
             return
-        import shutil
-        wp = Path(path)
-        if wp.is_dir():
-            # Containment guard (#28818): a board's ``default_workdir`` can
-            # pair ``workspace_kind='scratch'`` with a user-supplied path
-            # pointing at a real source tree. Without this check, task
-            # completion would unconditionally ``shutil.rmtree`` that path
-            # and silently delete the user's source data.
-            if _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Removed scratch workspace: %s", wp)
-            else:
-                _log.warning(
-                    "Refusing to remove out-of-scratch workspace for task %s: %s "
-                    "(workspace_kind='scratch' but path is outside any "
-                    "kanban-managed workspaces root)",
-                    task_id, wp,
-                )
-        # Also kill the tmux session for the worker that owned this task,
-        # if the tmux session is now dead (worker process exited).
+        # Scratch cleanup is deferred to the dispatcher. Do not delete the
+        # completing worker's current directory from inside that process.
         _cleanup_worker_tmux(conn, task_id)
         # After cleaning up this task's workspace, check if any parent
         # tasks now have all children done — their deferred cleanup can
@@ -6017,12 +6002,13 @@ def _cleanup_worktree_workspace(
 
 
 def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
-    """Clean up parent scratch workspaces now that *task_id* completed.
+    """Clean up parent worktrees now that *task_id* completed.
 
     When a parent task's cleanup was deferred because it had active children,
     this function is called after each child completes.  If all children of a
-    parent are now done/archived/failed/cancelled, the parent's scratch
-    workspace is removed (#33774).
+    parent are now done/archived/failed/cancelled, the parent's worktree is
+    eligible for its normal conservative cleanup. Scratch cleanup remains
+    dispatcher-owned so no worker deletes a live process's current directory.
     """
     try:
         parents = conn.execute(
@@ -6056,13 +6042,44 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                     parent_id, row["workspace_path"], row["branch_name"]
                 )
                 continue
-            import shutil
-            wp = Path(row["workspace_path"])
-            if wp.is_dir() and _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
         pass  # best-effort
+
+
+def gc_scratch_workspaces(conn: sqlite3.Connection) -> int:
+    """Reap safe, settled scratch workspaces from the dispatcher process.
+
+    The owning task must be terminal, unclaimed, have no non-terminal children,
+    and point inside Hermes-managed scratch storage. This intentionally runs on
+    dispatcher ticks rather than in ``complete_task`` so a worker never deletes
+    its own current working directory.
+    """
+    import shutil
+
+    rows = conn.execute(
+        "SELECT t.id, t.workspace_path FROM tasks t "
+        "WHERE t.workspace_kind = 'scratch' "
+        "  AND t.workspace_path IS NOT NULL "
+        "  AND t.status IN ('done', 'blocked', 'archived', 'failed', 'cancelled') "
+        "  AND t.claim_lock IS NULL "
+        "  AND NOT EXISTS ("
+        "    SELECT 1 FROM task_links l JOIN tasks c ON c.id = l.child_id "
+        "    WHERE l.parent_id = t.id "
+        "      AND c.status NOT IN ('done', 'archived', 'failed', 'cancelled')"
+        "  )"
+    ).fetchall()
+    reaped = 0
+    for row in rows:
+        try:
+            path = Path(row["workspace_path"])
+            if not path.is_dir() or not _is_managed_scratch_path(path):
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            reaped += 1
+            _log.debug("gc: removed scratch workspace for %s: %s", row["id"], path)
+        except Exception:
+            pass  # best-effort — preserve paths on any uncertainty
+    return reaped
 
 
 def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
@@ -9952,6 +9969,7 @@ def _dispatch_once_locked(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
     result.crashed = detect_crashed_workers(conn)
+    gc_scratch_workspaces(conn)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
