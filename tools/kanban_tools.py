@@ -859,6 +859,140 @@ def _handle_unblock(args: dict, **kw) -> str:
         return tool_error(f"kanban_unblock: {e}")
 
 
+def _handle_review(args: dict, **kw) -> str:
+    """Transition the worker's task to 'review' (auto-review agent handoff)."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    reason = args.get("reason")
+    if not reason or not str(reason).strip():
+        return tool_error(
+            "reason is required — pass the PR URL plus a one-line summary"
+        )
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok = kb.move_to_review(
+                conn, tid,
+                reason=reason,
+                expected_run_id=_worker_run_id(tid),
+            )
+            if not ok:
+                return tool_error(
+                    f"could not move {tid} to review (unknown id or "
+                    f"not in running/ready)"
+                )
+            return _ok(task_id=tid, status="review")
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_review: {e}")
+    except Exception as e:
+        logger.exception("kanban_review failed")
+        return tool_error(f"kanban_review: {e}")
+
+
+def _handle_human_review(args: dict, **kw) -> str:
+    """Transition a task to 'human_review' (auto-review agent passed)."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    reason = args.get("reason")
+    if not reason or not str(reason).strip():
+        return tool_error(
+            "reason is required — pass the PR URL / merged-commit hint for the human"
+        )
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok = kb.move_to_human_review(
+                conn, tid,
+                reason=reason,
+                expected_run_id=_worker_run_id(tid),
+            )
+            if not ok:
+                return tool_error(
+                    f"could not move {tid} to human_review (unknown id or "
+                    f"not in running/review)"
+                )
+            return _ok(task_id=tid, status="human_review")
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_human_review: {e}")
+    except Exception as e:
+        logger.exception("kanban_human_review failed")
+        return tool_error(f"kanban_human_review: {e}")
+
+
+def _handle_approve(args: dict, **kw) -> str:
+    """Approve a human_review task (-> done)."""
+    tid = args.get("task_id")
+    if not tid:
+        return tool_error("task_id is required")
+    reason = args.get("reason")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok = kb.approve_task(conn, str(tid), reason=reason)
+            if not ok:
+                return tool_error(
+                    f"could not approve {tid} (not in human_review or unknown)"
+                )
+            return _ok(task_id=str(tid), status="done")
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_approve: {e}")
+    except Exception as e:
+        logger.exception("kanban_approve failed")
+        return tool_error(f"kanban_approve: {e}")
+
+
+def _handle_reject(args: dict, **kw) -> str:
+    """Reject a review / human_review task (-> ready, with audit comment)."""
+    tid = args.get("task_id")
+    if not tid:
+        return tool_error("task_id is required")
+    reason = args.get("reason")
+    if not reason or not str(reason).strip():
+        return tool_error(
+            "reason is required — the next worker needs to know what to fix"
+        )
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            author = os.environ.get("HERMES_PROFILE") or "worker"
+            kb.add_comment(conn, str(tid), author, f"REJECTED: {reason}")
+            ok = kb.reject_task(conn, str(tid), reason=reason)
+            if not ok:
+                return tool_error(
+                    f"could not reject {tid} (not in review/human_review)"
+                )
+            return _ok(task_id=str(tid), status="ready")
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_reject: {e}")
+    except Exception as e:
+        logger.exception("kanban_reject failed")
+        return tool_error(f"kanban_reject: {e}")
+
+
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact."""
     parent_id = args.get("parent_id")
@@ -1326,6 +1460,119 @@ KANBAN_UNBLOCK_SCHEMA = {
     },
 }
 
+KANBAN_REVIEW_SCHEMA = {
+    "name": "kanban_review",
+    "description": (
+        "Move your current running task to 'review' so the auto-review "
+        "agent picks it up. Use this immediately after opening a PR for "
+        "the task's deliverable. ``reason`` should be the PR URL plus a "
+        "one-line summary so the review agent and human-in-the-loop "
+        "have everything they need without reading the whole thread."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "PR URL plus a one-line summary of what's ready for "
+                    "review. Surfaced on the review_requested event and "
+                    "carried in the closing-run summary."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["reason"],
+    },
+}
+
+KANBAN_HUMAN_REVIEW_SCHEMA = {
+    "name": "kanban_human_review",
+    "description": (
+        "Move a task into 'human_review' (auto-review agent has finished "
+        "verifying / merging and the task now waits on a human "
+        "approve/reject decision). The dispatcher does NOT auto-spawn "
+        "anything for human_review — the task parks until somebody "
+        "runs kanban_approve / kanban_reject or the equivalent CLI."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Human-facing handoff (merged PR URL, summary of "
+                    "what changed). Surfaced verbatim to the gateway "
+                    "notifier so the human sees it inline."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["reason"],
+    },
+}
+
+KANBAN_APPROVE_SCHEMA = {
+    "name": "kanban_approve",
+    "description": (
+        "Approve a task currently in 'human_review' (-> done). Use this "
+        "when you (or the dispatched reviewer) judge the work meets the "
+        "task's acceptance criteria."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Task id to approve. Must currently be in human_review.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Optional approval note (audit-only).",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id"],
+    },
+}
+
+KANBAN_REJECT_SCHEMA = {
+    "name": "kanban_reject",
+    "description": (
+        "Reject a task currently in 'review' or 'human_review'. Bounces "
+        "the task back to 'ready' with a durable comment so the next "
+        "worker run sees the rejection rationale via the normal "
+        "kanban_show prior-runs path."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Task id to reject. Must currently be in review or human_review.",
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "What needs to change before this can land. The "
+                    "next worker sees this in their context — be "
+                    "specific and actionable."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id", "reason"],
+    },
+}
+
 KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
@@ -1428,4 +1675,40 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+)
+
+registry.register(
+    name="kanban_review",
+    toolset="kanban",
+    schema=KANBAN_REVIEW_SCHEMA,
+    handler=_handle_review,
+    check_fn=_check_kanban_mode,
+    emoji="🔎",
+)
+
+registry.register(
+    name="kanban_human_review",
+    toolset="kanban",
+    schema=KANBAN_HUMAN_REVIEW_SCHEMA,
+    handler=_handle_human_review,
+    check_fn=_check_kanban_mode,
+    emoji="⏳",
+)
+
+registry.register(
+    name="kanban_approve",
+    toolset="kanban",
+    schema=KANBAN_APPROVE_SCHEMA,
+    handler=_handle_approve,
+    check_fn=_check_kanban_mode,
+    emoji="✅",
+)
+
+registry.register(
+    name="kanban_reject",
+    toolset="kanban",
+    schema=KANBAN_REJECT_SCHEMA,
+    handler=_handle_reject,
+    check_fn=_check_kanban_mode,
+    emoji="↩",
 )
