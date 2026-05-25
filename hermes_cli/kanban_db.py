@@ -7057,26 +7057,17 @@ def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
     worker before the agent loop runs. Gate the flag on actual resolvability;
     the kanban lifecycle contract is still injected via ``KANBAN_GUIDANCE``, so
     omitting the flag only drops the supplementary pattern library.
-    """
-    from pathlib import Path as _Path
 
-    # An unset HERMES_HOME means the worker falls back to the default root
-    # home (``~/.hermes``), which ships the bundled skill.
-    base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
-    skills_root = base / "skills"
-    if not skills_root.is_dir():
-        return False
-    # Canonical bundled location first (cheap), then a bounded scan for
-    # profiles that have it nested elsewhere.
-    if (skills_root / "devops" / "kanban-worker" / "SKILL.md").is_file():
-        return True
-    try:
-        for skill_md in skills_root.rglob("kanban-worker/SKILL.md"):
-            if skill_md.is_file():
-                return True
-    except OSError:
-        pass
-    return False
+    Reuses ``_resolve_skill_under_home`` so the liveness check is exactly the
+    same lookup the spawned worker will perform — including a recursive scan
+    of ``<home>/skills`` and every ``skills.external_dirs`` entry declared in
+    the profile's config.yaml. The previous bespoke check only looked at the
+    canonical bundled path and a bounded rglob of ``<home>/skills``, missing
+    cases where the skill lived in an external dir (the profile pattern used
+    by ``braintrusteng``, which keeps a single shared skills tree under
+    ``~/.hermes/skills`` and points every profile's ``external_dirs`` at it).
+    """
+    return _resolve_skill_under_home("kanban-worker", hermes_home)
 
 
 def _worker_terminal_timeout_env(
