@@ -6238,6 +6238,40 @@ def add_notify_sub(
             )
 
 
+def backfill_null_notifier_profile(
+    conn: sqlite3.Connection, notifier_profile: str,
+) -> int:
+    """Claim every ``kanban_notify_subs`` row that has no ``notifier_profile``
+    by stamping it with ``notifier_profile``.
+
+    Returns the number of rows updated.
+
+    A NULL ``notifier_profile`` is by definition stuck on multi-gateway
+    setups: every gateway's notifier filters it out (the comparison is
+    ``owner_profile and owner_profile != current``), so the events never
+    get delivered. Whichever gateway runs this backfill first takes
+    ownership; subsequent gateways are no-ops because the column is
+    already populated.
+
+    Called once at gateway startup from
+    ``_kanban_notifier_watcher`` so legacy rows (from before PR #9's
+    auto-subscribe path was teaching the profile) self-heal without
+    requiring a manual SQL nudge per task. See task t_b212a749.
+    """
+    if not notifier_profile:
+        return 0
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET notifier_profile = ?
+             WHERE notifier_profile IS NULL OR notifier_profile = ''
+            """,
+            (notifier_profile,),
+        )
+    return cur.rowcount or 0
+
+
 def list_notify_subs(
     conn: sqlite3.Connection, task_id: Optional[str] = None,
 ) -> list[dict]:
