@@ -4627,8 +4627,9 @@ def reject_task(
     *,
     reason: Optional[str] = None,
 ) -> bool:
-    """Transition ``review|human_review -> running`` (rejection bounces the
-    work back to the original worker with an audit comment for the next run).
+    """Transition ``review|human_review|running(claimed-from-review) -> ready``
+    (rejection bounces the work back to the original worker with an audit
+    comment for the next run).
 
     Used by both:
 
@@ -4636,12 +4637,22 @@ def reject_task(
       calls this to bounce the task back so the original worker can iterate,
     * the human reviewer — when they reject what landed in ``human_review``.
 
+    The ``running`` case covers the auto-review flow:
+    ``claim_review_task`` transitions ``review -> running`` and records a
+    ``claimed`` event with ``payload.source_status == 'review'`` before
+    spawning the reviewer worker. When that worker calls ``kanban_reject``,
+    the task is technically in ``running``; we look at the most recent
+    ``claimed`` event for the current run, and if it claims from ``review``
+    (or ``human_review``), we allow the rejection.
+
     ``reason`` is captured both on the ``rejected`` event payload and as a
     synthesized closing run summary so the next worker's ``kanban_show``
     surfaces the rejection rationale via the normal prior-runs path.
     """
     now = int(time.time())
     with write_txn(conn):
+        # Primary path: still parked in review/human_review (CLI human
+        # reviewer, or any caller that has not yet claimed the task).
         cur = conn.execute(
             """
             UPDATE tasks
@@ -4656,16 +4667,39 @@ def reject_task(
             """,
             (now, task_id),
         )
-        if cur.rowcount != 1:
-            return False
-        # Synthesize a closing run so prior attempt history captures the
-        # rejection rationale even though no worker was actively claimed.
-        # The next ready->running transition will open a fresh run.
-        run_id = _synthesize_ended_run(
-            conn, task_id,
-            outcome="rejected",
-            summary=reason,
-        )
+        run_id: Optional[int]
+        if cur.rowcount == 1:
+            # No active run on this transition — the task was parked in
+            # review/human_review with no worker claimed. Synthesize a
+            # closed run so attempt history captures the rejection.
+            run_id = _synthesize_ended_run(
+                conn, task_id,
+                outcome="rejected",
+                summary=reason,
+            )
+        else:
+            # Fallback: the task is in ``running``, claimed by the
+            # auto-review worker via claim_review_task. Confirm by
+            # checking the most recent ``claimed`` event payload —
+            # source_status must be review/human_review.
+            if not _is_review_claimed_run(conn, task_id):
+                return False
+            # Close the reviewer's active run as 'rejected' (this
+            # clears current_run_id and the run-row claim).
+            run_id = _end_run(
+                conn, task_id,
+                outcome="rejected",
+                summary=reason,
+                status="rejected",
+            )
+            # Drop the claim lock + worker_pid on the tasks row so the
+            # next dispatcher tick can re-spawn without waiting for
+            # release_stale_claims.
+            conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL WHERE id = ?",
+                (task_id,),
+            )
         # Flip status back to 'ready' so the dispatcher picks it up on the
         # next tick: 'running' with no claim_lock would otherwise live in
         # limbo until release_stale_claims swept it.
@@ -4680,6 +4714,38 @@ def reject_task(
             run_id=run_id,
         )
     return True
+
+
+def _is_review_claimed_run(
+    conn: sqlite3.Connection, task_id: str
+) -> bool:
+    """Return True iff the task's current run was claimed from review/human_review.
+
+    Inspects the most recent ``claimed`` event for the task's
+    ``current_run_id`` and checks ``payload.source_status``. Used by
+    ``reject_task`` to permit rejection from the auto-review worker
+    even though the task is technically in ``running``.
+    """
+    row = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row or not row["current_run_id"]:
+        return False
+    run_id = int(row["current_run_id"])
+    ev = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, run_id),
+    ).fetchone()
+    if ev is None or not ev["payload"]:
+        return False
+    try:
+        payload = json.loads(ev["payload"])
+    except (ValueError, TypeError):
+        return False
+    return payload.get("source_status") in ("review", "human_review")
 
 
 def specify_triage_task(
@@ -6462,13 +6528,44 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #
+    # Exception: if the task was rejected (auto-reviewer or human) AFTER
+    # the most recent PR-URL comment, the rejection is a signal to keep
+    # working on the existing PR — re-spawn so the next worker can read
+    # the rejection rationale and force-push a fix. Without this, the
+    # reject→fix-same-PR loop deadlocks because the dispatcher keeps
+    # seeing the PR URL and refusing to spawn.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    latest_pr_ts: Optional[int] = None
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            if latest_pr_ts is None or c["created_at"] > latest_pr_ts:
+                latest_pr_ts = int(c["created_at"])
+    if latest_pr_ts is not None:
+        # Most recent rejection signal from either an event row or a run
+        # outcome — whichever is newer wins.
+        reject_event = conn.execute(
+            "SELECT MAX(created_at) AS ts FROM task_events "
+            "WHERE task_id = ? AND kind = 'rejected'",
+            (task_id,),
+        ).fetchone()
+        reject_run = conn.execute(
+            "SELECT MAX(ended_at) AS ts FROM task_runs "
+            "WHERE task_id = ? AND outcome = 'rejected'",
+            (task_id,),
+        ).fetchone()
+        candidates = [
+            int(r["ts"]) for r in (reject_event, reject_run)
+            if r is not None and r["ts"] is not None
+        ]
+        latest_reject_ts = max(candidates) if candidates else None
+        if latest_reject_ts is None or latest_reject_ts <= latest_pr_ts:
             return "active_pr"
+        # else: rejection post-dates the PR → fall through, no guard.
 
     return None
 
