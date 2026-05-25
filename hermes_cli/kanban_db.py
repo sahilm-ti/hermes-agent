@@ -3120,44 +3120,28 @@ def _is_managed_scratch_path(p: Path) -> bool:
 
 
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
-    """Remove a task's scratch workspace dir and kill its stale tmux session.
+    """Best-effort cleanup that runs after a task completes.
 
-    Called from :func:`complete_task` after the DB transaction commits.
-    Best-effort — any error is swallowed so cleanup never blocks task completion.
-    Only ``scratch`` workspaces are removed; ``worktree`` and ``dir`` workspaces
-    are intentionally preserved.
+    Historically this also did ``shutil.rmtree`` on the task's scratch
+    workspace, but that is unsafe: ``complete_task`` is invoked by the worker
+    itself (via ``kanban_complete``) **inside the worker's own process**, and
+    the worker's process cwd is the very workspace directory we'd be deleting.
+    Removing the inode under a live process means every subsequent
+    ``os.getcwd()`` call in that process raises ENOENT — which on a Hermes
+    worker manifests as ``FileNotFoundError`` in ``tools/terminal_tool.py``
+    and ``tools/code_execution_tool.py`` and crashes every remaining tool
+    dispatch in the worker's final turn (e.g. follow-up status writes,
+    notification hooks).
+
+    Scratch workspaces are durable now: they live until the task is archived
+    and ``hermes kanban gc`` reaps them (see ``_cmd_gc`` in hermes_cli/kanban.py),
+    by which point the worker process has long since exited and the inode
+    can be unlinked safely.
+
+    We still do the tmux session cleanup here — it's safe (it only kills a
+    detached worker tmux session that the worker process doesn't depend on).
     """
     try:
-        row = conn.execute(
-            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if not row:
-            return
-        kind: Optional[str] = row["workspace_kind"]
-        path: Optional[str] = row["workspace_path"]
-        if kind != "scratch" or not path:
-            return
-        import shutil
-        wp = Path(path)
-        if wp.is_dir():
-            # Containment guard (#28818): a board's ``default_workdir`` can
-            # pair ``workspace_kind='scratch'`` with a user-supplied path
-            # pointing at a real source tree. Without this check, task
-            # completion would unconditionally ``shutil.rmtree`` that path
-            # and silently delete the user's source data.
-            if _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Removed scratch workspace: %s", wp)
-            else:
-                _log.warning(
-                    "Refusing to remove out-of-scratch workspace for task %s: %s "
-                    "(workspace_kind='scratch' but path is outside any "
-                    "kanban-managed workspaces root)",
-                    task_id, wp,
-                )
-        # Also kill the tmux session for the worker that owned this task,
-        # if the tmux session is now dead (worker process exited).
         _cleanup_worker_tmux(conn, task_id)
     except Exception:
         pass  # best-effort — never block completion

@@ -1006,6 +1006,37 @@ def _parse_env_var(name: str, default: str, converter=int, type_label: str = "in
         )
 
 
+def _safe_local_default_cwd() -> str:
+    """Return a safe default cwd for the local backend.
+
+    Normally this is ``os.getcwd()``. But if the process's cwd inode has been
+    unlinked out from under us (e.g. the kanban scratch workspace was rmtree'd
+    while the worker was still chdir'd into it), ``os.getcwd()`` raises
+    ``FileNotFoundError`` and would otherwise crash every subsequent tool
+    dispatch. In that case we fall back to a known-good directory so the
+    worker can finish its turn (report status, write logs, etc.) instead of
+    going into a tool-crash loop.
+
+    Fallback order: ``HERMES_KANBAN_WORKSPACES_ROOT`` (when the worker is a
+    kanban worker), ``HOME``, then ``/`` as a last resort.
+    """
+    try:
+        return os.getcwd()
+    except (FileNotFoundError, OSError) as e:
+        ws_root = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
+        for candidate in (ws_root, os.path.expanduser("~"), "/"):
+            if candidate and os.path.isdir(candidate):
+                logger.warning(
+                    "os.getcwd() failed (%s); falling back to %r for default cwd. "
+                    "This usually means the process's cwd was deleted under it "
+                    "(e.g. a kanban scratch workspace was rmtree'd mid-run).",
+                    e, candidate,
+                )
+                return candidate
+        # Truly nothing usable — re-raise so the caller sees the original error.
+        raise
+
+
 def _get_env_config() -> Dict[str, Any]:
     """Get terminal environment configuration from environment variables."""
     # Default image with Python and Node.js for maximum compatibility
@@ -1018,7 +1049,7 @@ def _get_env_config() -> Dict[str, Any]:
     # remote home, Vercel uses its documented workspace root, and everything
     # else starts in the backend's default root-like cwd.
     if env_type == "local":
-        default_cwd = os.getcwd()
+        default_cwd = _safe_local_default_cwd()
     elif env_type == "ssh":
         default_cwd = "~"
     elif env_type == "vercel_sandbox":
@@ -1036,7 +1067,7 @@ def _get_env_config() -> Dict[str, Any]:
     host_cwd = None
     host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
     if env_type == "docker" and mount_docker_cwd:
-        docker_cwd_source = os.getenv("TERMINAL_CWD") or os.getcwd()
+        docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_local_default_cwd()
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
             any(candidate.startswith(p) for p in host_prefixes)

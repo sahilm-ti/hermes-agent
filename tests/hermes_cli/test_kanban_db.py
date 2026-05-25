@@ -1471,11 +1471,18 @@ def test_worktree_workspace_returns_intended_path(kanban_home, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Scratch cleanup containment (#28818)
+# Scratch cleanup: post-complete safety (#REPLACE_ME)
 # ---------------------------------------------------------------------------
 
-def test_cleanup_workspace_removes_managed_scratch_dir(kanban_home):
-    """A scratch workspace under the kanban workspaces root is removed."""
+def test_complete_task_leaves_scratch_workspace_intact(kanban_home):
+    """``complete_task`` MUST NOT rmtree the worker's scratch workspace.
+
+    Worker processes run with cwd == workspace_path. Removing that dir under a
+    live worker makes every subsequent ``os.getcwd()`` raise ENOENT and
+    crashes the worker's final-turn tool dispatch (see fix:
+    kanban-scratch-workspace-self-delete). Scratch cleanup now belongs to
+    ``hermes kanban gc`` once the task is archived.
+    """
     with kb.connect() as conn:
         t = kb.create_task(conn, title="scratchy")
         task = kb.get_task(conn, t)
@@ -1483,16 +1490,20 @@ def test_cleanup_workspace_removes_managed_scratch_dir(kanban_home):
         kb.set_workspace_path(conn, t, ws)
         assert ws.is_dir()
         kb.complete_task(conn, t, result="ok")
-    assert not ws.exists(), "Hermes-managed scratch dir should be cleaned up"
+    assert ws.exists(), (
+        "Hermes-managed scratch dir must survive complete_task — "
+        "the live worker still has it as cwd"
+    )
 
 
-def test_cleanup_workspace_refuses_path_outside_scratch_root(kanban_home, tmp_path):
-    """A scratch task with a user path outside the workspaces root must NOT be deleted (#28818).
+def test_complete_task_does_not_touch_path_outside_scratch_root(kanban_home, tmp_path):
+    """Regression for the original #28818 data-loss vector.
 
-    Reproduces the data-loss vector where a board's ``default_workdir`` is set
-    to a real source directory; tasks created without an explicit
-    ``workspace_kind`` inherit ``scratch`` semantics, and the old cleanup path
-    would ``shutil.rmtree`` the user's source tree on task completion.
+    A board's ``default_workdir`` can pair ``workspace_kind='scratch'`` with a
+    user-supplied path (e.g. a real source tree). The cleanup path used to
+    ``shutil.rmtree`` that path on completion; the containment guard later
+    refused to. After the self-delete fix, ``complete_task`` doesn't touch
+    workspace paths at all, but we keep the assertion to lock that in.
     """
     real_source = tmp_path / "real-source"
     real_source.mkdir()
@@ -1501,10 +1512,6 @@ def test_cleanup_workspace_refuses_path_outside_scratch_root(kanban_home, tmp_pa
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="ship")
-        # Simulate the bad state directly: workspace_kind='scratch' (default)
-        # but workspace_path pointing at the user's real source tree, which is
-        # exactly what board.default_workdir produces when the task is created
-        # without an explicit workspace_kind.
         conn.execute(
             "UPDATE tasks SET workspace_kind=?, workspace_path=? WHERE id=?",
             ("scratch", str(real_source), t),
@@ -1512,17 +1519,14 @@ def test_cleanup_workspace_refuses_path_outside_scratch_root(kanban_home, tmp_pa
         conn.commit()
         kb.complete_task(conn, t, result="ok")
 
-    assert real_source.exists(), "User source tree must not be deleted by scratch cleanup"
+    assert real_source.exists(), "User source tree must not be deleted by complete_task"
     assert (real_source / ".git").exists()
     assert (real_source / "README.md").read_text(encoding="utf-8") == "important"
 
 
-def test_cleanup_workspace_honors_workspaces_root_env_override(tmp_path, monkeypatch):
-    """``HERMES_KANBAN_WORKSPACES_ROOT`` extends the managed-scratch set.
-
-    Worker subprocesses run with this env var injected by the dispatcher. The
-    cleanup containment check must treat paths under it as managed even when
-    they sit outside the active kanban home.
+def test_complete_task_leaves_override_root_scratch_intact(tmp_path, monkeypatch):
+    """Worker subprocesses set ``HERMES_KANBAN_WORKSPACES_ROOT``; the workspace
+    under it MUST NOT be deleted on complete_task (the worker still owns its cwd).
     """
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -1544,7 +1548,10 @@ def test_cleanup_workspace_honors_workspaces_root_env_override(tmp_path, monkeyp
         conn.commit()
         kb.complete_task(conn, t, result="ok")
 
-    assert not scratch_dir.exists(), "Override-root scratch dir should be cleaned up"
+    assert scratch_dir.exists(), (
+        "scratch dir under override root must survive complete_task — "
+        "gc collects it later once the task is archived"
+    )
 
 
 def test_is_managed_scratch_path_accepts_per_board_workspaces(kanban_home, tmp_path):

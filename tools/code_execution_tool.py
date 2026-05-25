@@ -1635,8 +1635,14 @@ def _resolve_child_cwd(mode: str, staging_dir: str) -> str:
         expanded = os.path.expanduser(raw)
         if os.path.isdir(expanded):
             return expanded
-    here = os.getcwd()
-    if os.path.isdir(here):
+    here: Optional[str]
+    try:
+        here = os.getcwd()
+    except (FileNotFoundError, OSError):
+        # cwd inode unlinked under us (e.g. kanban scratch workspace rmtree'd
+        # mid-run). Fall straight through to the staging tmpdir.
+        here = None
+    if here and os.path.isdir(here):
         return here
     return staging_dir
 
