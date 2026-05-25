@@ -70,6 +70,7 @@ AUTHOR_MAP = {
     "mr.aashiz@gmail.com": "aashizpoudel",
     "70629228+shaun0927@users.noreply.github.com": "shaun0927",
     "sahil@trilogy.com": "sahilm-ti",
+    "sahilmarwaha@Sahils-MacBook-Pro.local": "sahilm-ti",
     "98262967+Bihruze@users.noreply.github.com": "Bihruze",
     "189280367+Lempkey@users.noreply.github.com": "Lempkey",
     "leovillalbajr@gmail.com": "Lempkey",
