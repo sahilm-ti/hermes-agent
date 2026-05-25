@@ -974,8 +974,9 @@ def create_profile(
     clone_all: bool = False,
     clone_config: bool = False,
     no_alias: bool = False,
-    no_skills: bool = False,
+    no_skills: Optional[bool] = None,
     description: Optional[str] = None,
+    with_bundled_skills: bool = False,
 ) -> Path:
     """Create a new profile directory.
 
@@ -994,20 +995,55 @@ def create_profile(
     no_alias:
         If True, skip wrapper script creation.
     no_skills:
-        If True, create an empty profile with no bundled skills, and write
-        a marker file so ``hermes update`` skips re-seeding this profile's
-        skills. Mutually exclusive with ``clone_config``/``clone_all`` (those
-        explicitly copy skills from the source).
+        If True (the default since the canonical-root-skills migration),
+        create an empty profile with no bundled skills, and write a marker
+        file so ``hermes update`` and gateway start skip re-seeding this
+        profile's skills. The profile inherits skills from the canonical
+        root tree (``~/.hermes/skills``) via ``skills.external_dirs`` in
+        its ``config.yaml``. Mutually exclusive with
+        ``clone_config``/``clone_all`` (those explicitly copy skills from
+        the source) and with ``with_bundled_skills``.
+    with_bundled_skills:
+        Opt-IN switch that restores the old behavior: bootstrap a full
+        per-profile copy of the bundled skills tree. Required for users
+        who want a profile-local writeable skills/ dir (e.g. for
+        agent-modified skills that should stay private to this profile).
+        Mutually exclusive with ``no_skills``.
 
     Returns
     -------
     Path
         The newly created profile directory.
     """
+    # `with_bundled_skills=True` is the opt-in inverse of the new default
+    # `no_skills=True`. Resolve before the conflict check so a caller that
+    # passes only `with_bundled_skills=True` gets the bootstrap behavior.
+    if with_bundled_skills:
+        if no_skills is True:
+            raise ValueError(
+                "no_skills=True and with_bundled_skills=True are mutually exclusive."
+            )
+        no_skills = False
+    elif no_skills is None:
+        # Default: skip bundled skills UNLESS we're cloning (which carries
+        # its own skills from the source profile). This is the v2
+        # canonical-root-skills behavior. Any clone variant — including
+        # clone_from a named profile — carries source skills, so none of
+        # them default to no_skills.
+        no_skills = not (clone_from is not None or clone_config or clone_all)
+    # no_skills is incompatible with every clone variant (clone_from / --clone
+    # / --clone-all): cloning explicitly copies the source profile's skills,
+    # so suppressing bundled skills would be contradictory. Upstream's guard
+    # included clone_from; keep it here so --no-skills --clone-from is rejected.
     if no_skills and (clone_from is not None or clone_config or clone_all):
         raise ValueError(
             "--no-skills is mutually exclusive with --clone / --clone-from / --clone-all "
             "(cloning explicitly copies skills from the source profile)."
+        )
+    if with_bundled_skills and (clone_config or clone_all):
+        raise ValueError(
+            "--with-bundled-skills is mutually exclusive with --clone / "
+            "--clone-all (cloning explicitly copies skills from the source)."
         )
     canon = normalize_profile_name(name)
     validate_profile_name(canon)
@@ -1117,16 +1153,33 @@ def create_profile(
 
     # Write the opt-out marker so seed_profile_skills() and `hermes update`'s
     # all-profile sync loop both skip this profile for bundled-skill seeding.
+    # This is the default since the canonical-root-skills migration — root
+    # `~/.hermes/skills/` is the single source of truth and per-profile copies
+    # only drift and create skill_view collisions.
     if no_skills:
         try:
             (profile_dir / NO_BUNDLED_SKILLS_MARKER).write_text(
-                "This profile opted out of bundled-skill seeding "
-                "(`hermes profile create --no-skills`).\n"
-                "Delete this file to re-enable sync on the next `hermes update`.\n",
+                "This profile has bundled-skill seeding disabled "
+                "(default since v2 — see `hermes profile create --help`).\n"
+                "Skills resolve from skills.external_dirs in config.yaml \n"
+                "(canonical root ~/.hermes/skills).\n"
+                "Delete this file and pass --with-bundled-skills to opt back\n"
+                "into per-profile bundled-skill copies on the next \n"
+                "`hermes update` / profile-skill sync run.\n",
                 encoding="utf-8",
             )
         except OSError:
             pass  # best-effort — the feature still works via the empty skills/ dir
+
+        # Point `skills.external_dirs` at the canonical root tree so the
+        # profile inherits skills without per-profile copies. We only seed
+        # this when no_skills=True AND the profile doesn't already have a
+        # cloned config.yaml from the source profile (clone flows manage
+        # their own external_dirs).
+        try:
+            _seed_external_dirs_to_root(profile_dir)
+        except Exception:
+            pass  # best-effort — user can edit config.yaml manually
 
     # Cloned configs can be older than the running Hermes (or predate schema
     # tracking entirely). Migrate config-only clones immediately so
@@ -1158,6 +1211,87 @@ def create_profile(
     _maybe_register_gateway_service(canon)
 
     return profile_dir
+
+
+def _seed_external_dirs_to_root(profile_dir: Path) -> None:
+    """Ensure ``skills.external_dirs`` in the profile's ``config.yaml``
+    includes the canonical root-home ``skills/`` path.
+
+    Creates the file if missing, appends a minimal ``skills`` block if the
+    file exists without one. Idempotent — repeated calls are safe; the root
+    path is only added once. Preserves any pre-existing keys.
+
+    The canonical root is the *default* Hermes home, NOT the profile's own
+    ``skills/`` (that's always the local SKILLS_DIR). Resolving this from
+    ``_get_default_hermes_home()`` keeps the linkage explicit even when the
+    caller has overridden ``HERMES_HOME``.
+    """
+    config_path = profile_dir / "config.yaml"
+    root_skills = (_get_default_hermes_home() / "skills").resolve()
+
+    # If the profile's own skills/ would resolve to the root (unlikely but
+    # possible on weird FS layouts) skip — get_external_skills_dirs() drops
+    # entries that collide with the local skills dir anyway.
+    try:
+        local_skills = (profile_dir / "skills").resolve()
+        if local_skills == root_skills:
+            return
+    except OSError:
+        pass
+
+    # Read existing config if present. We try to preserve comments by going
+    # through plain text first; only fall back to a full YAML rewrite when
+    # the file already has a non-empty `skills:` block we need to extend.
+    if config_path.exists():
+        try:
+            import yaml
+        except ImportError:
+            return
+        try:
+            existing = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError:
+            return
+        if not isinstance(existing, dict):
+            return
+        skills_cfg = existing.get("skills")
+        if not isinstance(skills_cfg, dict):
+            skills_cfg = {}
+        ext = skills_cfg.get("external_dirs") or []
+        if not isinstance(ext, list):
+            ext = []
+        # Normalize for dedup
+        normalized = {str(Path(os.path.expanduser(os.path.expandvars(str(e)))).resolve())
+                      for e in ext if isinstance(e, str) and e}
+        if str(root_skills) in normalized:
+            return
+        ext.append(str(root_skills))
+        skills_cfg["external_dirs"] = ext
+        existing["skills"] = skills_cfg
+        try:
+            config_path.write_text(
+                yaml.safe_dump(existing, sort_keys=False, default_flow_style=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        return
+
+    # No config.yaml yet — write a minimal stub that documents the model.
+    stub = (
+        "# Profile config. The full set of defaults lives in hermes_cli/config.py;\n"
+        "# this file overlays per-profile overrides via deep-merge.\n"
+        "#\n"
+        "# This profile inherits skills from the canonical root tree\n"
+        "# (~/.hermes/skills) instead of keeping per-profile copies. The\n"
+        "# `.no-bundled-skills` marker at the profile root tells `hermes update`\n"
+        "# and gateway start to skip re-seeding bundled skills here.\n"
+        "skills:\n"
+        f"  external_dirs:\n    - {root_skills}\n"
+    )
+    try:
+        config_path.write_text(stub, encoding="utf-8")
+    except OSError:
+        pass
 
 
 def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict]:
@@ -1255,6 +1389,200 @@ def backfill_profile_envs(quiet: bool = False) -> List[str]:
                 print(f"⚠ Could not seed .env for profile '{entry.name}': {e}")
 
     return backfilled
+
+def prune_profile_skills(
+    profile_name: str,
+    backup_dir: Optional[Path] = None,
+    dry_run: bool = False,
+    force: bool = False,
+) -> dict:
+    """Move stale duplicate skill copies out of a profile's ``skills/`` dir.
+
+    For each ``SKILL.md`` under ``<profile>/skills/``, compare against the
+    canonical root tree at ``~/.hermes/skills/<rel>/SKILL.md``:
+
+    - **same content / same name & older** → safe to prune (root wins),
+      move the skill directory to ``backup_dir``.
+    - **profile copy is newer** → keep by default (user has edited); only
+      prune when ``force=True``.
+    - **not present in root** → keep (profile-local skill).
+
+    Bookkeeping files at the profile-skills root (``.bundled_manifest``,
+    ``.curator_state``, ``.usage.json``, ``.hub/``) are *not* touched. The
+    profile's ``.no-bundled-skills`` marker is also written if missing so
+    future ``hermes update`` runs don't re-create the same drift.
+
+    Parameters
+    ----------
+    profile_name : str
+        Profile alias (e.g. ``"braintrusteng"``). The default profile
+        (``~/.hermes``) is rejected — pruning the root tree's own copies
+        is nonsensical.
+    backup_dir : Path, optional
+        Where to move pruned skill dirs. Defaults to
+        ``~/.hermes/_backups/profile-prune-<utc-iso>/<profile>/``.
+    dry_run : bool
+        Report what would happen without touching the filesystem.
+    force : bool
+        Also prune skills whose profile copy is *newer* than the root copy
+        (i.e. the user has edited the profile copy). Off by default — the
+        safe behavior is to keep user edits.
+
+    Returns
+    -------
+    dict
+        Summary with keys ``pruned`` (list of skill names moved),
+        ``kept_user_modified`` (newer in profile), ``kept_profile_local``
+        (absent from root), ``backup_dir`` (str path), ``dry_run`` (bool).
+    """
+    import datetime
+
+    canon = normalize_profile_name(profile_name)
+    validate_profile_name(canon)
+    if canon == "default":
+        raise ValueError(
+            "Cannot prune the default profile (~/.hermes) — the root tree "
+            "IS the canonical source. Use this on a named profile."
+        )
+
+    profile_dir = get_profile_dir(canon)
+    if not profile_dir.is_dir():
+        raise FileNotFoundError(f"Profile '{canon}' does not exist at {profile_dir}")
+
+    profile_skills = profile_dir / "skills"
+    root_skills = _get_default_hermes_home() / "skills"
+
+    pruned: List[str] = []
+    kept_user_modified: List[str] = []
+    kept_profile_local: List[str] = []
+
+    if not profile_skills.is_dir():
+        return {
+            "pruned": pruned,
+            "kept_user_modified": kept_user_modified,
+            "kept_profile_local": kept_profile_local,
+            "backup_dir": "",
+            "dry_run": dry_run,
+        }
+
+    # Resolve backup destination up front so all moves share one timestamp.
+    if backup_dir is None:
+        ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
+        backup_dir = _get_default_hermes_home() / "_backups" / f"profile-prune-{ts}" / canon
+    backup_dir = Path(backup_dir)
+    if not dry_run:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+    # Walk skill dirs in the profile. A skill is a directory containing
+    # SKILL.md; the *category* is the path between profile_skills and the
+    # skill dir (may be empty, e.g. profile_skills/<skill_name>/SKILL.md).
+    for skill_md in sorted(profile_skills.rglob("SKILL.md")):
+        if is_excluded_skill_path(skill_md):
+            continue
+        skill_dir = skill_md.parent
+        try:
+            rel = skill_dir.relative_to(profile_skills)
+        except ValueError:
+            continue
+        # Skip nested SKILL.md files that aren't at a skill root (e.g.
+        # references/SKILL.md inside a skill — rare but possible).
+        # The skill root is the directory whose own SKILL.md exists; we
+        # already filtered to those, so this just guards against the edge
+        # case where a nested skill happens to be under another skill.
+        if any(p == "references" or p == "templates" or p == "scripts"
+               for p in rel.parts):
+            continue
+
+        skill_name = skill_dir.name
+        root_candidate = root_skills / rel / "SKILL.md"
+        if not root_candidate.exists():
+            # Profile-local skill — keep.
+            kept_profile_local.append(str(rel))
+            continue
+
+        profile_hash = _file_hash(skill_md)
+        root_hash = _file_hash(root_candidate)
+
+        if profile_hash == root_hash:
+            decision = "prune"
+        else:
+            try:
+                profile_mtime = skill_md.stat().st_mtime
+                root_mtime = root_candidate.stat().st_mtime
+            except OSError:
+                profile_mtime = 0
+                root_mtime = 0
+            if profile_mtime <= root_mtime or force:
+                decision = "prune"
+            else:
+                decision = "keep_user_modified"
+
+        if decision == "keep_user_modified":
+            kept_user_modified.append(str(rel))
+            continue
+
+        # Prune: move the whole skill dir to backup_dir/<rel>/
+        dest = backup_dir / rel
+        if dry_run:
+            pruned.append(str(rel))
+            continue
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(skill_dir), str(dest))
+            pruned.append(str(rel))
+        except (OSError, shutil.Error):
+            # Best-effort: surface the partial result rather than aborting.
+            kept_user_modified.append(str(rel) + " (move-failed)")
+
+    # Clean up empty category directories left behind.
+    if not dry_run:
+        for cat_dir in sorted(profile_skills.rglob("*"), reverse=True):
+            if cat_dir.is_dir() and not any(cat_dir.iterdir()):
+                try:
+                    cat_dir.rmdir()
+                except OSError:
+                    pass
+
+    # Write the marker so future syncs don't recreate the drift.
+    if not dry_run:
+        marker = profile_dir / NO_BUNDLED_SKILLS_MARKER
+        if not marker.exists():
+            try:
+                marker.write_text(
+                    "Written by `hermes profile prune-skills`. Skills now "
+                    "resolve from the canonical root tree (~/.hermes/skills) "
+                    "via skills.external_dirs in config.yaml.\n"
+                    "Delete this file and pass --with-bundled-skills to opt "
+                    "back into per-profile bundled-skill copies.\n",
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+        try:
+            _seed_external_dirs_to_root(profile_dir)
+        except Exception:
+            pass
+
+    return {
+        "pruned": pruned,
+        "kept_user_modified": kept_user_modified,
+        "kept_profile_local": kept_profile_local,
+        "backup_dir": str(backup_dir),
+        "dry_run": dry_run,
+    }
+
+
+def _file_hash(path: Path) -> str:
+    """MD5 of a single file's bytes. Returns empty string on error."""
+    import hashlib
+    try:
+        h = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
 
 
 def _profile_bound_backend_pids(canon: str, profile_dir: Path) -> list[int]:
