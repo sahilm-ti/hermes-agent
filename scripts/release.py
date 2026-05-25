@@ -67,6 +67,7 @@ AUTHOR_MAP = {
     "33978413+Interstellar-code@users.noreply.github.com": "Interstellar-code",
     # sahilm-ti
     "sahil.marwaha@trilogy.com": "sahilm-ti",
+    "sahil@nousresearch.com": "sahilm-ti",
     # teknium (multiple emails)
     "teknium1@gmail.com": "teknium1",
     "kenyon1977@gmail.com": "kenyonxu",
