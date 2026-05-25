@@ -48,6 +48,7 @@ AUTHOR_MAP = {
     "9592417+adam91holt@users.noreply.github.com": "adam91holt",
     # sahilm-ti
     "sahil.marwaha@trilogy.com": "sahilm-ti",
+    "sahil@nousresearch.com": "sahilm-ti",
     # teknium (multiple emails)
     "teknium1@gmail.com": "teknium1",
     "kenyon1977@gmail.com": "kenyonxu",
