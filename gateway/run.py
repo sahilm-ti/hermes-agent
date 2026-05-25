@@ -4789,6 +4789,52 @@ class GatewayRunner:
             notifier_profile = self._active_profile_name()
             self._kanban_notifier_profile = notifier_profile
 
+        # One-shot backfill of legacy NULL `notifier_profile` rows. A NULL
+        # owner is stuck across multi-gateway setups (every gateway filters
+        # it out, see line ~4720 below), so claiming them on startup is
+        # strictly an improvement over the prior silent-drop behaviour.
+        # First gateway to start wins; the others are no-ops because the
+        # column is already populated. See task t_b212a749.
+        def _backfill_once() -> None:
+            try:
+                boards = _kb.list_boards(include_archived=False)
+            except Exception:
+                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            seen: set[str] = set()
+            for board_meta in boards:
+                slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                db_path = board_meta.get("db_path")
+                try:
+                    key = str(Path(db_path).expanduser().resolve()) if db_path else str(
+                        _kb.kanban_db_path(slug).resolve()
+                    )
+                except Exception:
+                    key = f"slug:{slug}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    conn = _kb.connect(board=slug)
+                except Exception as exc:
+                    logger.debug("kanban notifier backfill: cannot open %s: %s", slug, exc)
+                    continue
+                try:
+                    n = _kb.backfill_null_notifier_profile(conn, notifier_profile)
+                    if n:
+                        logger.info(
+                            "kanban notifier: backfilled notifier_profile=%s on %d sub(s) (board=%s)",
+                            notifier_profile, n, slug,
+                        )
+                except Exception:
+                    logger.exception("kanban notifier backfill failed on board %s", slug)
+                finally:
+                    conn.close()
+
+        try:
+            await asyncio.to_thread(_backfill_once)
+        except Exception:
+            logger.exception("kanban notifier: startup backfill failed")
+
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
 
