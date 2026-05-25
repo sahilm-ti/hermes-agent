@@ -667,6 +667,11 @@ def _handle_create(args: dict, **kw) -> str:
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
+    auto_subscribe, bool_error = _parse_bool_arg(
+        args, "auto_subscribe", default=True,
+    )
+    if bool_error:
+        return tool_error(bool_error)
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -707,9 +712,13 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
+            subscribed = False
+            if auto_subscribe:
+                subscribed = _auto_subscribe_origin(kb, conn, new_tid)
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
+                subscribed=subscribed,
             )
         finally:
             conn.close()
@@ -718,6 +727,45 @@ def _handle_create(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_create failed")
         return tool_error(f"kanban_create: {e}")
+
+
+def _auto_subscribe_origin(kb, conn, task_id: str) -> bool:
+    """Subscribe the originating gateway chat to ``task_id``'s terminal events.
+
+    When this tool runs inside a gateway message handler the session
+    context vars (``HERMES_SESSION_PLATFORM`` / ``_CHAT_ID`` / ``_THREAD_ID``)
+    are bound to the originating chat. CLI / cron / dispatcher-spawned-
+    worker invocations leave them unset, so this is a no-op there and the
+    legacy "no auto-subscribe outside the gateway" behaviour is preserved.
+
+    Returns True iff a subscription row was inserted (or already existed —
+    ``add_notify_sub`` is INSERT OR IGNORE so reruns are safe).
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return False
+    try:
+        platform = (get_session_env("HERMES_SESSION_PLATFORM", "") or "").lower()
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "") or ""
+        if not platform or not chat_id:
+            return False
+        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or ""
+        user_id = get_session_env("HERMES_SESSION_USER_ID", "") or ""
+        notifier_profile = os.environ.get("HERMES_PROFILE") or None
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id or None,
+            user_id=user_id or None,
+            notifier_profile=notifier_profile,
+        )
+        return True
+    except Exception:
+        logger.exception("kanban_create auto-subscribe failed")
+        return False
 
 
 def _handle_unblock(args: dict, **kw) -> str:
@@ -1164,6 +1212,23 @@ KANBAN_CREATE_SCHEMA = {
                     "task, ['github-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "
                     "assignee's profile."
+                ),
+            },
+            "auto_subscribe": {
+                "type": "boolean",
+                "description": (
+                    "Default true. When this tool is called inside a "
+                    "gateway message handler (e.g. orchestrator agent "
+                    "creating a task in response to a Telegram message), "
+                    "auto-subscribe the originating chat to the new "
+                    "task's terminal events so the user gets a "
+                    "notification on completed / blocked / "
+                    "human_review_requested. Outside the gateway "
+                    "(CLI, cron, dispatcher-spawned worker) no session "
+                    "origin exists and this is a no-op regardless. Set "
+                    "false to suppress even when origin is present "
+                    "(e.g. internal fan-out where the user only wants "
+                    "the parent's notification)."
                 ),
             },
             "board": _board_schema_prop(),
