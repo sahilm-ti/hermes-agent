@@ -1128,17 +1128,18 @@ class TestSkillViewCollisionDetection:
     """Regression tests for skill_view name collision handling.
 
     When a skill name resolves to multiple paths across the local skills
-    dir and external_dirs, skill_view must refuse to guess. Silent
-    shadowing — where ``/skills`` shows the local version but
-    ``skill_view`` loads the external one — is the bug class this guards
-    against. Reproduces with `skills.external_dirs` registered in
-    config.yaml and a same-name skill nested under a category locally.
+    dir and external_dirs, skill_view now resolves deterministically:
+    local SKILLS_DIR wins over external_dirs (which are ranked in
+    declaration order), and within a tier the most-recently modified
+    SKILL.md wins. The collision is logged at WARN so an operator can
+    spot and clean up the stale copy.
 
-    Adapted from a regression suite originally proposed by @polkn in PR
-    #6136 (which used local-first precedence). The collision-refusal
-    behavior preserves the same protection without silently picking a
-    side, and gives the user an actionable hint (use the categorized
-    path) to recover.
+    This replaces the previous "refuse and surface error" behavior, which
+    permanently crashed the worker preload path (``--skills <name>``)
+    whenever a stale per-profile copy collided with the shared canonical
+    copy under ``external_dirs``. There is no human at CLI startup to
+    disambiguate, so picking deterministically (and loudly) is strictly
+    better than refusing.
     """
 
     def _patch_dirs(self, local_dir, external_dirs):
@@ -1151,9 +1152,10 @@ class TestSkillViewCollisionDetection:
             ),
         )
 
-    def test_nested_local_collides_with_top_level_external(self, tmp_path):
-        """The original bug scenario: nested local + top-level external,
-        same name. Now refuses with both paths surfaced."""
+    def test_nested_local_wins_over_top_level_external(self, tmp_path, caplog):
+        """Stale or competing external skill of the same name does NOT
+        crash the loader; SKILLS_DIR wins by tier and a WARN log is
+        emitted naming the shadowed candidate."""
         local_dir = tmp_path / "local"
         external_dir = tmp_path / "external"
         local_dir.mkdir()
@@ -1168,22 +1170,21 @@ class TestSkillViewCollisionDetection:
         _make_skill(external_dir, "explore-codebase", body="EXTERNAL VERSION")
 
         p1, p2 = self._patch_dirs(local_dir, [external_dir])
-        with p1, p2:
+        with caplog.at_level("WARNING", logger="tools.skills_tool"), p1, p2:
             raw = skill_view("explore-codebase")
 
         result = json.loads(raw)
-        assert result["success"] is False
-        assert "Ambiguous skill name 'explore-codebase'" in result["error"]
-        assert "matches" in result
-        assert len(result["matches"]) == 2
-        # Both paths surfaced
-        assert any("foundations/runtime" in p for p in result["matches"])
-        assert any("external" in p for p in result["matches"])
-        assert "hint" in result
+        assert result["success"] is True
+        assert "LOCAL VERSION" in result["content"]
+        # Operator-facing breadcrumb: WARN log identifies the chosen path
+        # and the shadowed candidate.
+        warn_messages = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any("Skill name collision for 'explore-codebase'" in m for m in warn_messages)
+        assert any("external" in m for m in warn_messages)
 
-    def test_top_level_local_collides_with_external(self, tmp_path):
-        """Top-level local + top-level external with the same name also
-        refuses — same-name shadowing is ambiguous regardless of nesting."""
+    def test_top_level_local_wins_over_external(self, tmp_path):
+        """Top-level local + top-level external with the same name —
+        local wins by tier."""
         local_dir = tmp_path / "local"
         external_dir = tmp_path / "external"
         local_dir.mkdir()
@@ -1197,13 +1198,14 @@ class TestSkillViewCollisionDetection:
             raw = skill_view("shared-name")
 
         result = json.loads(raw)
-        assert result["success"] is False
-        assert "Ambiguous" in result["error"]
-        assert len(result["matches"]) == 2
+        assert result["success"] is True
+        assert "LOCAL VERSION" in result["content"]
 
     def test_collision_resolvable_via_categorized_path(self, tmp_path):
-        """User can recover from a collision by passing the full
-        categorized path — the bare name is ambiguous, the path is not."""
+        """User can still pin a specific skill by passing its full
+        categorized path. The bare name resolves to the local copy by
+        tier; the explicit path bypasses the collision logic and loads
+        exactly the requested file."""
         local_dir = tmp_path / "local"
         external_dir = tmp_path / "external"
         local_dir.mkdir()
@@ -1243,9 +1245,9 @@ class TestSkillViewCollisionDetection:
         assert result["success"] is True
         assert "EXTERNAL BODY" in result["content"]
 
-    def test_two_externals_same_name_also_refuse(self, tmp_path):
-        """Collision detection is symmetric — two external dirs with
-        same-name skills also trigger the refusal."""
+    def test_two_externals_same_name_resolve_by_declaration_order(self, tmp_path):
+        """Same-name skills in two external dirs: the first declared
+        external dir wins (mirrors config.external_dirs order)."""
         local_dir = tmp_path / "local"
         ext_a = tmp_path / "ext_a"
         ext_b = tmp_path / "ext_b"
@@ -1261,9 +1263,8 @@ class TestSkillViewCollisionDetection:
             raw = skill_view("pr")
 
         result = json.loads(raw)
-        assert result["success"] is False
-        assert "Ambiguous" in result["error"]
-        assert len(result["matches"]) == 2
+        assert result["success"] is True
+        assert "EXT_A VERSION" in result["content"]
 
     def test_local_only_skill_loads_normally(self, tmp_path):
         """Sanity: a single local skill (no external collision) loads
@@ -1287,3 +1288,33 @@ class TestSkillViewCollisionDetection:
         result = json.loads(raw)
         assert result["success"] is True
         assert "LOCAL BODY" in result["content"]
+
+    def test_same_tier_collision_resolves_by_mtime(self, tmp_path):
+        """Two same-name skills nested differently inside the SAME
+        SKILLS_DIR (same tier): the most recently modified wins.
+        Reproduces the original incident — two ``kanban-worker``
+        SKILL.md files under the same dir at different versions, where
+        the newer (v2.2.0) one should be loaded."""
+        import os
+        import time
+
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+
+        _make_skill(local_dir, "kanban-worker", category="devops", body="V2.0.0 OLD")
+        # Bump second skill's mtime explicitly so the test is independent
+        # of filesystem write ordering.
+        _make_skill(local_dir, "kanban-worker", category="legacy", body="V2.2.0 NEW")
+        old_path = local_dir / "devops" / "kanban-worker" / "SKILL.md"
+        new_path = local_dir / "legacy" / "kanban-worker" / "SKILL.md"
+        now = time.time()
+        os.utime(old_path, (now - 3600, now - 3600))
+        os.utime(new_path, (now, now))
+
+        p1, p2 = self._patch_dirs(local_dir, [])
+        with p1, p2:
+            raw = skill_view("kanban-worker")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "V2.2.0 NEW" in result["content"]
