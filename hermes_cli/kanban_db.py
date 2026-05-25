@@ -7406,6 +7406,290 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
+# ---------------------------------------------------------------------------
+# Crash-loop circuit breaker helpers
+# ---------------------------------------------------------------------------
+
+def evaluate_crash_breaker(
+    conn: sqlite3.Connection,
+    *,
+    max_crashes: int = DEFAULT_CRASH_BREAKER_MAX_CRASHES,
+    window_seconds: int = DEFAULT_CRASH_BREAKER_WINDOW_SECONDS,
+    cooldown_seconds: int = DEFAULT_CRASH_BREAKER_COOLDOWN_SECONDS,
+    max_cooldown_seconds: int = DEFAULT_CRASH_BREAKER_MAX_COOLDOWN_SECONDS,
+    now: Optional[int] = None,
+) -> list[str]:
+    """Trip the per-assignee crash-loop breaker for any assignee whose
+    ``crashed`` event count within ``window_seconds`` reaches
+    ``max_crashes``.
+
+    Returns the list of assignees whose quarantine row was created OR
+    refreshed by this call (in practice: assignees newly tripped this
+    tick). Assignees that are already quarantined with cooldown in the
+    future are NOT returned — they were already counted on the original
+    trip and we don't want to double-notify.
+
+    Emits a ``quarantined`` event on the most-recent crashed task for the
+    assignee so the existing gateway notifier picks it up via its
+    terminal-kind subscription path.
+    """
+    if max_crashes < 1:
+        return []
+    if now is None:
+        now = int(time.time())
+    cutoff = now - max(int(window_seconds), 1)
+    # Per-assignee crash count + most-recent crashed task id + reason.
+    # We join task_events → tasks once to grab the assignee; group by
+    # assignee, count, and keep the latest event's task_id + payload
+    # for the notification.
+    rows = conn.execute(
+        """
+        SELECT t.assignee AS assignee,
+               COUNT(*)   AS n,
+               MAX(e.created_at) AS last_at,
+               (SELECT e2.task_id FROM task_events e2
+                 JOIN tasks t2 ON t2.id = e2.task_id
+                WHERE e2.kind = 'crashed'
+                  AND e2.created_at >= ?
+                  AND t2.assignee = t.assignee
+                ORDER BY e2.created_at DESC, e2.id DESC
+                LIMIT 1) AS last_task,
+               (SELECT e3.payload FROM task_events e3
+                 JOIN tasks t3 ON t3.id = e3.task_id
+                WHERE e3.kind = 'crashed'
+                  AND e3.created_at >= ?
+                  AND t3.assignee = t.assignee
+                ORDER BY e3.created_at DESC, e3.id DESC
+                LIMIT 1) AS last_payload
+          FROM task_events e
+          JOIN tasks t ON t.id = e.task_id
+         WHERE e.kind = 'crashed'
+           AND e.created_at >= ?
+           AND t.assignee IS NOT NULL
+         GROUP BY t.assignee
+         HAVING COUNT(*) >= ?
+        """,
+        (cutoff, cutoff, cutoff, int(max_crashes)),
+    ).fetchall()
+    tripped: list[str] = []
+    for row in rows:
+        assignee = row["assignee"]
+        last_at = int(row["last_at"])
+        last_task = row["last_task"]
+        last_reason = _extract_crash_reason(row["last_payload"])
+        with write_txn(conn):
+            existing = conn.execute(
+                "SELECT cooldown_until, trip_count FROM kanban_quarantine "
+                "WHERE assignee = ?",
+                (assignee,),
+            ).fetchone()
+            if existing is not None and int(existing["cooldown_until"]) > now:
+                # Already in cooldown — original trip already accounted
+                # for; do not double-notify.
+                continue
+            # Compute cooldown. Fresh trip → cooldown_seconds. Retrip
+            # right after a cooldown elapsed (probe not yet attempted)
+            # → backoff using the existing trip_count.
+            trip_count = (int(existing["trip_count"]) + 1) if existing else 1
+            cd = min(
+                int(cooldown_seconds) * (2 ** (trip_count - 1)),
+                int(max_cooldown_seconds),
+            )
+            conn.execute(
+                """
+                INSERT INTO kanban_quarantine
+                    (assignee, cooldown_until, trip_count, last_trip_at,
+                     last_reason, probe_in_flight, probe_task_id)
+                VALUES (?, ?, ?, ?, ?, 0, NULL)
+                ON CONFLICT(assignee) DO UPDATE SET
+                    cooldown_until = excluded.cooldown_until,
+                    trip_count     = excluded.trip_count,
+                    last_trip_at   = excluded.last_trip_at,
+                    last_reason    = excluded.last_reason,
+                    probe_in_flight= 0,
+                    probe_task_id  = NULL
+                """,
+                (assignee, now + cd, trip_count, last_at, last_reason),
+            )
+            if last_task:
+                _append_event(
+                    conn, last_task, "quarantined",
+                    {
+                        "assignee": assignee,
+                        "crashes": int(row["n"]),
+                        "window_seconds": int(window_seconds),
+                        "cooldown_seconds": int(cd),
+                        "trip_count": trip_count,
+                        "last_reason": last_reason,
+                    },
+                )
+        tripped.append(assignee)
+    return tripped
+
+
+def _extract_crash_reason(payload_text: Optional[str]) -> Optional[str]:
+    """Best-effort extraction of a human-readable crash reason from a
+    crashed event payload. Truncates to ``_QUARANTINE_REASON_MAX``."""
+    if not payload_text:
+        return None
+    try:
+        payload = json.loads(payload_text)
+    except Exception:
+        return str(payload_text)[:_QUARANTINE_REASON_MAX]
+    if not isinstance(payload, dict):
+        return str(payload_text)[:_QUARANTINE_REASON_MAX]
+    for key in ("error", "reason", "exit_kind"):
+        val = payload.get(key)
+        if val:
+            return str(val)[:_QUARANTINE_REASON_MAX]
+    # Fall back to pid summary so the notifier still has something.
+    pid = payload.get("pid")
+    code = payload.get("exit_code")
+    if pid is not None:
+        return (
+            f"pid {pid}"
+            + (f" exit {code}" if code is not None else "")
+        )[:_QUARANTINE_REASON_MAX]
+    return None
+
+
+def is_assignee_quarantined(
+    conn: sqlite3.Connection,
+    assignee: str,
+    *,
+    now: Optional[int] = None,
+) -> tuple[bool, bool]:
+    """Check + atomically consume a probe slot if available.
+
+    Returns ``(blocked, is_probe)``:
+
+    * ``(False, False)`` — no quarantine row; normal dispatch.
+    * ``(False, True)``  — cooldown has elapsed and the single probe slot
+      was granted to this caller (atomic: subsequent same-tick callers
+      for the same assignee see ``(True, False)`` until probe completes
+      or extends).
+    * ``(True, False)``  — quarantined; dispatch must skip.
+    """
+    if not assignee:
+        return (False, False)
+    if now is None:
+        now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT cooldown_until, probe_in_flight FROM kanban_quarantine "
+            "WHERE assignee = ?",
+            (assignee,),
+        ).fetchone()
+        if row is None:
+            return (False, False)
+        if int(row["cooldown_until"]) > now:
+            return (True, False)
+        if int(row["probe_in_flight"]) == 1:
+            # Probe already running for this assignee — block any other
+            # spawn attempts until it resolves.
+            return (True, False)
+        # Cooldown elapsed and no probe in flight → grant probe slot.
+        conn.execute(
+            "UPDATE kanban_quarantine SET probe_in_flight = 1 "
+            "WHERE assignee = ?",
+            (assignee,),
+        )
+        return (False, True)
+
+
+def mark_quarantine_probe_task(
+    conn: sqlite3.Connection, assignee: str, task_id: str,
+) -> None:
+    """Record which task is carrying the probe spawn so the
+    complete/crash paths can find this assignee by task id."""
+    if not assignee or not task_id:
+        return
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE kanban_quarantine SET probe_task_id = ? WHERE assignee = ?",
+            (task_id, assignee),
+        )
+
+
+def clear_assignee_quarantine(
+    conn: sqlite3.Connection, assignee: str,
+) -> bool:
+    """Delete the quarantine row for ``assignee``. Returns True if a row
+    was removed. Idempotent."""
+    if not assignee:
+        return False
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM kanban_quarantine WHERE assignee = ?",
+            (assignee,),
+        )
+        return cur.rowcount > 0
+
+
+def extend_assignee_quarantine(
+    conn: sqlite3.Connection,
+    assignee: str,
+    *,
+    cooldown_seconds: int = DEFAULT_CRASH_BREAKER_COOLDOWN_SECONDS,
+    max_cooldown_seconds: int = DEFAULT_CRASH_BREAKER_MAX_COOLDOWN_SECONDS,
+    reason: Optional[str] = None,
+    now: Optional[int] = None,
+) -> Optional[int]:
+    """Double the cooldown for an existing quarantine row (probe-crash path).
+
+    Returns the new ``cooldown_until`` epoch, or ``None`` if no row.
+    Clears ``probe_in_flight`` so the next post-cooldown tick gets a
+    fresh probe slot.
+    """
+    if not assignee:
+        return None
+    if now is None:
+        now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT trip_count FROM kanban_quarantine WHERE assignee = ?",
+            (assignee,),
+        ).fetchone()
+        if row is None:
+            return None
+        new_trip = int(row["trip_count"]) + 1
+        cd = min(
+            int(cooldown_seconds) * (2 ** (new_trip - 1)),
+            int(max_cooldown_seconds),
+        )
+        new_until = now + cd
+        conn.execute(
+            """
+            UPDATE kanban_quarantine
+               SET cooldown_until = ?,
+                   trip_count     = ?,
+                   last_trip_at   = ?,
+                   last_reason    = COALESCE(?, last_reason),
+                   probe_in_flight= 0,
+                   probe_task_id  = NULL
+             WHERE assignee = ?
+            """,
+            (new_until, new_trip, now,
+             reason[:_QUARANTINE_REASON_MAX] if reason else None,
+             assignee),
+        )
+        return new_until
+
+
+def _probe_assignee_for_task(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """If a quarantine row's probe_task_id matches ``task_id``, return
+    the assignee. Used by complete_task / detect_crashed_workers to
+    resolve probe outcome → quarantine state transition."""
+    row = conn.execute(
+        "SELECT assignee FROM kanban_quarantine WHERE probe_task_id = ?",
+        (task_id,),
+    ).fetchone()
+    return row["assignee"] if row else None
+
+
+
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
