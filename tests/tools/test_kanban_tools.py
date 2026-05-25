@@ -843,6 +843,116 @@ def test_create_rejects_no_title(worker_env):
     assert json.loads(kt._handle_create({"title": "   ", "assignee": "x"})).get("error")
 
 
+def test_create_auto_subscribes_originating_gateway_chat(worker_env):
+    """When the tool runs inside a gateway message handler the session
+    context vars are bound to the originating chat. The new task should
+    get a kanban_notify_subs row pointing at that chat so the user is
+    notified on terminal events. Regression: t_ec4bbd10 (BSB) completed
+    but no Telegram notification fired because the orchestrator's
+    kanban_create tool didn't subscribe the origin."""
+    from gateway.session_context import set_session_vars, clear_session_vars
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1001234567890",
+        thread_id="17585",
+        user_id="42",
+        user_name="sahil",
+        session_key="telegram:-1001234567890:17585",
+    )
+    try:
+        out = kt._handle_create({
+            "title": "from orchestrator",
+            "assignee": "peer",
+            "parents": [worker_env],
+        })
+    finally:
+        clear_session_vars(tokens)
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d.get("subscribed") is True
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id=d["task_id"])
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    row = subs[0]
+    assert row["platform"] == "telegram"
+    assert row["chat_id"] == "-1001234567890"
+    assert row["thread_id"] == "17585"
+    assert row["user_id"] == "42"
+    assert row["notifier_profile"] == "test-worker"
+
+
+def test_create_no_auto_subscribe_without_origin(worker_env):
+    """CLI / cron / dispatcher-spawned-worker invocations have no
+    session-origin context vars bound. ``kanban_create`` must not insert
+    a phantom subscription row in that case (status quo preserved)."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_create({
+        "title": "no origin",
+        "assignee": "peer",
+        "parents": [worker_env],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d.get("subscribed") is False
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id=d["task_id"])
+    finally:
+        conn.close()
+    assert subs == []
+
+
+def test_create_auto_subscribe_opt_out(worker_env):
+    """``auto_subscribe=false`` suppresses subscription even when the
+    gateway origin is bound. Used by orchestrators fanning out internal
+    children where only the parent should notify."""
+    from gateway.session_context import set_session_vars, clear_session_vars
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1001234567890",
+        thread_id="17585",
+        user_id="42",
+        user_name="sahil",
+        session_key="k",
+    )
+    try:
+        out = kt._handle_create({
+            "title": "no notify",
+            "assignee": "peer",
+            "parents": [worker_env],
+            "auto_subscribe": False,
+        })
+    finally:
+        clear_session_vars(tokens)
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d.get("subscribed") is False
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id=d["task_id"])
+    finally:
+        conn.close()
+    assert subs == []
+
+
+def test_create_schema_advertises_auto_subscribe():
+    from tools.kanban_tools import KANBAN_CREATE_SCHEMA
+    props = KANBAN_CREATE_SCHEMA["parameters"]["properties"]
+    assert "auto_subscribe" in props
+    assert props["auto_subscribe"]["type"] == "boolean"
+
+
 def test_create_rejects_no_assignee(worker_env):
     from tools import kanban_tools as kt
     assert json.loads(kt._handle_create({"title": "t"})).get("error")
