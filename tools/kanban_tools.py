@@ -1441,7 +1441,9 @@ def _handle_create(args: dict, **kw) -> str:
                 parents=tuple(parents),
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,
-                workspace_kind=str(workspace_kind),
+                workspace_kind=(
+                    str(workspace_kind) if workspace_kind else None
+                ),
                 workspace_path=workspace_path,
                 project_id=project_id,
                 project_source_task_id=project_source_task_id,
@@ -2326,9 +2328,13 @@ KANBAN_CREATE_SCHEMA = {
                 "type": "string",
                 "enum": ["scratch", "dir", "worktree"],
                 "description": (
-                    "Workspace flavor: 'scratch' (fresh tmp dir, "
-                    "default), 'dir' (shared directory, requires "
-                    "absolute workspace_path), 'worktree' (git worktree)."
+                    "Workspace flavor: 'scratch' (fresh tmp dir), 'dir' "
+                    "(shared directory, requires absolute workspace_path), "
+                    "'worktree' (git worktree at ~/.hermes/worktrees/<task_id>). "
+                    "When omitted, defaults to 'worktree' if the title/body "
+                    "mentions hermes-agent source paths or git/PR verbs "
+                    "(hermes_cli/, tools/, gateway/, 'git rebase', 'gh pr', "
+                    "etc.), otherwise 'scratch'."
                 ),
             },
             "workspace_path": {
