@@ -945,7 +945,8 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         logger.warning(
             "_maybe_auto_subscribe failed: %r (platform=%r key_set=%r)",
             _exc, platform, bool(chat_id),
-        )        return False
+        )
+        return False
 
 
 def _handle_unblock(args: dict, **kw) -> str:
