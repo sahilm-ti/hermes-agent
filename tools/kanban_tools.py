@@ -934,7 +934,13 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             chat_id = session_key
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
-        notifier_profile = os.environ.get("HERMES_PROFILE")
+        notifier_profile = os.environ.get("HERMES_PROFILE") or None
+        if not notifier_profile:
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                notifier_profile = get_active_profile_name() or None
+            except Exception:
+                notifier_profile = None
 
         # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb

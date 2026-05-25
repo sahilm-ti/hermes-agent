@@ -964,6 +964,56 @@ def test_create_auto_subscribes_originating_gateway_chat(worker_env):
     assert row["notifier_profile"] == "test-worker"
 
 
+def test_create_auto_subscribe_notifier_profile_falls_back_to_active_profile(
+    worker_env, monkeypatch,
+):
+    """Regression for t_b212a749: the gateway process never exports
+    HERMES_PROFILE — only the dispatcher does, for spawned workers — so
+    the auto-subscribe path must fall back to
+    ``hermes_cli.profiles.get_active_profile_name()`` to record the
+    right ``notifier_profile``. Without this, the inserted row has
+    ``notifier_profile=NULL`` and the multi-gateway notifier filter
+    silently drops every event for the task."""
+    from gateway.session_context import set_session_vars, clear_session_vars
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    # Simulate the gateway: HERMES_PROFILE is unset but the active
+    # profile (driven by HERMES_HOME) is well-defined.
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name",
+        lambda: "braintrustorch",
+    )
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1001234567890",
+        thread_id="17585",
+        user_id="42",
+        user_name="sahil",
+        session_key="telegram:-1001234567890:17585",
+    )
+    try:
+        out = kt._handle_create({
+            "title": "fallback profile",
+            "assignee": "peer",
+            "parents": [worker_env],
+        })
+    finally:
+        clear_session_vars(tokens)
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d.get("subscribed") is True
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id=d["task_id"])
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    assert subs[0]["notifier_profile"] == "braintrustorch"
+
+
 def test_create_no_auto_subscribe_without_origin(worker_env):
     """CLI / cron / dispatcher-spawned-worker invocations have no
     session-origin context vars bound. ``kanban_create`` must not insert
