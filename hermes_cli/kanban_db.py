@@ -6228,6 +6228,15 @@ DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
 DEFAULT_LOG_BACKUP_COUNT = 1
 
+# Default git identity for spawned kanban workers. The dispatcher injects
+# these into the worker env (GIT_AUTHOR_* / GIT_COMMITTER_*) so worker
+# commits are attributed to a known author regardless of the machine's
+# `git config --global` state. Operators on this fork can override via
+# `kanban.git_identity_email` / `kanban.git_identity_name` in config.yaml,
+# or via the env vars themselves (the worker's own .env wins).
+DEFAULT_KANBAN_GIT_IDENTITY_EMAIL = "97122673+sahilm-ti@users.noreply.github.com"
+DEFAULT_KANBAN_GIT_IDENTITY_NAME = "Sahil Marwaha"
+
 # Keep a little wall-clock budget for the worker to observe a terminal timeout
 # and call kanban_block/kanban_complete before max_runtime_seconds kills it.
 KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
@@ -8350,6 +8359,33 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _resolve_kanban_git_identity() -> tuple[str, str]:
+    """Return ``(name, email)`` for spawned worker git identity.
+
+    Resolution order:
+      1. ``kanban.git_identity_name`` / ``kanban.git_identity_email`` from
+         the dispatcher's profile config.yaml.
+      2. ``DEFAULT_KANBAN_GIT_IDENTITY_NAME`` / ``..._EMAIL`` module
+         constants.
+
+    Per-worker env overrides (``GIT_AUTHOR_EMAIL`` already present in
+    ``os.environ``) are applied in ``_default_spawn`` via the
+    ``env.get(..., default)`` pattern, NOT here — this helper only
+    supplies the default.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        kanban_cfg = (load_config().get("kanban") or {})
+    except Exception:
+        kanban_cfg = {}
+    name = (kanban_cfg.get("git_identity_name") or
+            DEFAULT_KANBAN_GIT_IDENTITY_NAME)
+    email = (kanban_cfg.get("git_identity_email") or
+             DEFAULT_KANBAN_GIT_IDENTITY_EMAIL)
+    return str(name), str(email)
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -8466,6 +8502,22 @@ def _default_spawn(
     # highest-precedence interface override; dropping the env var covers
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
+
+    # Git author/committer identity for worker commits. Workers open PRs
+    # against repos whose `Contributor Attribution Check` workflow
+    # validates the author email; without this, the worker inherits
+    # whatever `git config --global user.email` returned on this machine
+    # at install time and the check fails on every PR. The defaults are
+    # configurable via `kanban.git_identity_{name,email}` in config.yaml
+    # so other forks can attribute their workers correctly. Existing
+    # values from the parent env win — a power user can set
+    # GIT_AUTHOR_EMAIL in their shell or .env and it'll be honored.
+    _git_name, _git_email = _resolve_kanban_git_identity()
+    env["GIT_AUTHOR_NAME"] = env.get("GIT_AUTHOR_NAME", _git_name)
+    env["GIT_AUTHOR_EMAIL"] = env.get("GIT_AUTHOR_EMAIL", _git_email)
+    env["GIT_COMMITTER_NAME"] = env.get("GIT_COMMITTER_NAME", env["GIT_AUTHOR_NAME"])
+    env["GIT_COMMITTER_EMAIL"] = env.get("GIT_COMMITTER_EMAIL", env["GIT_AUTHOR_EMAIL"])
+
 
     cmd = [
         *_resolve_hermes_argv(),
