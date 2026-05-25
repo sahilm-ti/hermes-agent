@@ -743,7 +743,10 @@ def _handle_create(args: dict, **kw) -> str:
     # CLI / dashboard paths and on legacy hosts that don't set the env.
     session_id = args.get("session_id") or os.environ.get("HERMES_SESSION_ID")
     priority = args.get("priority")
-    workspace_kind = args.get("workspace_kind") or "scratch"
+    # workspace_kind: None when omitted so kanban_db.create_task can infer
+    # from title/body keywords (hermes-agent edits → 'worktree', else
+    # 'scratch'). An explicit value from the caller always wins.
+    workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
@@ -782,7 +785,9 @@ def _handle_create(args: dict, **kw) -> str:
                 parents=tuple(parents),
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,
-                workspace_kind=str(workspace_kind),
+                workspace_kind=(
+                    str(workspace_kind) if workspace_kind else None
+                ),
                 workspace_path=workspace_path,
                 triage=triage,
                 idempotency_key=idempotency_key,
@@ -1373,9 +1378,13 @@ KANBAN_CREATE_SCHEMA = {
                 "type": "string",
                 "enum": ["scratch", "dir", "worktree"],
                 "description": (
-                    "Workspace flavor: 'scratch' (fresh tmp dir, "
-                    "default), 'dir' (shared directory, requires "
-                    "absolute workspace_path), 'worktree' (git worktree)."
+                    "Workspace flavor: 'scratch' (fresh tmp dir), 'dir' "
+                    "(shared directory, requires absolute workspace_path), "
+                    "'worktree' (git worktree at ~/.hermes/worktrees/<task_id>). "
+                    "When omitted, defaults to 'worktree' if the title/body "
+                    "mentions hermes-agent source paths or git/PR verbs "
+                    "(hermes_cli/, tools/, gateway/, 'git rebase', 'gh pr', "
+                    "etc.), otherwise 'scratch'."
                 ),
             },
             "workspace_path": {
