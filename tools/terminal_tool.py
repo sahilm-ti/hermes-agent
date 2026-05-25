@@ -1026,7 +1026,23 @@ def _get_env_config() -> Dict[str, Any]:
     # remote home, and everything else starts in the backend's default
     # root-like cwd.
     if env_type == "local":
-        default_cwd = os.getcwd()
+        # Defensive: os.getcwd() raises FileNotFoundError (ENOENT) when the
+        # process's current working directory has been deleted out from
+        # under it — observed in kanban-worker spawns whose scratch
+        # workspace directory was cleaned mid-run, causing every tool
+        # dispatch to crash and the worker to die within seconds. Fall
+        # back to $HOME (or /tmp as last resort) instead of letting the
+        # error propagate up the tool registry and kill the whole worker.
+        try:
+            default_cwd = os.getcwd()
+        except (FileNotFoundError, OSError) as exc:
+            fallback = os.path.expanduser("~") or "/tmp"
+            logger.warning(
+                "os.getcwd() failed (%s); falling back to %r. "
+                "This usually means the worker's scratch workspace "
+                "was deleted mid-run.", exc, fallback,
+            )
+            default_cwd = fallback
     elif env_type == "ssh":
         default_cwd = "~"
     else:
