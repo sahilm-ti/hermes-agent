@@ -4308,3 +4308,159 @@ class TestKanbanWorkerSkillAvailable:
             f"skills:\n  external_dirs:\n    - {shared}\n", encoding="utf-8",
         )
         assert kb._kanban_worker_skill_available(str(home)) is True
+
+
+# ---------------------------------------------------------------------------
+# reject_task — running-from-review claim path (Bug 1)
+# ---------------------------------------------------------------------------
+
+
+def test_reject_task_accepts_running_claimed_from_review(kanban_home):
+    """reject_task works on a task currently in 'running' if the active
+    run was claimed from 'review' (auto-review worker path)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="rev-claim", assignee="alice")
+        _set_task_status(conn, t, "review")
+        claimed = kb.claim_review_task(conn, t)
+        assert claimed is not None and claimed.status == "running"
+
+        ok = kb.reject_task(conn, t, reason="missing tests")
+        assert ok is True
+
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.claim_lock is None
+        assert task.current_run_id is None
+
+        # Closed run row carries the rejection rationale.
+        runs = conn.execute(
+            "SELECT status, outcome, summary FROM task_runs "
+            "WHERE task_id = ? ORDER BY id",
+            (t,),
+        ).fetchall()
+        assert any(
+            r["outcome"] == "rejected" and r["summary"] == "missing tests"
+            for r in runs
+        )
+
+        # 'rejected' event recorded.
+        events = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
+            (t,),
+        ).fetchall()
+        assert "rejected" in [e["kind"] for e in events]
+
+
+def test_reject_task_rejects_running_not_claimed_from_review(kanban_home):
+    """reject_task refuses a normal running task (claimed from 'ready')."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="normal", assignee="alice")
+        # Drive the normal ready -> running claim path (no source_status='review').
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None and claimed.status == "running"
+
+        ok = kb.reject_task(conn, t, reason="nope")
+        assert ok is False
+
+        task = kb.get_task(conn, t)
+        assert task.status == "running"
+
+
+def test_reject_task_still_works_from_review_status(kanban_home):
+    """The original review/human_review path keeps working unchanged."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="parked", assignee="alice")
+        _set_task_status(conn, t, "review")
+
+        ok = kb.reject_task(conn, t, reason="not yet")
+        assert ok is True
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_reject_task_from_human_review_status(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="hr", assignee="alice")
+        _set_task_status(conn, t, "human_review")
+
+        ok = kb.reject_task(conn, t, reason="needs work")
+        assert ok is True
+        assert kb.get_task(conn, t).status == "ready"
+
+
+# ---------------------------------------------------------------------------
+# check_respawn_guard — active_pr suppressed on post-PR rejection (Bug 2)
+# ---------------------------------------------------------------------------
+
+
+def test_respawn_guard_active_pr_suppressed_when_rejection_postdates_pr(
+    kanban_home,
+):
+    """If a 'rejected' event/run post-dates the PR-URL comment, the
+    active_pr guard yields so the next worker can iterate on the same PR.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reject-then-fix", assignee="alice")
+        now = int(time.time())
+        # PR URL comment first, rejection event later.
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', "
+            "'PR: https://github.com/totemx-AI/subsidysmart/pull/7', ?)",
+            (t, now - 60),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'rejected', NULL, ?)",
+            (t, now - 30),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None, (
+        f"expected guard suppressed (rejection > pr_ts), got {reason!r}"
+    )
+
+
+def test_respawn_guard_active_pr_still_fires_when_pr_post_dates_rejection(
+    kanban_home,
+):
+    """If the PR-URL comment is newer than the rejection, the guard
+    still fires (the worker opened a fresh PR after the reject — don't
+    spawn a third one)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="rej-then-pr", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'rejected', NULL, ?)",
+            (t, now - 120),
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', "
+            "'PR: https://github.com/totemx-AI/subsidysmart/pull/9', ?)",
+            (t, now - 30),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_active_pr_uses_rejected_run_outcome(kanban_home):
+    """A task_runs row with outcome='rejected' counts as a rejection
+    signal for the guard suppression (covers the reject_task path that
+    closes via _end_run on running-claimed-from-review)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="run-reject", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', "
+            "'https://github.com/totemx-AI/foo/pull/3', ?)",
+            (t, now - 60),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, "
+            "started_at, ended_at) "
+            "VALUES (?, 'rejected', 'rejected', ?, ?)",
+            (t, now - 35, now - 30),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
