@@ -1284,6 +1284,223 @@ def test_create_auto_subscribe_opt_out(worker_env):
     assert subs == []
 
 
+def test_create_inherits_parent_subscriptions_without_origin(worker_env):
+    """Worker spawned without a gateway session origin (CLI / dispatcher
+    path) still inherits each parent's notification subscriptions so
+    fan-outs keep pinging the chat already tracking the parent. See task
+    t_2b0e7ab6."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    # Seed the parent (worker_env's task) with a subscription as if the
+    # gateway had originally registered it.
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(
+            conn,
+            task_id=worker_env,
+            platform="telegram",
+            chat_id="-1001234567890",
+            thread_id="17585",
+            user_id="42",
+            notifier_profile="braintrustorch",
+        )
+    finally:
+        conn.close()
+
+    out = kt._handle_create({
+        "title": "fanned-out child",
+        "assignee": "peer",
+        "parents": [worker_env],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d.get("subscribed") is True
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id=d["task_id"])
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    sub = subs[0]
+    assert sub["platform"] == "telegram"
+    assert sub["chat_id"] == "-1001234567890"
+    assert sub["thread_id"] == "17585"
+    assert sub["user_id"] == "42"
+    assert sub["notifier_profile"] == "braintrustorch"
+
+
+def test_create_inherits_multi_parent_subs_unioned_and_deduped(worker_env):
+    """Multi-parent fan-in: child inherits the UNION of every parent's
+    subscriptions, deduped by (platform, chat_id, thread_id)."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        # Parent A — Telegram thread.
+        kb.add_notify_sub(
+            conn,
+            task_id=worker_env,
+            platform="telegram",
+            chat_id="-1001111111111",
+            thread_id="100",
+            user_id="42",
+            notifier_profile="braintrustorch",
+        )
+        # Second parent with two subs, one of which overlaps parent A.
+        parent_b = kb.create_task(
+            conn, title="parent B", assignee="peer",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=parent_b,
+            platform="telegram",
+            chat_id="-1001111111111",
+            thread_id="100",
+            user_id="42",
+            notifier_profile="braintrustorch",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=parent_b,
+            platform="discord",
+            chat_id="999",
+            thread_id=None,
+            user_id=None,
+            notifier_profile="braintrustorch",
+        )
+    finally:
+        conn.close()
+
+    out = kt._handle_create({
+        "title": "child of A+B",
+        "assignee": "peer",
+        "parents": [worker_env, parent_b],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d.get("subscribed") is True
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id=d["task_id"])
+    finally:
+        conn.close()
+    # Two distinct rows: telegram thread 100 + discord 999. Telegram row
+    # appears once even though both parents had it.
+    assert len(subs) == 2
+    keyed = {(s["platform"], s["chat_id"], s["thread_id"]) for s in subs}
+    assert ("telegram", "-1001111111111", "100") in keyed
+    assert ("discord", "999", "") in keyed
+
+
+def test_create_parent_inheritance_dedupes_with_origin(worker_env):
+    """When both the session origin AND a parent point at the same chat,
+    only one row is inserted (add_notify_sub is INSERT OR IGNORE on the
+    (task, platform, chat, thread) uniqueness key)."""
+    from gateway.session_context import set_session_vars, clear_session_vars
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(
+            conn,
+            task_id=worker_env,
+            platform="telegram",
+            chat_id="-1001234567890",
+            thread_id="17585",
+            user_id="42",
+            notifier_profile="braintrustorch",
+        )
+    finally:
+        conn.close()
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1001234567890",
+        thread_id="17585",
+        user_id="42",
+        user_name="sahil",
+        session_key="k",
+    )
+    try:
+        out = kt._handle_create({
+            "title": "origin + parent overlap",
+            "assignee": "peer",
+            "parents": [worker_env],
+        })
+    finally:
+        clear_session_vars(tokens)
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id=d["task_id"])
+    finally:
+        conn.close()
+    assert len(subs) == 1
+
+
+def test_create_parent_inheritance_respects_opt_out(worker_env):
+    """``auto_subscribe=False`` suppresses parent inheritance too — used
+    by orchestrators that want only the parent card to notify."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(
+            conn,
+            task_id=worker_env,
+            platform="telegram",
+            chat_id="-1001234567890",
+            thread_id="17585",
+            user_id="42",
+            notifier_profile="braintrustorch",
+        )
+    finally:
+        conn.close()
+
+    out = kt._handle_create({
+        "title": "silent child",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "auto_subscribe": False,
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d.get("subscribed") is False
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id=d["task_id"])
+    finally:
+        conn.close()
+    assert subs == []
+
+
+def test_create_parent_inheritance_no_op_when_parent_has_no_subs(worker_env):
+    """Parent with zero subs → child with zero subs (matches today's
+    'background cron job creates standalone card' pattern)."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_create({
+        "title": "lonely child",
+        "assignee": "peer",
+        "parents": [worker_env],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d.get("subscribed") is False
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id=d["task_id"])
+    finally:
+        conn.close()
+    assert subs == []
+
+
 def test_create_schema_advertises_auto_subscribe():
     from tools.kanban_tools import KANBAN_CREATE_SCHEMA
     props = KANBAN_CREATE_SCHEMA["parameters"]["properties"]
