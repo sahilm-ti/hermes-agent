@@ -40,8 +40,7 @@ TOKEN_VAR="GH_TOKEN_SAHILM_AI"
 GH_TOKEN=$(printenv "$TOKEN_VAR") gh pr view "$PR_URL" --json state,...
 ```
 
-Never use `sahilm-ti` credentials. Never use the bare `$GH_TOKEN` env var
-unless it has already been set to `GH_TOKEN_SAHILM_AI` in this session.
+Use `sahilm-ai` credentials exclusively. Set `GH_TOKEN` from `GH_TOKEN_SAHILM_AI` before every `gh` invocation.
 
 ---
 
@@ -139,9 +138,9 @@ kanban_block(reason="CI failing on PR <url> — fix and re-approve. Failing chec
 
 ## kanban_complete / kanban_block contract
 
-- `kanban_complete` is the ONLY success terminator. Do NOT call `kanban_review` or `kanban_human_review`.
-- `kanban_block` is the ONLY failure terminator. Always include the PR URL and an actionable next step in the reason.
-- One and only one terminal call per run. After it, stop — do not attempt anything else.
+- The ONLY success terminator is `kanban_complete`. The ONLY failure terminator is `kanban_block`.
+- `kanban_block` always includes the PR URL and an actionable next step in the reason.
+- One and only one terminal call per run. After the single terminal call, stop.
 
 ---
 
