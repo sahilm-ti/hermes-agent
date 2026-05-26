@@ -1952,6 +1952,14 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Stuck-worker detection: a running task whose PID is alive but
+        # whose heartbeat has been silent for this many seconds is killed
+        # and re-queued as ``ready`` WITHOUT counting as a failure.
+        # Complements stale detection: fires quickly (default 15 min) for
+        # long-running work that has already checked in via heartbeat.
+        # 0 disables.  Per-task overrides: tasks.stuck_after_seconds (column)
+        # and tasks.no_heartbeat_required (column).
+        "stuck_after_seconds_default": 900,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
