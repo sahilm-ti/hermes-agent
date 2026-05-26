@@ -442,6 +442,15 @@ class GatewayKanbanWatchersMixin:
                                 f"✖ {tag}Kanban {sub['task_id']} worker crashed "
                                 f"(pid gone); dispatcher will retry"
                             )
+                        elif kind == "stuck":
+                            hb_age = 0
+                            if ev.payload and ev.payload.get("heartbeat_age_seconds"):
+                                hb_age = int(ev.payload["heartbeat_age_seconds"])
+                            silent_min = hb_age // 60 if hb_age else 0
+                            msg = (
+                                f"🫀 {tag}Kanban {sub['task_id']} worker stuck "
+                                f"(silent {silent_min}m, live pid); killed + will retry"
+                            )
                         elif kind == "timed_out":
                             limit = 0
                             if ev.payload and ev.payload.get("limit_seconds"):
@@ -960,6 +969,21 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        # Read stuck_after_seconds_default — 0 disables stuck-worker detection.
+        raw_stuck = kanban_cfg.get(
+            "stuck_after_seconds_default", _kb.DEFAULT_STUCK_AFTER_SECONDS
+        )
+        try:
+            stuck_after_seconds_default = int(raw_stuck or 0)
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.stuck_after_seconds_default=%r; "
+                "using default %d",
+                raw_stuck,
+                _kb.DEFAULT_STUCK_AFTER_SECONDS,
+            )
+            stuck_after_seconds_default = _kb.DEFAULT_STUCK_AFTER_SECONDS
+
         # Crash-loop circuit breaker: trip on N crashes per assignee in
         # M seconds, quarantine for a cooldown with exponential backoff
         # on repeat trips. Defaults match the May 2026 incident that
@@ -1102,6 +1126,7 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    stuck_after_seconds_default=stuck_after_seconds_default,
                     crash_breaker_enabled=crash_breaker_enabled,
                     crash_breaker_max_crashes=crash_breaker_max_crashes,
                     crash_breaker_window_seconds=crash_breaker_window_seconds,
