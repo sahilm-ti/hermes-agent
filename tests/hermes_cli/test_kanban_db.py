@@ -3992,3 +3992,245 @@ def test_respawn_guard_active_pr_uses_rejected_run_outcome(kanban_home):
         )
         reason = kb.check_respawn_guard(conn, t)
     assert reason is None
+
+
+# ---------------------------------------------------------------------------
+# detect_stuck_workers
+# ---------------------------------------------------------------------------
+
+def test_detect_stuck_workers_kills_and_requeues(kanban_home, monkeypatch):
+    """Task with live PID + stale heartbeat is killed and re-queued as
+    ready WITHOUT incrementing consecutive_failures."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="stuck-worker", assignee="worker")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+
+        stale_hb = int(time.time()) - (20 * 60)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
+                (stale_hb, t),
+            )
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: True)
+        killed_signals: list = []
+        stuck = kb.detect_stuck_workers(
+            conn,
+            stuck_after_seconds_default=15 * 60,
+            signal_fn=lambda p, s: killed_signals.append(s),
+        )
+
+        assert t in stuck
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.last_heartbeat_at is None
+        assert task.consecutive_failures == 0, (
+            "consecutive_failures must NOT be incremented for stuck"
+        )
+        assert killed_signals, "SIGTERM must be sent to the stuck worker"
+
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (t,),
+            ).fetchall()
+        ]
+        assert "stuck" in kinds
+
+        run = conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (t,),
+        ).fetchone()
+        assert run and run["outcome"] == "stuck"
+
+
+def test_detect_stuck_workers_skips_no_heartbeat(kanban_home, monkeypatch):
+    """Workers that never heartbeated (last_heartbeat_at IS NULL) are not
+    touched — the stale-claim reaper handles those."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="no-hb", assignee="worker")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: True)
+        stuck = kb.detect_stuck_workers(
+            conn,
+            stuck_after_seconds_default=15 * 60,
+            signal_fn=lambda p, s: None,
+        )
+
+        assert stuck == []
+        assert kb.get_task(conn, t).status == "running"
+
+
+def test_detect_stuck_workers_skips_recent_heartbeat(kanban_home, monkeypatch):
+    """A task with a recent heartbeat is NOT stuck."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="alive-hb", assignee="worker")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
+                (int(time.time()) - 60, t),  # 1 min ago
+            )
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: True)
+        stuck = kb.detect_stuck_workers(
+            conn,
+            stuck_after_seconds_default=15 * 60,
+            signal_fn=lambda p, s: None,
+        )
+
+        assert stuck == []
+        assert kb.get_task(conn, t).status == "running"
+
+
+def test_detect_stuck_workers_per_task_override(kanban_home, monkeypatch):
+    """Per-task stuck_after_seconds overrides the board-wide default."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="long-training", assignee="worker")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+
+        # 45 min stale heartbeat; per-task threshold 1 hour.
+        stale_hb = int(time.time()) - (45 * 60)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET last_heartbeat_at = ?, stuck_after_seconds = ? WHERE id = ?",
+                (stale_hb, 60 * 60, t),
+            )
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: True)
+        stuck = kb.detect_stuck_workers(
+            conn,
+            stuck_after_seconds_default=15 * 60,  # board default 15 min
+            signal_fn=lambda p, s: None,
+        )
+        assert stuck == [], "Per-task 1h override should prevent 45-min fire"
+
+        # Push beyond the per-task threshold.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
+                (int(time.time()) - (70 * 60), t),
+            )
+        stuck2 = kb.detect_stuck_workers(
+            conn,
+            stuck_after_seconds_default=15 * 60,
+            signal_fn=lambda p, s: None,
+        )
+        assert t in stuck2, "Must fire once heartbeat age exceeds per-task threshold"
+
+
+def test_detect_stuck_workers_no_heartbeat_required_skips(kanban_home, monkeypatch):
+    """no_heartbeat_required=1 opts the task out of stuck detection entirely."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="opt-out", assignee="worker")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET last_heartbeat_at = ?, no_heartbeat_required = 1 WHERE id = ?",
+                (int(time.time()) - (20 * 60), t),
+            )
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: True)
+        stuck = kb.detect_stuck_workers(
+            conn,
+            stuck_after_seconds_default=15 * 60,
+            signal_fn=lambda p, s: None,
+        )
+        assert stuck == []
+        assert kb.get_task(conn, t).status == "running"
+
+
+def test_detect_stuck_workers_disabled_when_zero(kanban_home, monkeypatch):
+    """stuck_after_seconds_default=0 disables detection globally."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="disabled", assignee="worker")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
+                (int(time.time()) - (60 * 60), t),
+            )
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: True)
+        stuck = kb.detect_stuck_workers(
+            conn, stuck_after_seconds_default=0, signal_fn=lambda p, s: None,
+        )
+        assert stuck == []
+        assert kb.get_task(conn, t).status == "running"
+
+
+def test_detect_stuck_workers_skips_dead_pid(kanban_home, monkeypatch):
+    """detect_stuck_workers skips tasks whose PID is already dead."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="dead-pid", assignee="worker")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
+                (int(time.time()) - (20 * 60), t),
+            )
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
+        stuck = kb.detect_stuck_workers(
+            conn, stuck_after_seconds_default=15 * 60, signal_fn=lambda p, s: None,
+        )
+        assert stuck == [], "Dead PID left to detect_crashed_workers"
+
+
+def test_dispatch_once_populates_stuck_result(kanban_home, monkeypatch):
+    """dispatch_once surfaces stuck task ids in DispatchResult.stuck."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="stuck-dispatch", assignee="worker")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
+                (int(time.time()) - (20 * 60), t),
+            )
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: True)
+
+        result = kb.dispatch_once(
+            conn,
+            stuck_after_seconds_default=15 * 60,
+            spawn_fn=lambda *a, **kw: None,
+        )
+        assert t in result.stuck, f"Expected {t!r} in result.stuck; got {result.stuck!r}"
+        assert kb.get_task(conn, t).consecutive_failures == 0
