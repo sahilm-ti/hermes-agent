@@ -1162,6 +1162,11 @@ def _handle_create(args: dict, **kw) -> str:
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
+    auto_subscribe, bool_error = _parse_bool_arg(
+        args, "auto_subscribe", default=True,
+    )
+    if bool_error:
+        return tool_error(bool_error)
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -1232,7 +1237,12 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
-            subscribed = _maybe_auto_subscribe(conn, new_tid)
+            subscribed = auto_subscribe and _maybe_auto_subscribe(conn, new_tid)
+            if auto_subscribe and parents:
+                if _inherit_parent_subs(
+                    kb, conn, new_tid, list(parents),
+                ):
+                    subscribed = True
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -1344,6 +1354,64 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             _exc, platform, bool(chat_id),
         )
         return False
+
+
+def _inherit_parent_subs(kb, conn, task_id: str, parent_ids: list) -> bool:
+    """Copy every parent's notification subscriptions onto ``task_id``.
+
+    Worker-spawned child tasks should keep notifying the same gateway
+    chats that are tracking their parents, even when the worker has no
+    session-origin context vars bound (CLI / dispatcher-spawned worker
+    invocations). Without this, fan-outs silently drop notifications:
+    Sahil stops getting Telegram pings on the child because
+    ``kanban_notify_subs`` has zero rows for it. See task t_2b0e7ab6.
+
+    Deduplicates across parents by ``(platform, chat_id, thread_id)``.
+    ``add_notify_sub`` itself is ``INSERT OR IGNORE``, so rows already
+    inserted by the session-origin auto-subscribe path are not
+    duplicated.
+
+    Returns True iff at least one row was inserted (or already existed
+    from a same-call dedupe via the origin path).
+    """
+    inserted = False
+    seen: set[tuple[str, str, str]] = set()
+    for parent_id in parent_ids:
+        try:
+            rows = kb.list_notify_subs(conn, task_id=str(parent_id))
+        except Exception:
+            logger.exception(
+                "kanban_create parent-sub inheritance: list_notify_subs failed "
+                "for parent %s", parent_id,
+            )
+            continue
+        for sub in rows:
+            platform = (sub.get("platform") or "").lower()
+            chat_id = sub.get("chat_id") or ""
+            thread_id = sub.get("thread_id") or ""
+            if not platform or not chat_id:
+                continue
+            key = (platform, chat_id, thread_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                kb.add_notify_sub(
+                    conn,
+                    task_id=task_id,
+                    platform=platform,
+                    chat_id=chat_id,
+                    thread_id=thread_id or None,
+                    user_id=sub.get("user_id") or None,
+                    notifier_profile=sub.get("notifier_profile") or None,
+                )
+                inserted = True
+            except Exception:
+                logger.exception(
+                    "kanban_create parent-sub inheritance: add_notify_sub "
+                    "failed for child %s (parent %s)", task_id, parent_id,
+                )
+    return inserted
 
 
 def _handle_unblock(args: dict, **kw) -> str:
@@ -2100,6 +2168,27 @@ KANBAN_CREATE_SCHEMA = {
                     "provider — a model name alone is resolved against "
                     "the profile's provider and will fail if it belongs "
                     "to a different one. Requires 'model'."
+                ),
+            },
+            "auto_subscribe": {
+                "type": "boolean",
+                "description": (
+                    "Default true. When this tool is called inside a "
+                    "gateway message handler (e.g. orchestrator agent "
+                    "creating a task in response to a Telegram message), "
+                    "auto-subscribe the originating chat to the new "
+                    "task's terminal events so the user gets a "
+                    "notification on completed / blocked / "
+                    "human_review_requested. Additionally, when "
+                    "``parents`` is non-empty, every parent's existing "
+                    "subscriptions are inherited (UNION across parents, "
+                    "deduped) so worker-spawned children keep notifying "
+                    "the chats already tracking the parent — works on "
+                    "the CLI / dispatcher-spawned-worker path with no "
+                    "session origin. Set false to suppress both origin "
+                    "and parent inheritance (e.g. internal fan-out "
+                    "where the user only wants the parent's "
+                    "notification)."
                 ),
             },
             "board": _board_schema_prop(),
