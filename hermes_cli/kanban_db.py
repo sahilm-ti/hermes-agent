@@ -4940,6 +4940,22 @@ def edit_completed_task_result(
     return True
 
 
+def _real_user_home() -> str:
+    """Return the real user home directory from the OS password database.
+
+    Uses ``pwd.getpwuid(os.getuid())`` so the result is unaffected by
+    any ``HOME`` env-var override (e.g. profile-sandboxed orchestrator
+    processes that set ``HOME`` to ``~/.hermes/profiles/<orch>/home/``).
+    Falls back to ``os.path.expanduser("~")`` only on systems where
+    ``pwd`` is not available (Windows; effectively unreachable on macOS/Linux).
+    """
+    try:
+        import pwd  # lazy — not available on Windows; ImportError caught below
+        return pwd.getpwuid(os.getuid()).pw_dir  # windows-footgun: ok — pwd import above is lazy, ImportError caught
+    except (ImportError, AttributeError, KeyError):
+        return os.path.expanduser("~")
+
+
 def _resolve_skill_under_home(skill_name: str, hermes_home: Optional[str]) -> bool:
     """Best-effort check that ``skill_name`` resolves under the worker's HERMES_HOME.
 
@@ -4960,7 +4976,7 @@ def _resolve_skill_under_home(skill_name: str, hermes_home: Optional[str]) -> bo
     if not skill_name:
         return True
 
-    base = _P(hermes_home) if hermes_home else (_P.home() / ".hermes")
+    base = _P(hermes_home) if hermes_home else (_P(_real_user_home()) / ".hermes")
     roots: list[_P] = [base / "skills"]
 
     # Pull external_dirs from the home's config.yaml without importing
@@ -4976,7 +4992,13 @@ def _resolve_skill_under_home(skill_name: str, hermes_home: Optional[str]) -> bo
             for entry in ext:
                 if not isinstance(entry, str):
                     continue
-                p = _P(os.path.expandvars(os.path.expanduser(entry)))
+                # Expand ~ against the real OS user home (not $HOME, which may be
+                # overridden by a profile-sandboxed orchestrator process).
+                real_home = _real_user_home()
+                expanded = entry.replace("~/", real_home.rstrip("/") + "/", 1)
+                if expanded.startswith("~"):
+                    expanded = real_home + expanded[1:]
+                p = _P(os.path.expandvars(expanded))
                 if p.is_dir():
                     roots.append(p)
         except Exception:
