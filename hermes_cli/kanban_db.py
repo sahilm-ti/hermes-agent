@@ -5472,12 +5472,14 @@ def detect_stuck_workers(
     # differ from the board default.  We also need claim_lock to check
     # host-locality and worker_pid to kill the process.
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
-        "       t.stuck_after_seconds, t.no_heartbeat_required "
+        "SELECT t.id, t.worker_pid, tr.last_heartbeat_at, t.claim_lock, "
+        "       t.stuck_after_seconds, t.no_heartbeat_required, "
+        "       t.current_run_id "
         "FROM tasks t "
+        "JOIN task_runs tr ON tr.id = t.current_run_id "
         "WHERE t.status = 'running' "
         "  AND t.worker_pid IS NOT NULL "
-        "  AND t.last_heartbeat_at IS NOT NULL"
+        "  AND tr.last_heartbeat_at IS NOT NULL"
     ).fetchall()
 
     for row in rows:
@@ -5543,12 +5545,25 @@ def detect_stuck_workers(
         }
 
         with write_txn(conn):
+            # CAS: guard on current_run_id + worker_pid + claim_lock so a
+            # racing heartbeat or reclaim between the SELECT and this UPDATE
+            # makes the UPDATE a no-op (rowcount == 0) instead of stomping a
+            # fresh run.  This fixes the TOCTOU race: if the live worker sent a
+            # heartbeat between our SELECT and now, the task's current_run_id /
+            # pid / claim_lock are unchanged, so this still fires correctly for
+            # a true stuck worker.  For stale-heartbeat-carryover (retry path),
+            # the fresh run's task_runs row has no last_heartbeat_at yet, so it
+            # was never included in the SELECT — we never reach this block for
+            # tasks whose new run hasn't heartbeated.
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running'",
-                (tid,),
+                "WHERE id = ? AND status = 'running' "
+                "  AND current_run_id = ? "
+                "  AND worker_pid = ? "
+                "  AND claim_lock = ?",
+                (tid, int(row["current_run_id"]), pid, lock),
             )
             if cur.rowcount != 1:
                 continue

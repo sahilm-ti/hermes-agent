@@ -4015,6 +4015,11 @@ def test_detect_stuck_workers_kills_and_requeues(kanban_home, monkeypatch):
                 "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
                 (stale_hb, t),
             )
+            conn.execute(
+                "UPDATE task_runs SET last_heartbeat_at = ?"
+                " WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (stale_hb, t),
+            )
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: True)
         killed_signals: list = []
@@ -4084,6 +4089,11 @@ def test_detect_stuck_workers_skips_recent_heartbeat(kanban_home, monkeypatch):
                 "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
                 (int(time.time()) - 60, t),  # 1 min ago
             )
+            conn.execute(
+                "UPDATE task_runs SET last_heartbeat_at = ?"
+                " WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (int(time.time()) - 60, t),
+            )
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: True)
         stuck = kb.detect_stuck_workers(
@@ -4113,6 +4123,11 @@ def test_detect_stuck_workers_per_task_override(kanban_home, monkeypatch):
                 "UPDATE tasks SET last_heartbeat_at = ?, stuck_after_seconds = ? WHERE id = ?",
                 (stale_hb, 60 * 60, t),
             )
+            conn.execute(
+                "UPDATE task_runs SET last_heartbeat_at = ?"
+                " WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (stale_hb, t),
+            )
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: True)
         stuck = kb.detect_stuck_workers(
@@ -4123,10 +4138,16 @@ def test_detect_stuck_workers_per_task_override(kanban_home, monkeypatch):
         assert stuck == [], "Per-task 1h override should prevent 45-min fire"
 
         # Push beyond the per-task threshold.
+        very_stale_hb = int(time.time()) - (70 * 60)
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
-                (int(time.time()) - (70 * 60), t),
+                (very_stale_hb, t),
+            )
+            conn.execute(
+                "UPDATE task_runs SET last_heartbeat_at = ?"
+                " WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (very_stale_hb, t),
             )
         stuck2 = kb.detect_stuck_workers(
             conn,
@@ -4149,6 +4170,11 @@ def test_detect_stuck_workers_no_heartbeat_required_skips(kanban_home, monkeypat
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ?, no_heartbeat_required = 1 WHERE id = ?",
+                (int(time.time()) - (20 * 60), t),
+            )
+            conn.execute(
+                "UPDATE task_runs SET last_heartbeat_at = ?"
+                " WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
                 (int(time.time()) - (20 * 60), t),
             )
 
@@ -4177,6 +4203,11 @@ def test_detect_stuck_workers_disabled_when_zero(kanban_home, monkeypatch):
                 "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
                 (int(time.time()) - (60 * 60), t),
             )
+            conn.execute(
+                "UPDATE task_runs SET last_heartbeat_at = ?"
+                " WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (int(time.time()) - (60 * 60), t),
+            )
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: True)
         stuck = kb.detect_stuck_workers(
@@ -4196,10 +4227,16 @@ def test_detect_stuck_workers_skips_dead_pid(kanban_home, monkeypatch):
         kb.claim_task(conn, t, claimer=f"{host}:worker")
         kb._set_worker_pid(conn, t, 12345)
 
+        dead_stale_hb = int(time.time()) - (20 * 60)
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
-                (int(time.time()) - (20 * 60), t),
+                (dead_stale_hb, t),
+            )
+            conn.execute(
+                "UPDATE task_runs SET last_heartbeat_at = ?"
+                " WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (dead_stale_hb, t),
             )
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
@@ -4219,10 +4256,16 @@ def test_dispatch_once_populates_stuck_result(kanban_home, monkeypatch):
         kb.claim_task(conn, t, claimer=f"{host}:worker")
         kb._set_worker_pid(conn, t, 12345)
 
+        dispatch_stale_hb = int(time.time()) - (20 * 60)
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
-                (int(time.time()) - (20 * 60), t),
+                (dispatch_stale_hb, t),
+            )
+            conn.execute(
+                "UPDATE task_runs SET last_heartbeat_at = ?"
+                " WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (dispatch_stale_hb, t),
             )
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: True)
@@ -4234,3 +4277,170 @@ def test_dispatch_once_populates_stuck_result(kanban_home, monkeypatch):
         )
         assert t in result.stuck, f"Expected {t!r} in result.stuck; got {result.stuck!r}"
         assert kb.get_task(conn, t).consecutive_failures == 0
+
+
+def test_detect_stuck_workers_retried_task_not_killed_before_new_heartbeat(
+    kanban_home, monkeypatch
+):
+    """A previously-stuck task that has been re-queued and claimed by a fresh
+    worker should NOT be killed before the new run sends its first heartbeat.
+
+    The fix: detect_stuck_workers now sources last_heartbeat_at from
+    task_runs (the current run's row) rather than tasks.  A fresh run has
+    task_runs.last_heartbeat_at = NULL, so it is invisible to the SELECT
+    and is never killed prematurely.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="retry-no-early-kill", assignee="worker")
+        host = _kb._claimer_id().split(":", 1)[0]
+        claimer = f"{host}:worker"
+
+        # --- Simulate a first (stuck) run ---
+        kb.claim_task(conn, t, claimer=claimer)
+        kb._set_worker_pid(conn, t, 11111)
+
+        old_stale_hb = int(time.time()) - (30 * 60)  # 30 min ago
+        run1_id = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (t,)
+        ).fetchone()["current_run_id"]
+        with kb.write_txn(conn):
+            # Set heartbeat on both tasks and task_runs to simulate the old run
+            conn.execute(
+                "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
+                (old_stale_hb, t),
+            )
+            conn.execute(
+                "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
+                (old_stale_hb, run1_id),
+            )
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: True)
+        stuck = kb.detect_stuck_workers(
+            conn,
+            stuck_after_seconds_default=15 * 60,
+            signal_fn=lambda p, s: None,
+        )
+        assert t in stuck  # first run correctly detected as stuck
+
+        # --- Simulate the task being re-claimed by a fresh worker ---
+        # tasks.last_heartbeat_at is now NULL (cleared by detect_stuck_workers).
+        # The fresh run's task_runs row has last_heartbeat_at = NULL.
+        kb.claim_task(conn, t, claimer=claimer)
+        kb._set_worker_pid(conn, t, 22222)
+
+        new_run_id = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (t,)
+        ).fetchone()["current_run_id"]
+        assert new_run_id != run1_id, "A new task_runs row should have been created"
+
+        # Verify the new run's task_runs row has NULL heartbeat (not inherited
+        # from the old run).
+        new_run_hb = conn.execute(
+            "SELECT last_heartbeat_at FROM task_runs WHERE id = ?", (new_run_id,)
+        ).fetchone()["last_heartbeat_at"]
+        assert new_run_hb is None, (
+            "Fresh run must NOT inherit the previous run's heartbeat timestamp"
+        )
+
+        # detect_stuck_workers must NOT kill the new worker (it hasn't
+        # heartbeated yet, so its task_runs row is excluded from the JOIN).
+        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: True)
+        stuck2 = kb.detect_stuck_workers(
+            conn,
+            stuck_after_seconds_default=15 * 60,
+            signal_fn=lambda p, s: None,
+        )
+        assert stuck2 == [], (
+            "Fresh run without a heartbeat must NOT be treated as stuck"
+        )
+        task2 = kb.get_task(conn, t)
+        assert task2 is not None
+        assert task2.status == "running"
+
+
+def test_detect_stuck_workers_cas_noop_when_heartbeat_advanced(
+    kanban_home, monkeypatch
+):
+    """detect_stuck_workers uses a CAS UPDATE.  If the worker sends a fresh
+    heartbeat between the SELECT and the UPDATE, the task's current_run_id /
+    worker_pid / claim_lock are unchanged — the UPDATE still fires correctly
+    for a genuinely stuck worker.
+
+    More importantly: if the task is reclaimed (different current_run_id)
+    between SELECT and UPDATE, the CAS predicate fails (rowcount == 0) and the
+    task is NOT incorrectly reset.
+
+    We simulate the TOCTOU window by patching write_txn to change
+    current_run_id before the UPDATE executes, then confirm the task is
+    left untouched.
+    """
+    import hermes_cli.kanban_db as _kb
+    from contextlib import contextmanager
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="cas-toctou", assignee="worker")
+        host = _kb._claimer_id().split(":", 1)[0]
+        claimer = f"{host}:worker"
+        kb.claim_task(conn, t, claimer=claimer)
+        kb._set_worker_pid(conn, t, 33333)
+
+        stale_hb = int(time.time()) - (20 * 60)
+        run_id = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (t,)
+        ).fetchone()["current_run_id"]
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
+                (stale_hb, t),
+            )
+            conn.execute(
+                "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
+                (stale_hb, run_id),
+            )
+
+        # Simulate a mid-flight reclaim: change current_run_id between SELECT
+        # (which we replicate by injecting a side-effect in write_txn) and the
+        # UPDATE.  We do this by inserting a new task_runs row and updating
+        # current_run_id directly to mimic what claim_task does, WITHOUT going
+        # through claim_task (to avoid changing status which would drop the row
+        # from the SELECT).
+        fake_new_run_id = run_id + 1000
+        original_write_txn = kb.write_txn
+
+        call_count = [0]
+
+        @contextmanager
+        def patched_write_txn(c):
+            with original_write_txn(c) as ctx:
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    # First write_txn call inside detect_stuck_workers is the
+                    # UPDATE itself.  Before it runs, flip current_run_id so
+                    # the CAS WHERE fails.
+                    c.execute(
+                        "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+                        (fake_new_run_id, t),
+                    )
+                yield ctx
+
+        monkeypatch.setattr(kb, "write_txn", patched_write_txn)
+        monkeypatch.setattr(_kb, "write_txn", patched_write_txn)
+        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: True)
+
+        stuck = kb.detect_stuck_workers(
+            conn,
+            stuck_after_seconds_default=15 * 60,
+            signal_fn=lambda p, s: None,
+        )
+
+        # CAS must have prevented the reset — task NOT in stuck list and
+        # status unchanged.
+        assert stuck == [], (
+            "CAS UPDATE must be a no-op when current_run_id changed between "
+            "SELECT and UPDATE"
+        )
+        cas_task = kb.get_task(conn, t)
+        assert cas_task is not None
+        assert cas_task.status == "running"
