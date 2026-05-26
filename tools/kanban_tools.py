@@ -830,6 +830,11 @@ def _handle_create(args: dict, **kw) -> str:
             subscribed = False
             if auto_subscribe:
                 subscribed = _auto_subscribe_origin(kb, conn, new_tid)
+                if parents:
+                    if _inherit_parent_subs(
+                        kb, conn, new_tid, list(parents),
+                    ):
+                        subscribed = True
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -894,6 +899,64 @@ def _auto_subscribe_origin(kb, conn, task_id: str) -> bool:
     except Exception:
         logger.exception("kanban_create auto-subscribe failed")
         return False
+
+
+def _inherit_parent_subs(kb, conn, task_id: str, parent_ids: list) -> bool:
+    """Copy every parent's notification subscriptions onto ``task_id``.
+
+    Worker-spawned child tasks should keep notifying the same gateway
+    chats that are tracking their parents, even when the worker has no
+    session-origin context vars bound (CLI / dispatcher-spawned worker
+    invocations). Without this, fan-outs silently drop notifications:
+    Sahil stops getting Telegram pings on the child because
+    ``kanban_notify_subs`` has zero rows for it. See task t_2b0e7ab6.
+
+    Deduplicates across parents by ``(platform, chat_id, thread_id)``.
+    ``add_notify_sub`` itself is ``INSERT OR IGNORE``, so rows already
+    inserted by the session-origin auto-subscribe path are not
+    duplicated.
+
+    Returns True iff at least one row was inserted (or already existed
+    from a same-call dedupe via the origin path).
+    """
+    inserted = False
+    seen: set[tuple[str, str, str]] = set()
+    for parent_id in parent_ids:
+        try:
+            rows = kb.list_notify_subs(conn, task_id=str(parent_id))
+        except Exception:
+            logger.exception(
+                "kanban_create parent-sub inheritance: list_notify_subs failed "
+                "for parent %s", parent_id,
+            )
+            continue
+        for sub in rows:
+            platform = (sub.get("platform") or "").lower()
+            chat_id = sub.get("chat_id") or ""
+            thread_id = sub.get("thread_id") or ""
+            if not platform or not chat_id:
+                continue
+            key = (platform, chat_id, thread_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                kb.add_notify_sub(
+                    conn,
+                    task_id=task_id,
+                    platform=platform,
+                    chat_id=chat_id,
+                    thread_id=thread_id or None,
+                    user_id=sub.get("user_id") or None,
+                    notifier_profile=sub.get("notifier_profile") or None,
+                )
+                inserted = True
+            except Exception:
+                logger.exception(
+                    "kanban_create parent-sub inheritance: add_notify_sub "
+                    "failed for child %s (parent %s)", task_id, parent_id,
+                )
+    return inserted
 
 
 def _handle_unblock(args: dict, **kw) -> str:
@@ -1513,12 +1576,16 @@ KANBAN_CREATE_SCHEMA = {
                     "auto-subscribe the originating chat to the new "
                     "task's terminal events so the user gets a "
                     "notification on completed / blocked / "
-                    "human_review_requested. Outside the gateway "
-                    "(CLI, cron, dispatcher-spawned worker) no session "
-                    "origin exists and this is a no-op regardless. Set "
-                    "false to suppress even when origin is present "
-                    "(e.g. internal fan-out where the user only wants "
-                    "the parent's notification)."
+                    "human_review_requested. Additionally, when "
+                    "``parents`` is non-empty, every parent's existing "
+                    "subscriptions are inherited (UNION across parents, "
+                    "deduped) so worker-spawned children keep notifying "
+                    "the chats already tracking the parent — works on "
+                    "the CLI / dispatcher-spawned-worker path with no "
+                    "session origin. Set false to suppress both origin "
+                    "and parent inheritance (e.g. internal fan-out "
+                    "where the user only wants the parent's "
+                    "notification)."
                 ),
             },
             "board": _board_schema_prop(),
