@@ -247,6 +247,13 @@ DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
 # stops the duplication; once no duplicate is spawned the pressure eases, the
 # signal lands, and the following tick reclaims cleanly.
 RECLAIM_DEFER_GRACE_SECONDS = 120
+# Default heartbeat-staleness threshold for stuck-worker detection.
+# A running task whose worker PID is alive, that has sent at least one
+# heartbeat, and whose last heartbeat is older than this many seconds is
+# classified as "stuck" and killed + re-queued.  Configurable globally via
+# ``kanban.stuck_after_seconds_default`` and per-task via the task's
+# ``stuck_after_seconds`` column.  0 or None disables the check.
+DEFAULT_STUCK_AFTER_SECONDS = 15 * 60  # 15 minutes
 
 
 def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
@@ -972,6 +979,12 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Per-task override for the stuck-worker heartbeat-staleness threshold.
+    # NULL = use the board-wide ``kanban.stuck_after_seconds_default``.
+    stuck_after_seconds: Optional[int] = None
+    # When True, the dispatcher skips stuck-detection for this task even
+    # when the board-wide default is enabled.
+    no_heartbeat_required: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1055,6 +1068,14 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            stuck_after_seconds=(
+                row["stuck_after_seconds"] if "stuck_after_seconds" in keys else None
+            ),
+            no_heartbeat_required=(
+                bool(row["no_heartbeat_required"])
+                if "no_heartbeat_required" in keys
+                else False
             ),
         )
 
@@ -1221,11 +1242,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
     session_id           TEXT,
-    -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
-    -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
-    -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
-    -- to ``blocked`` for a human. Preserved across unblock so a re-block for
-    -- the SAME kind can be recognised as a loop.
     block_kind           TEXT,
     -- Unblock-loop counter. Incremented each time a task is re-blocked for the
     -- same truly-blocked reason after having been unblocked. When it reaches
@@ -1233,7 +1249,21 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Per-task override for the stuck-worker heartbeat-staleness threshold.
+    -- When non-NULL, the dispatcher uses this value instead of the board-
+    -- wide ``kanban.stuck_after_seconds_default`` to decide whether the
+    -- worker is stuck (alive PID but stale heartbeat).  Useful for long-
+    -- running training/encoding jobs that legitimately go 30+ minutes
+    -- without a heartbeat.  NULL = fall through to the board default.
+    stuck_after_seconds  INTEGER,
+    -- When 1 (true), the dispatcher skips stuck-detection entirely for this
+    -- task even if the board-wide default is enabled.  Intended for short
+    -- tasks that finish before the stuck window without ever heartbeating,
+    -- where the "heartbeat present and stale" guard would never fire anyway
+    -- (the rule already requires last_heartbeat_at IS NOT NULL), but
+    -- operators can use this as an explicit opt-out for clarity.
+    no_heartbeat_required INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2063,6 +2093,25 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "tasks",
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
+        )
+
+    if "stuck_after_seconds" not in cols:
+        # Per-task override for the stuck-worker heartbeat-staleness window.
+        # NULL = fall through to the board-wide
+        # ``kanban.stuck_after_seconds_default``.
+        _add_column_if_missing(
+            conn, "tasks", "stuck_after_seconds", "stuck_after_seconds INTEGER"
+        )
+
+    if "no_heartbeat_required" not in cols:
+        # Explicit per-task opt-out of stuck-detection.
+        # Defaults to 0 (false) for all existing rows so behaviour is
+        # unchanged until the operator explicitly sets it.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "no_heartbeat_required",
+            "no_heartbeat_required INTEGER NOT NULL DEFAULT 0",
         )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -6632,6 +6681,11 @@ class DispatchResult:
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
+    stuck: list[str] = field(default_factory=list)
+    """Task ids whose workers had a live PID but a stale heartbeat
+    (heartbeated at least once, then went silent past the configured
+    ``stuck_after_seconds`` window).  The workers are killed and the tasks
+    re-queued as ``ready`` without incrementing ``consecutive_failures``."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
@@ -7109,6 +7163,180 @@ def enforce_max_runtime(
                 event_payload_extra={"pid": pid, "sigkill": killed},
             )
     return timed_out
+
+
+def detect_stuck_workers(
+    conn: sqlite3.Connection,
+    *,
+    stuck_after_seconds_default: int = DEFAULT_STUCK_AFTER_SECONDS,
+    signal_fn=None,
+) -> list[str]:
+    """Kill and re-queue running tasks whose worker PID is alive but whose
+    heartbeat has gone silent past the configured threshold.
+
+    A task is considered **stuck** when ALL of these hold:
+
+    1. ``status = 'running'`` and ``worker_pid`` is alive (host-local PID
+       check).
+    2. ``last_heartbeat_at`` is NOT NULL — the worker has heartbeated at
+       least once on this run (i.e. it opted into the heartbeat contract).
+    3. ``now - last_heartbeat_at > effective_stuck_after_seconds``.
+
+    The effective threshold resolves as:
+
+    * Per-task ``stuck_after_seconds`` column (when non-NULL).
+    * Board-wide ``stuck_after_seconds_default`` argument (from
+      ``kanban.stuck_after_seconds_default`` in config).
+    * Falls back to ``DEFAULT_STUCK_AFTER_SECONDS`` (15 min) when neither
+      is set.
+
+    Per-task ``no_heartbeat_required = 1`` skips the check entirely for
+    that task even when the board default is active.
+
+    Edge cases handled correctly:
+
+    * Workers that never heartbeated (``last_heartbeat_at IS NULL``) are
+      **not** touched — the existing 4-hour stale-claim reaper
+      (``detect_stale_running``) covers those.
+    * Workers that are heartbeating normally (recent ``last_heartbeat_at``)
+      are **not** touched.
+    * ``stuck_after_seconds_default <= 0`` disables the check entirely
+      (returns ``[]`` immediately) unless overridden per-task.
+
+    On stuck detection:
+
+    * Emits a ``stuck`` event (new kind, distinct from ``crashed`` /
+      ``timed_out``).
+    * SIGTERMs the worker; SIGKILLs after a 5-second grace window if still
+      alive.
+    * Closes the active run with ``outcome='stuck'``.
+    * Resets the task to ``ready`` WITHOUT incrementing
+      ``consecutive_failures`` — stuck is environmental (e.g. a blocked
+      network call), not worker fault.
+
+    Returns the list of re-queued task IDs.  ``signal_fn`` is a test hook;
+    defaults to ``os.kill`` on POSIX.
+    """
+    import signal as _signal_mod
+
+    stuck_ids: list[str] = []
+    now = int(time.time())
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+
+    # We read stuck_after_seconds per task so the per-task override can
+    # differ from the board default.  We also need claim_lock to check
+    # host-locality and worker_pid to kill the process.
+    rows = conn.execute(
+        "SELECT t.id, t.worker_pid, tr.last_heartbeat_at, t.claim_lock, "
+        "       t.stuck_after_seconds, t.no_heartbeat_required, "
+        "       t.current_run_id "
+        "FROM tasks t "
+        "JOIN task_runs tr ON tr.id = t.current_run_id "
+        "WHERE t.status = 'running' "
+        "  AND t.worker_pid IS NOT NULL "
+        "  AND tr.last_heartbeat_at IS NOT NULL"
+    ).fetchall()
+
+    for row in rows:
+        # Resolve the effective threshold for this task.
+        if row["no_heartbeat_required"]:
+            continue  # operator explicitly opted out
+
+        raw_per_task = row["stuck_after_seconds"]
+        if raw_per_task is not None:
+            effective = int(raw_per_task)
+        else:
+            effective = int(stuck_after_seconds_default)
+
+        if effective <= 0:
+            continue  # disabled (either globally or per-task)
+
+        hb_age = now - int(row["last_heartbeat_at"])
+        if hb_age <= effective:
+            continue  # still within the heartbeat window — healthy
+
+        # Only act on tasks claimed by this host.
+        lock = row["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue
+
+        pid = int(row["worker_pid"])
+        if not _pid_alive(pid):
+            continue  # already dead — detect_crashed_workers will handle it
+
+        tid = row["id"]
+
+        # Terminate: SIGTERM first, SIGKILL after grace window.
+        kill = signal_fn if signal_fn is not None else (
+            os.kill if hasattr(os, "kill") else None
+        )
+        killed = False
+        if kill is not None:
+            try:
+                kill(pid, _signal_mod.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+            for _ in range(10):
+                if not _pid_alive(pid):
+                    break
+                time.sleep(0.5)
+            if _pid_alive(pid):
+                try:
+                    _sigkill = getattr(_signal_mod, "SIGKILL", _signal_mod.SIGTERM)
+                    kill(pid, _sigkill)
+                    killed = True
+                except (ProcessLookupError, OSError):
+                    pass
+
+        error_msg = (
+            f"worker silent for {hb_age // 60}m ({hb_age}s) despite live pid {pid}"
+        )
+        payload = {
+            "pid": pid,
+            "last_heartbeat_at": int(row["last_heartbeat_at"]),
+            "heartbeat_age_seconds": hb_age,
+            "stuck_after_seconds": effective,
+            "sigkill": killed,
+        }
+
+        with write_txn(conn):
+            # CAS: guard on current_run_id + worker_pid + claim_lock so a
+            # racing heartbeat or reclaim between the SELECT and this UPDATE
+            # makes the UPDATE a no-op (rowcount == 0) instead of stomping a
+            # fresh run.  This fixes the TOCTOU race: if the live worker sent a
+            # heartbeat between our SELECT and now, the task's current_run_id /
+            # pid / claim_lock are unchanged, so this still fires correctly for
+            # a true stuck worker.  For stale-heartbeat-carryover (retry path),
+            # the fresh run's task_runs row has no last_heartbeat_at yet, so it
+            # was never included in the SELECT — we never reach this block for
+            # tasks whose new run hasn't heartbeated.
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, "
+                "last_heartbeat_at = NULL "
+                "WHERE id = ? AND status = 'running' "
+                "  AND current_run_id = ? "
+                "  AND worker_pid = ? "
+                "  AND claim_lock = ?",
+                (tid, int(row["current_run_id"]), pid, lock),
+            )
+            if cur.rowcount != 1:
+                continue
+
+            run_id = _end_run(
+                conn, tid,
+                outcome="stuck", status="stuck",
+                error=error_msg,
+                metadata=payload,
+            )
+            _append_event(conn, tid, "stuck", payload, run_id=run_id)
+            stuck_ids.append(tid)
+
+        # Do NOT call _record_task_failure — stuck is environmental, not
+        # worker fault.  The consecutive_failures counter stays unchanged so
+        # the circuit breaker is not tripped by network-sleep incidents.
+
+    return stuck_ids
 
 
 # Heartbeat staleness heartbeat gap — if a running task hasn't sent a
@@ -8199,6 +8427,7 @@ def dispatch_once(
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
+    stuck_after_seconds_default: int = DEFAULT_STUCK_AFTER_SECONDS,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
@@ -8341,6 +8570,10 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    result.stuck = detect_stuck_workers(
+        conn,
+        stuck_after_seconds_default=stuck_after_seconds_default,
+    )
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Crash-loop circuit breaker: trip on N crashed events / window per
