@@ -5362,6 +5362,101 @@ class TestKanbanWorkerSkillAvailable:
         assert kb._kanban_worker_skill_available(str(home)) is True
 
 
+class TestResolveSkillUnderHomeCrossProfile:
+    """Regression for the HOME-sandbox mis-expansion bug (2026-05-26).
+
+    When the calling process has HOME overridden to a profile-sandboxed path
+    (e.g. ``/tmp/fake_home``) and the skill config uses ``~/.hermes/skills``,
+    ``_resolve_skill_under_home`` must still resolve correctly against the
+    real OS user home — not the sandboxed HOME.
+    """
+
+    def _write_skill(self, root: Path, skill_name: str = "kanban-worker", category: str = "devops") -> Path:
+        skill_dir = root / category / skill_name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text(
+            f"---\nname: {skill_name}\ndescription: stub\n---\n\nstub\n",
+            encoding="utf-8",
+        )
+        return skill_md
+
+    def test_resolves_tilde_in_external_dirs_despite_fake_home(self, tmp_path, monkeypatch):
+        """The core bug: config has ``~/.hermes/skills`` (tilde-prefixed) and the
+        caller's HOME is set to a sandbox path.  The resolver must use the real
+        user home from pwd, not $HOME."""
+        import pwd as _pwd
+
+        real_home = _pwd.getpwuid(os.getuid()).pw_dir
+
+        # Build the profile home under the real user home (mirrors real usage).
+        profile_home = tmp_path / "profiles" / "bt-optimizer"
+        profile_home.mkdir(parents=True)
+        (profile_home / "skills").mkdir()
+
+        # Shared skills dir with the skill.
+        shared_skills = tmp_path / "shared-skills"
+        self._write_skill(shared_skills, "kanban-worker")
+
+        # Config uses tilde — exactly the pattern the bug broke.
+        # We can't use the real ~/.hermes/skills path because that would
+        # resolve correctly even with the old code (real dir exists).
+        # Instead, write the config with the absolute path of shared_skills
+        # prefixed by the fake real_home replacement.  The simplest
+        # end-to-end test is to use the shared_skills absolute path
+        # directly in external_dirs (already tested in the other class)
+        # and separately test that the tilde-expansion helper itself
+        # returns the real home regardless of $HOME.
+        fake_home = str(tmp_path / "fake_home")
+        monkeypatch.setenv("HOME", fake_home)
+
+        # _real_user_home must ignore $HOME and return the actual home.
+        assert kb._real_user_home() == real_home
+
+        # And the resolver must find the skill when external_dirs uses an
+        # absolute path (sanity check that fake HOME doesn't break absolute paths).
+        (profile_home / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {shared_skills}\n", encoding="utf-8",
+        )
+        assert kb._resolve_skill_under_home("kanban-worker", str(profile_home)) is True
+
+    def test_resolves_tilde_entry_with_fake_home(self, tmp_path, monkeypatch):
+        """Write the external_dirs entry as ``~/<relative>`` and confirm the
+        resolver expands it against the real home even when $HOME is wrong."""
+        import pwd as _pwd
+
+        real_home = _pwd.getpwuid(os.getuid()).pw_dir
+
+        # Create the skill under a path that IS under the real home (tmp_path
+        # is typically /tmp/… which is NOT under real_home — so we place the
+        # skill under a real_home-relative subdirectory we can clean up).
+        # Use a unique subdir inside real_home to avoid collisions.
+        import uuid
+        unique = f".hermes-test-{uuid.uuid4().hex[:8]}"
+        shared_root = Path(real_home) / unique
+        try:
+            self._write_skill(shared_root, "kanban-worker")
+
+            profile_home = tmp_path / "profile"
+            profile_home.mkdir()
+            (profile_home / "skills").mkdir()
+
+            # Write config with tilde-path pointing at the unique subdir.
+            (profile_home / "config.yaml").write_text(
+                f"skills:\n  external_dirs:\n    - ~/{unique}\n", encoding="utf-8",
+            )
+
+            # Override HOME to a fake path.
+            monkeypatch.setenv("HOME", str(tmp_path / "fake_home"))
+
+            # Resolver must still find the skill via real home expansion.
+            assert kb._resolve_skill_under_home("kanban-worker", str(profile_home)) is True
+        finally:
+            import shutil as _shutil
+            if shared_root.exists():
+                _shutil.rmtree(shared_root)
+
+
 # ---------------------------------------------------------------------------
 # reject_task — running-from-review claim path (Bug 1)
 # ---------------------------------------------------------------------------
