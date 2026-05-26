@@ -186,6 +186,7 @@ class GatewayKanbanWatchersMixin:
             "completed", "blocked", "gave_up", "crashed", "timed_out",
             "status", "archived", "unblocked",
             "human_review_requested", "approved", "rejected", "quarantined",
+            "merge_requested",
         )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
@@ -491,6 +492,16 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"✅ {board_tag}{tag}Kanban {sub['task_id']} approved "
                                 f"— {title}{note}"
+                            )
+                        elif kind == "merge_requested":
+                            pr_url_note = ""
+                            if ev.payload and ev.payload.get("pr_url"):
+                                pr_url_note = (
+                                    f"\n{str(ev.payload['pr_url'])[:NOTIFY_BLOCKED_REASON_MAX]}"
+                                )
+                            msg = (
+                                f"⚙️ {tag}Kanban {sub['task_id']} merging PR "
+                                f"— {title}{pr_url_note}"
                             )
                         elif kind == "rejected":
                             note = ""
