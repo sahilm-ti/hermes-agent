@@ -176,10 +176,39 @@ def sync_skills(quiet: bool = False) -> dict:
     """
     Sync bundled skills into ~/.hermes/skills/ using the manifest.
 
+    Honors the ``.no-bundled-skills`` opt-out marker at ``HERMES_HOME``: when
+    present, the entire sync (SKILL.md *and* category DESCRIPTION.md files)
+    is skipped. This is defense-in-depth — every documented caller (gateway
+    startup, ``hermes update``, ``seed_profile_skills``) is supposed to check
+    the marker before calling us, but historically the DESCRIPTION.md
+    loop below ran unconditionally even when the SKILL.md path was
+    correctly bypassed at the caller, leaving stale category stubs in
+    opted-out profile skills/ dirs (see PR #15 follow-up).
+
     Returns:
         dict with keys: copied (list), updated (list), skipped (int),
-                        user_modified (list), cleaned (list), total_bundled (int)
+                        user_modified (list), cleaned (list), total_bundled (int).
+        When the opt-out marker is set, returns a zero-effect dict with
+        ``skipped_opt_out=True`` so callers can distinguish "skipped due to
+        marker" from "nothing to do".
     """
+    # Defense-in-depth marker check. SKILLS_DIR's parent is HERMES_HOME by
+    # construction (module-level constant), so resolving the marker relative
+    # to it works regardless of how callers patch globals in tests.
+    try:
+        from hermes_cli.profiles import NO_BUNDLED_SKILLS_MARKER
+        marker = SKILLS_DIR.parent / NO_BUNDLED_SKILLS_MARKER
+        if marker.exists():
+            return {
+                "copied": [], "updated": [], "skipped": 0,
+                "user_modified": [], "cleaned": [], "total_bundled": 0,
+                "skipped_opt_out": True,
+            }
+    except Exception:
+        # Best-effort — if the import fails (circular import edge cases,
+        # partial installs) fall through to the normal sync path.
+        pass
+
     bundled_dir = _get_bundled_dir()
     if not bundled_dir.exists():
         return {
