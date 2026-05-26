@@ -1,5 +1,14 @@
 # Design: Post-Approve Merger Agent for Kanban
 
+> **Update (2026-05-26 — post-design-approval):** Sahil confirmed: **no new `merging`
+> status, no new dashboard column.** The task stays in `human_review` while the
+> merger agent works, then transitions directly to `done` (or `blocked` on failure).
+> Sections Q6, the state machine, and the file-change list below have been updated
+> to reflect this. The `merging` column from the original sequence diagram has been
+> replaced with the `running` approach described in §3.
+
+
+
 **Task:** t_5a521a19  
 **Phase:** Design (no code — approval gate before implementing)  
 **Author:** braintrusteng (hermes worker)
@@ -82,14 +91,27 @@ The merger never stores intermediate state in the task itself. It relies entirel
 
 ### Q6 — Dashboard new `merging` column vs. `human_review`-with-spinner?
 
-**Recommendation: add a new `merging` status to `VALID_STATUSES` and render it as its own board column.**
+**Decision (Sahil, 2026-05-26): no new status, no new dashboard column.**
 
-Having a separate status is necessary because:
-- `human_review` is a "parked" state (dispatcher ignores it). If we kept tasks in `human_review` while merging is in progress, the dispatcher can't distinguish "parked awaiting Sahil" from "currently being merged".
-- A distinct `merging` status allows the dispatcher to spawn the merger agent (same `dispatch_once` pattern as the `review` column dispatch).
-- The dashboard can show `merging` with a distinct ⚙️ glyph (vs. ⏳ for `human_review`).
+The implementation uses a direct-spawn approach instead of a dispatcher-loop approach:
 
-The task body asks whether the dashboard needs a new column. Given `dispatch_once` already handles `review` as a special column alongside `ready`, adding `merging` as a third dispatchable column follows the same precedent cleanly.
+- `approve_task()` finds a PR URL → calls `claim_merger_task()` which moves the task
+  `human_review → running`, appends a `merge_requested` event, and returns the claimed
+  `Task` object.
+- The tool handler `_handle_approve` (in `kanban_tools.py`) receives the claimed task
+  and immediately calls `_default_spawn()` to fire up the `post-approve-merger` worker
+  — no waiting for the next dispatcher tick.
+- The merger worker runs normally: reads the task, merges (or blocks), calls
+  `kanban_complete` / `kanban_block` which transition `running → done/blocked`.
+- The task is in `running` state while the merger works — that's indistinguishable
+  from any other worker run on the dashboard. No new column needed.
+
+Trade-off vs. the original `merging` approach: crash recovery is slightly slower
+(the TTL reap loop reclaims the task and re-queues it as `ready` if the merger crashes,
+but the assignee will be whatever the task's `assignee` field holds — the merger must
+be invoked with the correct profile, which the direct-spawn path guarantees; a
+re-dispatch of the `ready` task would use the original assignee, not `post-approve-merger`).
+The idempotency rule (§Q5) mitigates this: re-spawn checks `gh pr view` first.
 
 ---
 
@@ -108,19 +130,23 @@ No SQL migration is needed. `VALID_STATUSES` is a Python set in memory; adding `
 ## 2. Full State Machine (updated)
 
 ```
-triage → todo → ready → running → review → human_review → merging → done
+triage → todo → ready → running → review → human_review → done
                                 ↓        ↓               ↓
-                             blocked   blocked         blocked
+                             blocked   blocked         blocked (from running, via merger)
                                 ↑        ↑
                              (rejected)  (rejected)
 ```
 
-Status transitions added by this change:
-- `human_review → merging` (triggered by `approve_task` when a PR URL is found)
-- `merging → done` (triggered by `complete_task` called from merger worker on success)
-- `merging → blocked` (triggered by `block_task` called from merger worker on irrecoverable failure)
+With the merger flow, `human_review → done` is now split into two paths:
 
-`merging` is dispatchable (dispatcher spawns `post-approve-merger` profile when it sees a `merging` task with no claim lock), parallel to the `review` column dispatch.
+1. **No PR found** — `approve_task()` transitions `human_review → done` directly
+   (current behavior, unchanged).
+2. **PR found** — `approve_task()` calls `claim_merger_task()` which transitions
+   `human_review → running`. The merger worker runs, then either:
+   - `kanban_complete` → `running → done`
+   - `kanban_block` → `running → blocked`
+
+No new status values added to `VALID_STATUSES`. No new dispatcher column.
 
 ---
 
@@ -131,7 +157,7 @@ sequenceDiagram
     participant Sahil
     participant kanban_approve (tool/CLI)
     participant kanban_db.approve_task()
-    participant Dispatcher (dispatch_once)
+    participant _handle_approve (kanban_tools.py)
     participant post-approve-merger worker
     participant GitHub (gh CLI)
 
@@ -141,18 +167,15 @@ sequenceDiagram
 
     kanban_db.approve_task()->>kanban_db.approve_task(): _extract_pr_url(conn, task_id)
     alt No PR URL found
-        kanban_db.approve_task()-->>kanban_approve (tool/CLI): True, status=done
+        kanban_db.approve_task()-->>kanban_approve (tool/CLI): (True, "done", None)
         kanban_approve (tool/CLI)-->>Sahil: {status: done}
     else PR URL found
-        kanban_db.approve_task()->>kanban_db.approve_task(): UPDATE tasks SET status='merging'
+        kanban_db.approve_task()->>kanban_db.approve_task(): claim_merger_task() → human_review → running
         kanban_db.approve_task()->>kanban_db.approve_task(): _append_event(merge_requested, {pr_url})
-        kanban_db.approve_task()-->>kanban_approve (tool/CLI): True, status=merging
-        kanban_approve (tool/CLI)-->>Sahil: {status: merging, pr_url: ...}
-
-        Note over Dispatcher (dispatch_once): next tick
-        Dispatcher (dispatch_once)->>Dispatcher (dispatch_once): SELECT id FROM tasks WHERE status='merging' AND claim_lock IS NULL
-        Dispatcher (dispatch_once)->>kanban_db.approve_task(): claim_merging_task(conn, task_id)
-        Dispatcher (dispatch_once)->>post-approve-merger worker: spawn(task, workspace, skills=[post-approve-merger])
+        kanban_db.approve_task()-->>kanban_approve (tool/CLI): (True, "merge_triggered", pr_url, task)
+        kanban_approve (tool/CLI)-->>_handle_approve (kanban_tools.py): merge_triggered
+        _handle_approve (kanban_tools.py)->>post-approve-merger worker: _default_spawn(task, workspace, board)
+        _handle_approve (kanban_tools.py)-->>Sahil: {status: merge_triggered, pr_url: ...}
 
         post-approve-merger worker->>kanban_db.approve_task(): kanban_show() → get pr_url from merge_requested event
         post-approve-merger worker->>GitHub (gh CLI): gh pr view --json state,mergeable,statusCheckRollup,isDraft
@@ -262,18 +285,23 @@ sequenceDiagram
 
 ---
 
-## 5. Files Changed (implementation plan — NOT implemented yet)
+## 5. Files Changed (implementation plan)
 
 | File | Change |
 |---|---|
-| `hermes_cli/kanban_db.py` | Add `"merging"` to `VALID_STATUSES`; add `_extract_pr_url()`; modify `approve_task()` to route via merging; add `move_to_merging()` (called internally by `approve_task`); add `claim_merging_task()`; add merging column dispatch section in `dispatch_once()` |
-| `tools/kanban_tools.py` | `_handle_approve()` already delegates to `approve_task()` — no change needed; update return value to surface `pr_url` in JSON when transitioning to `merging` |
-| `hermes_cli/kanban.py` | `_cmd_approve()` prints "Sent to merging" when `approve_task` returns `merging` instead of `done` |
-| `gateway/run.py` | Add `"merge_requested"` and `"merged"` event kinds to the notifier event set (line 4764); add human-readable messages for each |
+| `hermes_cli/kanban_db.py` | Add `_extract_pr_url()`; add `claim_merger_task()`; modify `approve_task()` to call `claim_merger_task()` when PR found and return a tuple `(success, outcome, pr_url, task)` |
+| `tools/kanban_tools.py` | Update `_handle_approve()` to handle `merge_triggered` outcome: call `_default_spawn()` with the claimed task, return `{status: "merge_triggered", pr_url: ...}` |
+| `hermes_cli/kanban.py` | Update `_cmd_approve()` to print "Sent to merger (PR: <url>)" on `merge_triggered` path |
+| `gateway/run.py` | Add `"merge_requested"` to the notifier event set; add human-readable message |
 | `~/.hermes/profiles/post-approve-merger/` | New profile directory with `config.yaml` |
-| `skills/devops/post-approve-merger/SKILL.md` | New skill: PR merger procedure, all 6 PR state branches, auth pattern, idempotency, `kanban_complete`/`kanban_block` contract |
-| `tests/hermes_cli/test_kanban_merging.py` | New test file: `"merging"` in `VALID_STATUSES`, `_extract_pr_url` (event path, comment path, no-URL path), `approve_task` routes correctly (PR → merging, no-PR → done), dispatcher spawns merger on `merging` tasks, `claim_merging_task` transitions correctly |
-| `tests/hermes_cli/test_kanban_human_review.py` | Extend existing tests: `test_approve_routes_to_merging_when_pr_url_present`, `test_approve_routes_to_done_when_no_pr_url` |
+| `skills/devops/post-approve-merger/SKILL.md` | New skill: PR merger procedure, all 6 PR state branches, auth pattern, idempotency |
+| `tests/hermes_cli/test_kanban_merging.py` | New test file: `_extract_pr_url` (event path, comment path, no-URL path), `claim_merger_task`, `approve_task` routing |
+| `tests/hermes_cli/test_kanban_human_review.py` | Add `test_approve_routes_to_merge_triggered_when_pr_url_present`, `test_approve_routes_to_done_when_no_pr_url` |
+
+**NOT changed vs. original design:**
+- `VALID_STATUSES` — no new status
+- `dispatch_once()` — no new dispatch column
+- `has_spawnable_review()` / `has_spawnable_ready()` — no new counterparts needed
 
 ---
 
