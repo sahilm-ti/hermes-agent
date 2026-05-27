@@ -3679,9 +3679,7 @@ def _real_user_home() -> str:
     try:
         import pwd  # lazy — not available on Windows; ImportError caught below
 
-        return pwd.getpwuid(
-            os.getuid()
-        ).pw_dir  # windows-footgun: ok — pwd import above is lazy, ImportError caught
+        return pwd.getpwuid(os.getuid()).pw_dir  # windows-footgun: ok — pwd import above is lazy, ImportError caught  # fmt: skip
     except (ImportError, AttributeError, KeyError):
         return os.path.expanduser("~")
 
@@ -5845,8 +5843,10 @@ def detect_stuck_workers(
         tid = row["id"]
 
         # Terminate: SIGTERM first, SIGKILL after grace window.
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        kill = (
+            signal_fn
+            if signal_fn is not None
+            else (os.kill if hasattr(os, "kill") else None)
         )
         killed = False
         if kill is not None:
@@ -5902,8 +5902,10 @@ def detect_stuck_workers(
                 continue
 
             run_id = _end_run(
-                conn, tid,
-                outcome="stuck", status="stuck",
+                conn,
+                tid,
+                outcome="stuck",
+                status="stuck",
                 error=error_msg,
                 metadata=payload,
             )
