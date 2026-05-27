@@ -87,7 +87,8 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     db_path = tmp_path / "legacy-kanban.db"
     conn = sqlite3.connect(str(db_path))
     # Pre-#16081 ``tasks`` shape: missing tenant, idempotency_key, session_id.
-    conn.execute("""
+    conn.execute(
+        """
         CREATE TABLE tasks (
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
@@ -104,11 +105,13 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
             claim_lock TEXT,
             claim_expires INTEGER
         )
-    """)
+    """
+    )
     # Pre-#17805 ``task_events`` shape: missing run_id. Required because
     # ``_migrate_add_optional_columns`` unconditionally runs PRAGMA on
     # ``task_events`` for run_id back-fill.
-    conn.execute("""
+    conn.execute(
+        """
         CREATE TABLE task_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             task_id TEXT NOT NULL,
@@ -116,7 +119,8 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
             payload TEXT,
             created_at INTEGER NOT NULL
         )
-    """)
+    """
+    )
     conn.execute(
         "INSERT INTO tasks (id, title, status, created_at) "
         "VALUES ('legacy', 'old board task', 'ready', 1)"
@@ -2677,7 +2681,8 @@ def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home
     # Schema already in fully-migrated state (all optional columns present).
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
-    conn.execute("""
+    conn.execute(
+        """
         CREATE TABLE tasks (
             id INTEGER PRIMARY KEY,
             title TEXT NOT NULL,
@@ -2697,8 +2702,10 @@ def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home
             max_retries INTEGER,
             session_id TEXT
         )
-        """)
-    conn.execute("""
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE task_events (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             task_id    TEXT NOT NULL DEFAULT '',
@@ -2707,7 +2714,8 @@ def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home
             payload    TEXT,
             created_at INTEGER NOT NULL DEFAULT 0
         )
-        """)
+        """
+    )
 
     # Running migration on an already-migrated schema must not raise.
     kb._migrate_add_optional_columns(conn)
