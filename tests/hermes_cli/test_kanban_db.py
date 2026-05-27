@@ -357,6 +357,10 @@ def test_ensure_worktree_respawn_reuses_existing(kanban_home, tmp_path, monkeypa
     live = _init_bare_live_checkout(tmp_path)
     monkeypatch.setenv("HERMES_KANBAN_LIVE_CHECKOUT", str(live))
     monkeypatch.setenv("HERMES_KANBAN_WORKTREE_BASE_REF", "main")
+    # Disable identity enforcement so this test can commit with a
+    # throwaway author email — the test is verifying respawn semantics
+    # (prior commits survive), not git identity attribution.
+    monkeypatch.setenv("HERMES_KANBAN_ENFORCE_GIT_IDENTITY", "false")
 
     wt_path = tmp_path / "wt" / "t_worktree_respawn"
     with kb.connect() as conn:
@@ -5049,3 +5053,299 @@ def test_detect_stuck_workers_cas_noop_when_heartbeat_advanced(
         cas_task = kb.get_task(conn, t)
         assert cas_task is not None
         assert cas_task.status == "running"
+
+
+# ---------------------------------------------------------------------------
+# Worker git identity pinning (pin_workspace_git_identity)
+# ---------------------------------------------------------------------------
+#
+# These tests verify the two-layer defence (per-workspace git config +
+# pre-commit hook) introduced to prevent misattributed worker commits.
+# ---------------------------------------------------------------------------
+
+_WORKER_NAME = "Sahil (AI)"
+_WORKER_EMAIL = "266772320+sahilm-ai@users.noreply.github.com"
+_BAD_EMAIL = "97122673+sahilm-ti@users.noreply.github.com"
+
+
+def _init_git_workspace(path: "Path") -> None:
+    """Initialise a minimal git repo at *path* wired for test commits."""
+    import subprocess
+
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.email", "pre-test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.name", "pre-test"],
+        check=True,
+    )
+    (path / "seed.txt").write_text("seed\n")
+    subprocess.run(["git", "-C", str(path), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", "seed"], check=True)
+
+
+def _git_config_get(path: "Path", key: str) -> str:
+    import subprocess
+
+    return subprocess.run(
+        ["git", "-C", str(path), "config", "--local", "--get", key],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def _try_commit(path: "Path", *, user_email: str | None = None) -> int:
+    """Attempt a commit in *path*; return the exit code.
+
+    Strips GIT_AUTHOR_* / GIT_COMMITTER_* from the environment so the
+    test exercises the per-workspace git config, not inherited env vars
+    from the test runner (which may be a kanban worker process that has
+    the old identity baked into its env).
+    """
+    import subprocess
+
+    (path / "change.txt").write_text("change\n")
+    subprocess.run(["git", "-C", str(path), "add", "."], check=True)
+    cmd = ["git", "-C", str(path)]
+    if user_email is not None:
+        cmd += ["-c", f"user.email={user_email}", "-c", "user.name=override"]
+    cmd += ["commit", "-q", "-m", "test commit"]
+    # Strip GIT_AUTHOR_* / GIT_COMMITTER_* env vars so the test exercises
+    # the per-workspace git config, not inherited env from the kanban dispatcher.
+    env = {
+        k: v for k, v in __import__("os").environ.items()
+        if not k.startswith("GIT_AUTHOR_") and not k.startswith("GIT_COMMITTER_")
+    }
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
+    return result.returncode
+
+
+# --- workspace_kind = worktree ---
+
+
+def test_pin_workspace_git_identity_worktree_sets_git_config(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """ensure_worktree pins user.name / user.email in the worktree's local config."""
+    live = _init_bare_live_checkout(tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_LIVE_CHECKOUT", str(live))
+    monkeypatch.setenv("HERMES_KANBAN_WORKTREE_BASE_REF", "main")
+    monkeypatch.delenv("HERMES_KANBAN_ENFORCE_GIT_IDENTITY", raising=False)
+
+    wt_path = tmp_path / "wt" / "t_identity_worktree"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="hermes-agent: identity test worktree",
+            workspace_path=str(wt_path),
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+
+    kb.ensure_worktree(task, wt_path)
+
+    assert _git_config_get(wt_path, "user.name") == _WORKER_NAME
+    assert _git_config_get(wt_path, "user.email") == _WORKER_EMAIL
+
+
+def test_pin_workspace_git_identity_worktree_hook_rejects_bad_author(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """Pre-commit hook installed by ensure_worktree rejects commits with wrong author."""
+    live = _init_bare_live_checkout(tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_LIVE_CHECKOUT", str(live))
+    monkeypatch.setenv("HERMES_KANBAN_WORKTREE_BASE_REF", "main")
+    monkeypatch.delenv("HERMES_KANBAN_ENFORCE_GIT_IDENTITY", raising=False)
+
+    wt_path = tmp_path / "wt" / "t_hook_rejects"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="hermes-agent: hook rejection test",
+            workspace_path=str(wt_path),
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+
+    kb.ensure_worktree(task, wt_path)
+
+    # Commit with the bad author email (sahilm-ti) must fail.
+    rc = _try_commit(wt_path, user_email=_BAD_EMAIL)
+    assert rc != 0, "pre-commit hook should have rejected a commit by sahilm-ti"
+
+
+def test_pin_workspace_git_identity_worktree_hook_allows_correct_author(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """Commits with correct author identity succeed after ensure_worktree."""
+    live = _init_bare_live_checkout(tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_LIVE_CHECKOUT", str(live))
+    monkeypatch.setenv("HERMES_KANBAN_WORKTREE_BASE_REF", "main")
+    monkeypatch.delenv("HERMES_KANBAN_ENFORCE_GIT_IDENTITY", raising=False)
+
+    wt_path = tmp_path / "wt" / "t_hook_allows"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="hermes-agent: hook allow test",
+            workspace_path=str(wt_path),
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+
+    kb.ensure_worktree(task, wt_path)
+
+    # No -c override: git uses the per-worktree config, which is now sahilm-ai.
+    rc = _try_commit(wt_path)
+    assert rc == 0, "commit by the correct worker identity should succeed"
+
+    import subprocess
+    log = subprocess.run(
+        ["git", "-C", str(wt_path), "log", "-1", "--format=%ae"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert log == _WORKER_EMAIL
+
+
+# --- workspace_kind = scratch ---
+
+
+def test_pin_workspace_git_identity_scratch_sets_git_config(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """pin_workspace_git_identity sets git config in a scratch git workspace."""
+    monkeypatch.delenv("HERMES_KANBAN_ENFORCE_GIT_IDENTITY", raising=False)
+
+    scratch = tmp_path / "scratch"
+    _init_git_workspace(scratch)
+
+    kb.pin_workspace_git_identity(scratch)
+
+    assert _git_config_get(scratch, "user.name") == _WORKER_NAME
+    assert _git_config_get(scratch, "user.email") == _WORKER_EMAIL
+
+
+def test_pin_workspace_git_identity_scratch_hook_rejects_bad_author(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """Pre-commit hook in a scratch workspace rejects commits by the wrong author."""
+    monkeypatch.delenv("HERMES_KANBAN_ENFORCE_GIT_IDENTITY", raising=False)
+
+    scratch = tmp_path / "scratch_rej"
+    _init_git_workspace(scratch)
+
+    kb.pin_workspace_git_identity(scratch)
+
+    rc = _try_commit(scratch, user_email=_BAD_EMAIL)
+    assert rc != 0, "pre-commit hook should have rejected a commit by sahilm-ti"
+
+
+def test_pin_workspace_git_identity_scratch_hook_allows_correct_author(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """Commits with the correct author succeed in a scratch workspace."""
+    monkeypatch.delenv("HERMES_KANBAN_ENFORCE_GIT_IDENTITY", raising=False)
+
+    scratch = tmp_path / "scratch_ok"
+    _init_git_workspace(scratch)
+
+    kb.pin_workspace_git_identity(scratch)
+
+    rc = _try_commit(scratch)
+    assert rc == 0, "commit by the correct worker identity should succeed"
+
+
+# --- workspace_kind = dir ---
+
+
+def test_pin_workspace_git_identity_dir_sets_git_config(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """pin_workspace_git_identity sets git config in a dir workspace."""
+    monkeypatch.delenv("HERMES_KANBAN_ENFORCE_GIT_IDENTITY", raising=False)
+
+    dir_ws = tmp_path / "dir_ws"
+    _init_git_workspace(dir_ws)
+
+    kb.pin_workspace_git_identity(dir_ws)
+
+    assert _git_config_get(dir_ws, "user.name") == _WORKER_NAME
+    assert _git_config_get(dir_ws, "user.email") == _WORKER_EMAIL
+
+
+def test_pin_workspace_git_identity_dir_hook_rejects_bad_author(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """Pre-commit hook in a dir workspace rejects commits by the wrong author."""
+    monkeypatch.delenv("HERMES_KANBAN_ENFORCE_GIT_IDENTITY", raising=False)
+
+    dir_ws = tmp_path / "dir_ws_rej"
+    _init_git_workspace(dir_ws)
+
+    kb.pin_workspace_git_identity(dir_ws)
+
+    rc = _try_commit(dir_ws, user_email=_BAD_EMAIL)
+    assert rc != 0, "pre-commit hook should have rejected a commit by sahilm-ti"
+
+
+def test_pin_workspace_git_identity_dir_hook_allows_correct_author(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """Commits with the correct author succeed in a dir workspace."""
+    monkeypatch.delenv("HERMES_KANBAN_ENFORCE_GIT_IDENTITY", raising=False)
+
+    dir_ws = tmp_path / "dir_ws_ok"
+    _init_git_workspace(dir_ws)
+
+    kb.pin_workspace_git_identity(dir_ws)
+
+    rc = _try_commit(dir_ws)
+    assert rc == 0, "commit by the correct worker identity should succeed"
+
+
+# --- opt-out ---
+
+
+def test_pin_workspace_git_identity_opt_out_env_skips_hook(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """HERMES_KANBAN_ENFORCE_GIT_IDENTITY=false suppresses hook installation."""
+    monkeypatch.setenv("HERMES_KANBAN_ENFORCE_GIT_IDENTITY", "false")
+
+    scratch = tmp_path / "scratch_optout"
+    _init_git_workspace(scratch)
+
+    kb.pin_workspace_git_identity(scratch)
+
+    # git config should still be set (Layer 1 always runs).
+    assert _git_config_get(scratch, "user.email") == _WORKER_EMAIL
+
+    # Hook directory must not have been wired via core.hooksPath.
+    import subprocess
+    cp = subprocess.run(
+        ["git", "-C", str(scratch), "config", "--local", "--get", "core.hooksPath"],
+        capture_output=True, text=True, check=False,
+    )
+    assert cp.returncode != 0, "core.hooksPath should not be set when opt-out is active"
+
+    # Bad-author commit must now succeed (hook not installed).
+    rc = _try_commit(scratch, user_email=_BAD_EMAIL)
+    assert rc == 0, "bad-author commit should succeed when hook enforcement is off"
+
+
+def test_pin_workspace_git_identity_non_git_dir_is_noop(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """Calling pin_workspace_git_identity on a non-git directory does not raise."""
+    monkeypatch.delenv("HERMES_KANBAN_ENFORCE_GIT_IDENTITY", raising=False)
+
+    plain_dir = tmp_path / "plain"
+    plain_dir.mkdir()
+
+    # Must not raise.
+    kb.pin_workspace_git_identity(plain_dir)
+
+    # The hooks dir should still be created (ready for after git init).
+    hooks_dir = plain_dir / ".hermes-hooks"
+    assert hooks_dir.exists()
+    assert (hooks_dir / "pre-commit").exists()
+
