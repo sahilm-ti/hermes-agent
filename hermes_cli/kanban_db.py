@@ -8670,12 +8670,12 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     #
-    # Exception: if the task was rejected (auto-reviewer or human) AFTER
-    # the most recent PR-URL comment, the rejection is a signal to keep
-    # working on the existing PR — re-spawn so the next worker can read
-    # the rejection rationale and force-push a fix. Without this, the
-    # reject→fix-same-PR loop deadlocks because the dispatcher keeps
-    # seeing the PR URL and refusing to spawn.
+    # Exception: if the task was rejected (auto-reviewer or human), or
+    # explicitly unblocked, AFTER the most recent PR-URL comment, the
+    # resume signal is a decision to keep working on the existing PR.
+    # Re-spawn so the next worker can read the rationale and force-push a
+    # fix. Without this, the reject→fix-same-PR loop deadlocks because the
+    # dispatcher keeps seeing the PR URL and refusing to spawn.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     latest_pr_ts: Optional[int] = None
     for c in conn.execute(
@@ -8687,8 +8687,10 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             if latest_pr_ts is None or c["created_at"] > latest_pr_ts:
                 latest_pr_ts = int(c["created_at"])
     if latest_pr_ts is not None:
-        # Most recent rejection signal from either an event row or a run
-        # outcome — whichever is newer wins.
+        # Most recent resume signal: a 'rejected' event, a rejected run
+        # outcome, or an 'unblocked' event — whichever is newest wins.
+        # Both rejected and unblocked are explicit human-or-orchestrator
+        # decisions that the worker should keep iterating on the same PR.
         reject_event = conn.execute(
             "SELECT MAX(created_at) AS ts FROM task_events "
             "WHERE task_id = ? AND kind = 'rejected'",
@@ -8699,14 +8701,19 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             "WHERE task_id = ? AND outcome = 'rejected'",
             (task_id,),
         ).fetchone()
+        unblock_event = conn.execute(
+            "SELECT MAX(created_at) AS ts FROM task_events "
+            "WHERE task_id = ? AND kind = 'unblocked'",
+            (task_id,),
+        ).fetchone()
         candidates = [
-            int(r["ts"]) for r in (reject_event, reject_run)
+            int(r["ts"]) for r in (reject_event, reject_run, unblock_event)
             if r is not None and r["ts"] is not None
         ]
-        latest_reject_ts = max(candidates) if candidates else None
-        if latest_reject_ts is None or latest_reject_ts <= latest_pr_ts:
+        latest_resume_ts = max(candidates) if candidates else None
+        if latest_resume_ts is None or latest_resume_ts <= latest_pr_ts:
             return "active_pr"
-        # else: rejection post-dates the PR → fall through, no guard.
+        # else: resume signal post-dates the PR → fall through, no guard.
 
     return None
 
