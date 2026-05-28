@@ -8347,6 +8347,19 @@ def _default_spawn(
             )
         env["GH_TOKEN"] = _gh_token_ai
 
+    # Ensure ~/.hermes/bin is on the worker's PATH so profile-agnostic
+    # wrappers (gh-as-ti, gh-as-ai) resolve from any shell, any profile.
+    # This path is outside all profile dirs, so it's available regardless
+    # of which profile's HERMES_HOME is active in the worker subprocess.
+    # We prepend rather than append so the wrappers take priority over any
+    # stale version that might be elsewhere on PATH.
+    _hermes_root_bin = str(
+        (Path(os.path.expanduser("~")) / ".hermes" / "bin").resolve()
+    )
+    _current_path = env.get("PATH", "")
+    if _hermes_root_bin not in _current_path.split(os.pathsep):
+        env["PATH"] = _hermes_root_bin + os.pathsep + _current_path
+
     cmd = [
         *_resolve_hermes_argv(),
         "-p",

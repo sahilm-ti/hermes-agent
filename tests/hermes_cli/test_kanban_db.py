@@ -2696,6 +2696,100 @@ class TestSharedBoardPaths:
 # ---------------------------------------------------------------------------
 # latest_summary / latest_summaries — surface task_runs.summary handoffs
 # ---------------------------------------------------------------------------
+    def test_worker_spawn_prepends_hermes_bin_to_path(self, tmp_path, monkeypatch):
+        # _default_spawn must prepend ~/.hermes/bin to the worker's PATH so
+        # profile-agnostic wrappers (gh-as-ti, gh-as-ai) resolve from any
+        # shell, any profile — including bt-optimizer and braintrusteng workers.
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+
+        monkeypatch.setenv("GH_TOKEN_SAHILM_AI", "ghs_test_ai_token")
+        monkeypatch.delenv("HERMES_KANBAN_WORKER_GH_TOKEN_OVERRIDE", raising=False)
+
+        captured: dict = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["env"] = kwargs.get("env", {})
+                self.pid = 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        task = kb.Task(
+            id="t_hermes_bin_path",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            branch_name=None,
+        )
+        kb._default_spawn(task, str(tmp_path / "ws"))
+
+        worker_path = captured["env"].get("PATH", "")
+        hermes_bin = str((Path(os.path.expanduser("~")) / ".hermes" / "bin").resolve())
+        path_entries = worker_path.split(os.pathsep)
+        assert path_entries[0] == hermes_bin, (
+            f"Expected ~/.hermes/bin to be the first PATH entry; got: {path_entries[:3]}"
+        )
+
+    def test_worker_spawn_path_not_duplicated_if_already_present(self, tmp_path, monkeypatch):
+        # If ~/.hermes/bin is already on PATH (e.g. the orchestrator set it),
+        # _default_spawn must NOT add a second copy.
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+
+        hermes_bin = str((Path(os.path.expanduser("~")) / ".hermes" / "bin").resolve())
+        monkeypatch.setenv("PATH", hermes_bin + os.pathsep + "/usr/bin")
+        monkeypatch.setenv("GH_TOKEN_SAHILM_AI", "ghs_test_ai_token")
+        monkeypatch.delenv("HERMES_KANBAN_WORKER_GH_TOKEN_OVERRIDE", raising=False)
+
+        captured: dict = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["env"] = kwargs.get("env", {})
+                self.pid = 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        task = kb.Task(
+            id="t_hermes_bin_nodup",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            branch_name=None,
+        )
+        kb._default_spawn(task, str(tmp_path / "ws"))
+
+        worker_path = captured["env"].get("PATH", "")
+        path_entries = worker_path.split(os.pathsep)
+        assert path_entries.count(hermes_bin) == 1, (
+            f"Expected exactly 1 copy of ~/.hermes/bin; got {path_entries.count(hermes_bin)}"
+        )
+
 
 
 def test_latest_summary_returns_none_when_no_runs(kanban_home):
