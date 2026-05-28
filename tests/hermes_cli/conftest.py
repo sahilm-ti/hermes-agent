@@ -20,6 +20,25 @@ def all_assignees_spawnable(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _worker_gh_token_override(monkeypatch):
+    """Set HERMES_KANBAN_WORKER_GH_TOKEN_OVERRIDE to a sentinel value.
+
+    ``_default_spawn`` now requires ``GH_TOKEN_SAHILM_AI`` in the
+    dispatcher env so spawned workers always authenticate as the bot
+    account (sahilm-ai).  Test suites run without that real token, so we
+    bypass the requirement via the escape-hatch env var.
+
+    Tests that want to exercise the ``GH_TOKEN_SAHILM_AI`` requirement
+    explicitly call ``monkeypatch.delenv("HERMES_KANBAN_WORKER_GH_TOKEN_OVERRIDE")``
+    to override this fixture.
+    """
+    import os
+
+    if "HERMES_KANBAN_WORKER_GH_TOKEN_OVERRIDE" not in os.environ:
+        monkeypatch.setenv("HERMES_KANBAN_WORKER_GH_TOKEN_OVERRIDE", "ghs_test_fixture_token")
+
+
+@pytest.fixture(autouse=True)
 def _suppress_concurrent_hermes_gate(request, monkeypatch):
     """Default ``_detect_concurrent_hermes_instances`` to ``[]`` for every test.
 

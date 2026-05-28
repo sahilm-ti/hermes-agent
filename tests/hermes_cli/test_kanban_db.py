@@ -2559,6 +2559,139 @@ class TestSharedBoardPaths:
         assert env["GIT_COMMITTER_NAME"] == "Committer User"
         assert env["GIT_COMMITTER_EMAIL"] == "committer@example.com"
 
+    def test_worker_spawn_injects_gh_token_from_ai_var(self, tmp_path, monkeypatch):
+        # _default_spawn must pin GH_TOKEN to GH_TOKEN_SAHILM_AI so every
+        # `gh` call inside a dispatched worker authenticates as the bot
+        # account (sahilm-ai), not the interactive account (sahilm-ti).
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+
+        monkeypatch.setenv("GH_TOKEN_SAHILM_AI", "ghs_test_ai_token")
+        monkeypatch.delenv("HERMES_KANBAN_WORKER_GH_TOKEN_OVERRIDE", raising=False)
+
+        captured: dict = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["env"] = kwargs.get("env", {})
+                self.pid = 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        task = kb.Task(
+            id="t_gh_token_ai",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            branch_name=None,
+        )
+        kb._default_spawn(task, str(tmp_path / "ws"))
+
+        env = captured["env"]
+        assert env["GH_TOKEN"] == "ghs_test_ai_token"
+
+    def test_worker_spawn_gh_token_fails_loud_when_ai_var_unset(
+        self, tmp_path, monkeypatch
+    ):
+        # If GH_TOKEN_SAHILM_AI is absent, _default_spawn must raise rather
+        # than silently inherit whichever GH_TOKEN the dispatcher had.
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+
+        monkeypatch.delenv("GH_TOKEN_SAHILM_AI", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_WORKER_GH_TOKEN_OVERRIDE", raising=False)
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                pass
+
+            @property
+            def pid(self) -> int:
+                return 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        task = kb.Task(
+            id="t_gh_token_missing",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            branch_name=None,
+        )
+        import pytest as _pytest
+
+        with _pytest.raises(RuntimeError, match="GH_TOKEN_SAHILM_AI"):
+            kb._default_spawn(task, str(tmp_path / "ws"))
+
+    def test_worker_spawn_gh_token_override_bypasses_ai_var(
+        self, tmp_path, monkeypatch
+    ):
+        # The HERMES_KANBAN_WORKER_GH_TOKEN_OVERRIDE escape hatch (for test
+        # fixtures) must be honored and suppress the GH_TOKEN_SAHILM_AI
+        # requirement.
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+
+        monkeypatch.delenv("GH_TOKEN_SAHILM_AI", raising=False)
+        monkeypatch.setenv("HERMES_KANBAN_WORKER_GH_TOKEN_OVERRIDE", "ghs_override_token")
+
+        captured: dict = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["env"] = kwargs.get("env", {})
+                self.pid = 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        task = kb.Task(
+            id="t_gh_token_override",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            branch_name=None,
+        )
+        kb._default_spawn(task, str(tmp_path / "ws"))
+
+        env = captured["env"]
+        assert env["GH_TOKEN"] == "ghs_override_token"
+
 
 # ---------------------------------------------------------------------------
 # latest_summary / latest_summaries — surface task_runs.summary handoffs

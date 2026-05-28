@@ -8321,6 +8321,32 @@ def _default_spawn(
     env["GIT_COMMITTER_NAME"] = env.get("GIT_COMMITTER_NAME", env["GIT_AUTHOR_NAME"])
     env["GIT_COMMITTER_EMAIL"] = env.get("GIT_COMMITTER_EMAIL", env["GIT_AUTHOR_EMAIL"])
 
+    # Worker gh CLI identity: pin GH_TOKEN to GH_TOKEN_SAHILM_AI so every
+    # `gh` call inside a dispatched worker authenticates as the bot account
+    # (sahilm-ai) rather than the interactive account (sahilm-ti).
+    #
+    # Fail loud if GH_TOKEN_SAHILM_AI is not set — the task body itself
+    # documents this invariant ("If a worker needs to do a git operation but
+    # GH_TOKEN_SAHILM_AI is unset, BLOCK with kanban_block").  We raise here
+    # (before the subprocess launches) so the dispatcher records a
+    # spawn_failed event and the orchestrator sees a clear message rather than
+    # a worker that silently acts as the wrong identity.
+    #
+    # Opt-out: set HERMES_KANBAN_WORKER_GH_TOKEN_OVERRIDE in the environment
+    # to a specific value (e.g. from a test fixture) to bypass this injection.
+    _worker_gh_token_override = env.get("HERMES_KANBAN_WORKER_GH_TOKEN_OVERRIDE")
+    if _worker_gh_token_override is not None:
+        env["GH_TOKEN"] = _worker_gh_token_override
+    else:
+        _gh_token_ai = env.get("GH_TOKEN_SAHILM_AI")
+        if not _gh_token_ai:
+            raise RuntimeError(
+                "GH_TOKEN_SAHILM_AI is not set in the dispatcher environment. "
+                "Add it to ~/.hermes/.env so kanban workers authenticate as "
+                "sahilm-ai (the bot account). See t_bb7f6148 for the auth model."
+            )
+        env["GH_TOKEN"] = _gh_token_ai
+
     cmd = [
         *_resolve_hermes_argv(),
         "-p",
