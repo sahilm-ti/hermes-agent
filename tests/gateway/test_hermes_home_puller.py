@@ -309,7 +309,7 @@ class TestHermesHomePullerLifecycle(unittest.TestCase):
             puller._stop_event.wait()
             stopped.set()
 
-        puller._run = quick_run  # type: ignore[method-assign]
+        puller._run = quick_run
         puller.start()
         started.wait(timeout=2)
         puller.stop(timeout=2)

@@ -35,7 +35,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +70,7 @@ def _is_disabled_by_config(cfg: Optional[Dict]) -> bool:
         return False  # config unreadable — don't disable
 
 
-def _run_git(hermes_home: Path, *args: str) -> subprocess.CompletedProcess:  # type: ignore[type-arg]
+def _run_git(hermes_home: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """Run a git command in *hermes_home*.  Returns the CompletedProcess."""
     cmd = ["git", "-C", str(hermes_home), *args]
     return subprocess.run(
@@ -204,6 +204,8 @@ class HermesHomePuller:
         self._interval = interval
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Typed as Callable so tests can monkey-patch _run without a type error.
+        self._run: Callable[[], None] = self._run_impl
 
     def start(self) -> None:
         self._thread = threading.Thread(
@@ -223,7 +225,7 @@ class HermesHomePuller:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
 
-    def _run(self) -> None:
+    def _run_impl(self) -> None:
         # Run once at startup (after a short warm-up delay) so the first
         # check happens quickly — avoids waiting a full hour on gateway boot.
         time.sleep(10)
