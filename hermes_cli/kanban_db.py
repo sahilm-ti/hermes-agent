@@ -5693,8 +5693,17 @@ def complete_task(
     # just tracks "is there a current pathology the breaker should
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
+    # Crash-loop breaker: a successful probe proves its assignee is healthy.
+    try:
+        probe_assignee = _probe_assignee_for_task(conn, task_id)
+        if probe_assignee:
+            clear_assignee_quarantine(conn, probe_assignee)
+    except Exception:
+        pass
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
+    # Regime-B completion audit: schedule a read-only audit when no PR exists.
+    _maybe_schedule_completion_audit(conn, task_id)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
@@ -9092,6 +9101,15 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    quarantined: list[str] = field(default_factory=list)
+    """Assignees newly tripped by the crash-loop breaker this tick."""
+    quarantine_blocked: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks skipped because their assignee is in crash-loop cooldown."""
+    quarantine_probes: list[tuple[str, str]] = field(default_factory=list)
+    """Probe spawns granted by the crash-loop breaker."""
+    audited: list[tuple[str, str, str]] = field(default_factory=list)
+    """Regime-B completion-audit spawns as task/assignee/workspace triples."""
+
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
