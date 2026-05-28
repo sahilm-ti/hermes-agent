@@ -85,7 +85,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from toolsets import get_toolset_names
 
@@ -1021,7 +1021,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- where the "heartbeat present and stale" guard would never fire anyway
     -- (the rule already requires last_heartbeat_at IS NOT NULL), but
     -- operators can use this as an explicit opt-out for clarity.
-    no_heartbeat_required INTEGER NOT NULL DEFAULT 0
+    no_heartbeat_required INTEGER NOT NULL DEFAULT 0,
+    -- Epoch timestamp set by complete_task when a task finishes without an
+    -- associated PR (regime-B completion audit). The dispatcher picks up tasks
+    -- with this column non-NULL and spawns an sdlc-completion-audit agent.
+    -- Cleared (set to NULL) after the audit agent is spawned.
+    completion_audit_at  INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1677,6 +1682,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "tasks",
             "no_heartbeat_required",
             "no_heartbeat_required INTEGER NOT NULL DEFAULT 0",
+        )
+
+    if "completion_audit_at" not in cols:
+        # Regime-B completion audit trigger column. NULL = no audit pending.
+        # complete_task sets this when no PR is associated with the card.
+        _add_column_if_missing(
+            conn, "tasks", "completion_audit_at", "completion_audit_at INTEGER"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_completion_audit "
+            "ON tasks(completion_audit_at) WHERE completion_audit_at IS NOT NULL"
         )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -3329,6 +3345,204 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+# ---------------------------------------------------------------------------
+# Regime-B completion audit helpers
+# ---------------------------------------------------------------------------
+
+_SKIP_REVIEW_RE = re.compile(r"(?m)^skip-review\s*:", re.IGNORECASE)
+"""Matches a ``skip-review: <reason>`` line in a task body — opt-out of audit."""
+
+
+def _maybe_schedule_completion_audit(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> None:
+    """Set ``completion_audit_at`` if this task should be regime-B audited.
+
+    Conditions for scheduling an audit (all must hold):
+    1. The task had at least one claimed run (was dispatched to a worker, not
+       just manually completed via ``hermes kanban complete``).
+    2. No GitHub PR URL anywhere in the task's comments or events.
+    3. No ``skip-review: …`` directive in the task body.
+    4. ``completion_audit_at`` is not already set (idempotent).
+
+    Silent on failure — audit scheduling is best-effort.
+    """
+    try:
+        row = conn.execute(
+            "SELECT body, completion_audit_at FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return
+        # Already scheduled.
+        if row["completion_audit_at"] is not None:
+            return
+        # Body opts out.
+        body = row["body"] or ""
+        if _SKIP_REVIEW_RE.search(body):
+            return
+        # Only audit tasks that had at least one real worker run — i.e., a
+        # ``claimed`` event exists. Manually completed tasks (via
+        # ``hermes kanban complete`` on a never-dispatched task) skip audit
+        # because there's no deliverable for the agent to inspect.
+        claimed_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'claimed'",
+            (task_id,),
+        ).fetchone()[0]
+        if claimed_events == 0:
+            return
+        # Skip if the task has an associated PR.
+        if _extract_pr_url(conn, task_id):
+            return
+        # Schedule.
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET completion_audit_at = ? WHERE id = ? AND status = 'done'",
+                (int(time.time()), task_id),
+            )
+    except Exception:
+        pass  # never break completion on an audit-scheduling fault
+
+
+def claim_completion_audit_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    ttl_seconds: Optional[int] = None,
+    claimer: Optional[str] = None,
+) -> Optional["Task"]:
+    """Atomically claim a done task for the regime-B completion audit.
+
+    Transitions ``completion_audit_at IS NOT NULL → completion_audit_at = NULL``
+    in the same UPDATE that records the claim, preventing double-audit on
+    concurrent dispatcher ticks.  The task status stays ``done`` — the audit
+    is a read-only pass that posts a comment; it does NOT change the task
+    lifecycle.
+
+    A separate run row is created so the audit agent's lifecycle is tracked
+    independently (heartbeat, outcome, summary).
+
+    Returns the claimed ``Task`` on success, ``None`` if another tick already
+    claimed it (``completion_audit_at`` was cleared between the SELECT and the
+    UPDATE).
+    """
+    now = int(time.time())
+    lock = claimer or _claimer_id()
+    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    with write_txn(conn):
+        # Clear the trigger atomically to prevent double-audit.
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET completion_audit_at = NULL,
+                   claim_lock          = ?,
+                   claim_expires       = ?
+             WHERE id = ?
+               AND status = 'done'
+               AND completion_audit_at IS NOT NULL
+               AND claim_lock IS NULL
+            """,
+            (lock, expires, task_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        trow = conn.execute(
+            "SELECT assignee, max_runtime_seconds, current_step_key FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        run_cur = conn.execute(
+            """
+            INSERT INTO task_runs (
+                task_id, profile, step_key, status,
+                claim_lock, claim_expires, max_runtime_seconds,
+                started_at
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                trow["assignee"] if trow else None,
+                trow["current_step_key"] if trow else None,
+                lock,
+                expires,
+                trow["max_runtime_seconds"] if trow else None,
+                now,
+            ),
+        )
+        run_id = run_cur.lastrowid
+        conn.execute(
+            "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+            (run_id, task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "claimed",
+            {
+                "lock": lock,
+                "expires": expires,
+                "run_id": run_id,
+                "source_status": "done",
+                "audit_kind": "completion_audit",
+            },
+            run_id=run_id,
+        )
+        return get_task(conn, task_id)
+
+
+def complete_completion_audit(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    claimer: Optional[str] = None,
+) -> bool:
+    """Close out a completion-audit run (release claim, end the run row).
+
+    The task stays ``done``.  The audit run is closed with outcome
+    ``"completed"`` and the summary/metadata stored on the run row.
+
+    Returns True on success, False if the task was not in the expected state.
+    """
+    now = int(time.time())
+    lock = claimer or _claimer_id()
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET claim_lock    = NULL,
+                   claim_expires = NULL
+             WHERE id = ?
+               AND status = 'done'
+               AND claim_lock = ?
+            """,
+            (task_id, lock),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="completed",
+            status="done",
+            summary=summary,
+            metadata=metadata,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "completion_audit_done",
+            {
+                "summary": (summary or "")[:200] or None,
+                "run_id": run_id,
+            },
+            run_id=run_id,
+        )
+    return True
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3526,6 +3740,11 @@ def complete_task(
         pass
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
+    # Regime-B completion audit: if the task completed without an associated
+    # PR, schedule a completion audit on the next dispatcher tick. The audit
+    # agent runs the regime-B rule sets and posts findings to the orchestrator.
+    # Skip-review body markers ("skip-review: …") exempt the card from audit.
+    _maybe_schedule_completion_audit(conn, task_id)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     return True
@@ -5642,6 +5861,11 @@ class DispatchResult:
     """Probe spawns this tick: ``(task_id, assignee)`` pairs. Exactly one
     per assignee per tick — the breaker grants the slot atomically inside
     ``is_assignee_quarantined``."""
+    audited: list[tuple[str, str, str]] = field(default_factory=list)
+    """Regime-B completion audit spawns this tick, as
+    ``(task_id, assignee, workspace_path)`` triples. The audit agent runs the
+    class-aware rule sets on the deliverable and posts findings as a
+    kanban_comment targeted at the orchestrator. The task stays ``done``."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -7445,8 +7669,8 @@ def dispatch_once(
         try:
             from hermes_cli.profiles import profile_exists  # local import: avoids cycle
         except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
+            profile_exists: Optional[Callable[[str], bool]] = None
+        if profile_exists is not None and not profile_exists(row["assignee"]):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -7647,7 +7871,7 @@ def dispatch_once(
         try:
             from hermes_cli.profiles import profile_exists
         except Exception:
-            profile_exists = None  # type: ignore[assignment]
+            profile_exists: Optional[Callable[[str], bool]] = None
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
@@ -7751,6 +7975,119 @@ def dispatch_once(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+
+    # ---- completion-audit column dispatch ----
+    # Regime-B: tasks that completed without a PR are flagged for an async
+    # lint pass.  The audit agent spawns with the ``sdlc-completion-audit``
+    # skill, reads the task's run summary + comments, runs class-aware rules,
+    # and posts any findings as a kanban_comment targeted at the orchestrator.
+    # The task status stays ``done`` throughout — audit is read-only.
+    #
+    # Audit spawns count against max_spawn like review spawns.
+    audit_rows = conn.execute(
+        "SELECT id, assignee FROM tasks "
+        "WHERE status = 'done' AND completion_audit_at IS NOT NULL AND claim_lock IS NULL "
+        "ORDER BY completion_audit_at ASC"
+    ).fetchall()
+    for row in audit_rows:
+        if max_spawn is not None and running_count + spawned >= max_spawn:
+            break
+        if not row["assignee"]:
+            result.skipped_unassigned.append(row["id"])
+            continue
+        try:
+            from hermes_cli.profiles import profile_exists as _pe
+        except Exception:
+            _pe: Optional[Callable[[str], bool]] = None
+        if _pe is not None and not _pe(row["assignee"]):
+            result.skipped_nonspawnable.append(row["id"])
+            continue
+        if dry_run:
+            result.audited.append((row["id"], row["assignee"], ""))
+            continue
+        claimed = claim_completion_audit_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        if claimed is None:
+            continue
+        try:
+            workspace = resolve_workspace(claimed, board=board)
+            if claimed.workspace_kind == "worktree":
+                ensure_worktree(claimed, workspace)
+            else:
+                pin_workspace_git_identity(workspace)
+        except Exception as exc:
+            # Release claim on workspace failure; don't re-queue audit tasks
+            # via the failure counter — a workspace fault is infrastructure,
+            # not the task's fault.  Just skip this tick.
+            try:
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL "
+                        "WHERE id = ? AND status = 'done'",
+                        (claimed.id,),
+                    )
+            except Exception:
+                pass
+            continue
+        set_workspace_path(conn, claimed.id, str(workspace))
+        # Audit agent gets both kanban-worker (lifecycle) and
+        # sdlc-completion-audit (regime-B rule logic).
+        claimed.skills = ["sdlc-completion-audit"]
+        # Pre-flight skill validation (same pattern as review dispatch).
+        if spawn_fn is None:
+            try:
+                from hermes_cli.profiles import (
+                    resolve_profile_env as _resolve_profile_env,
+                )
+
+                _worker_home = (
+                    _resolve_profile_env(claimed.assignee) if claimed.assignee else None
+                )
+            except Exception:
+                _worker_home = None
+            _missing_skills = _validate_task_skills(claimed, _worker_home)
+            if _missing_skills:
+                # Missing skill — skip this audit tick, release claim.
+                try:
+                    with write_txn(conn):
+                        conn.execute(
+                            "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                            "completion_audit_at = ? "
+                            "WHERE id = ? AND status = 'done'",
+                            (int(time.time()), claimed.id),
+                        )
+                except Exception:
+                    pass
+                continue
+        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        try:
+            import inspect
+
+            try:
+                sig = inspect.signature(_spawn)
+                if "board" in sig.parameters:
+                    pid = _spawn(claimed, str(workspace), board=board)
+                else:
+                    pid = _spawn(claimed, str(workspace))
+            except (TypeError, ValueError):
+                pid = _spawn(claimed, str(workspace))
+            if pid:
+                _set_worker_pid(conn, claimed.id, int(pid))
+            result.audited.append((claimed.id, claimed.assignee or "", str(workspace)))
+            spawned += 1
+        except Exception as exc:
+            # Release the claim on spawn failure (audit-specific path:
+            # re-arm the trigger so next tick retries).
+            try:
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                        "completion_audit_at = ? "
+                        "WHERE id = ? AND status = 'done'",
+                        (int(time.time()), claimed.id),
+                    )
+            except Exception:
+                pass
+
     return result
 
 
