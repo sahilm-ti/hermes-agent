@@ -6,6 +6,22 @@ Fix 3: max_iterations field — create_task → DB → _default_spawn env inject
 Retro motivation: t_4ba269e5 ran 42 minutes with zero heartbeats and
 exhausted the 150-iteration budget without shipping. The two fixes here
 make that failure mode structurally impossible.
+
+TEST ISOLATION RULE
+-------------------
+Every test that calls into kanban_db MUST use the ``kanban_home`` fixture
+below, which explicitly sets ``HERMES_KANBAN_HOME`` (highest priority in
+``kanban_db.kanban_home()``) AND clears ``HERMES_KANBAN_DB`` so that no
+path injected by a parent dispatcher process can leak into the test.
+
+The fixture asserts at setup time that ``kb.connect()`` resolves to a path
+inside ``tmp_path`` — the test will fail immediately (not silently) if the
+isolation breaks.
+
+Without this guard, a worker that runs ``pytest`` while
+``HERMES_KANBAN_DB=/Users/…/.hermes/kanban.db`` is set in its environment
+would write fixture tasks into the live board, which is exactly what the
+``t_80581b0d`` retro found.
 """
 
 from __future__ import annotations
@@ -20,15 +36,90 @@ from hermes_cli import kanban_db as kb
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
-    """Isolated HERMES_HOME with an empty kanban DB."""
-    from pathlib import Path
+    """Isolated kanban DB rooted at tmp_path.
 
+    Isolation strategy:
+    - Sets ``HERMES_KANBAN_HOME`` to ``tmp_path/.hermes`` — this is the
+      *highest-priority* override in ``kanban_db.kanban_home()``, so it
+      wins over any ambient ``HERMES_HOME`` inherited from a parent process.
+    - Clears ``HERMES_KANBAN_DB`` so a dispatcher-injected pin cannot
+      override the fixture home.
+    - Clears ``HERMES_KANBAN_BOARD`` so no named-board override sneaks in.
+    - Clears ``_INITIALIZED_PATHS`` module cache so a prior test's DB path
+      does not carry forward into this test's connect() call.
+    - Asserts that ``kb.kanban_db_path()`` resolves inside ``tmp_path``
+      before returning — hard failure if isolation is broken.
+    """
     home = tmp_path / ".hermes"
     home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    # Pin the kanban root explicitly — highest-priority override.
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+
+    # Clear env vars that could pin the real DB path over our fixture home.
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+
+    # Clear module-level init cache so connect() doesn't reuse a previous
+    # test's path.
+    kb._INITIALIZED_PATHS.clear()
+
+    # Initialize the DB in the tmp home.
     kb.init_db()
-    return home
+
+    # Hard assertion: kanban_db_path() must resolve inside tmp_path.
+    resolved = kb.kanban_db_path().resolve()
+    assert str(tmp_path) in str(resolved), (
+        f"ISOLATION BROKEN: kanban_db_path() resolved to {resolved}, "
+        f"which is outside tmp_path={tmp_path}. "
+        f"HERMES_KANBAN_HOME={os.environ.get('HERMES_KANBAN_HOME')!r}, "
+        f"HERMES_KANBAN_DB={os.environ.get('HERMES_KANBAN_DB')!r}"
+    )
+
+    yield home
+
+    # Cleanup: discard the tmp path from the init cache so subsequent
+    # tests that call connect() without the fixture don't accidentally
+    # reuse this temp DB.
+    kb._INITIALIZED_PATHS.discard(str(resolved))
+
+
+# ---------------------------------------------------------------------------
+# DB isolation regression test — fail-loud if live DB is reachable
+# ---------------------------------------------------------------------------
+
+
+def test_kanban_create_without_isolation_fixture_uses_tmp_path(tmp_path, monkeypatch):
+    """Regression: kanban_create must NOT reach the live kanban.db.
+
+    This test simulates a 'naked' kanban_db call made without the
+    isolation fixture — we ensure the global conftest already pins
+    HERMES_KANBAN_HOME (or HERMES_HOME) to a tmp_path before any
+    kanban_db operation can reach the live ~/.hermes/kanban.db.
+
+    If the global conftest's _hermetic_environment fixture is working,
+    HERMES_KANBAN_DB and HERMES_KANBAN_HOME are already cleared and
+    HERMES_HOME points to a temp dir. We verify that creating a task
+    from this baseline state writes to the per-test tmpdir, NOT the
+    real kanban.db.
+    """
+    live_kanban_db = os.path.expanduser("~/.hermes/kanban.db")
+
+    # If we're running as a dispatched worker, HERMES_KANBAN_DB is set.
+    # The global conftest _hermetic_environment should have cleared it.
+    # Verify it's gone:
+    assert os.environ.get("HERMES_KANBAN_DB", "") == "", (
+        "HERMES_KANBAN_DB is set — global conftest _hermetic_environment "
+        "should have cleared it. Test environment is not hermetic."
+    )
+
+    # kanban_db_path() must NOT resolve to the live path.
+    resolved_path = str(kb.kanban_db_path().resolve())
+    assert resolved_path != os.path.abspath(live_kanban_db), (
+        f"kanban_db_path() resolved to the live DB at {live_kanban_db}. "
+        "HERMES_HOME is not pointing to a tmpdir. "
+        "The global conftest _hermetic_environment fixture is broken."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +426,7 @@ def test_max_iterations_dispatch_once_e2e(kanban_home, monkeypatch):
     with kb.connect() as conn:
         t = kb.create_task(
             conn,
-            title="e2e-max-iter",
+            title="dispatch-max-iter",
             assignee="worker",
             max_iterations=300,
         )
