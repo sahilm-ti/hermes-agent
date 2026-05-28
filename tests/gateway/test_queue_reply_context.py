@@ -6,158 +6,229 @@ _prepare_inbound_message_text can inject the [Replying to: "..."] prefix
 when the turn eventually runs.
 
 Regression for: t_1cc95bc9 — /queue drops reply_to_message_id + reply_to_text
+
+IMPORTANT: The core tests exercise _handle_message() end-to-end so that
+reverting the 6-line fix in gateway/run.py would make them fail.
 """
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
-from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Shared helpers (mirrors test_steer_command.py pattern)
 # ---------------------------------------------------------------------------
 
-def _make_runner() -> GatewayRunner:
-    runner = object.__new__(GatewayRunner)
-    runner.config = GatewayConfig(
-        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake")},
-    )
-    runner.adapters = {}
-    runner._model = "openai/gpt-4.1-mini"
-    runner._base_url = None
-    runner._queued_events = {}
-    return runner
-
-
-def _source() -> SessionSource:
+def _make_source() -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,
-        chat_id="123",
-        chat_name="DM",
-        chat_type="private",
-        user_name="Alice",
+        user_id="u1",
+        chat_id="c1",
+        user_name="tester",
+        chat_type="dm",
     )
 
 
-def _make_adapter():
+def _make_event(text: str, **kwargs) -> MessageEvent:
+    return MessageEvent(
+        text=text,
+        source=_make_source(),
+        message_id="m1",
+        **kwargs,
+    )
+
+
+def _make_runner():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+    )
     adapter = MagicMock()
+    adapter.send = AsyncMock()
     adapter._pending_messages = {}
-    return adapter
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = _session_entry()
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.has_any_sessions.return_value = True
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._queued_events = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = MagicMock()
+    runner._session_db.get_session_title.return_value = None
+    runner._reasoning_config = None
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._show_reasoning = False
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+    runner._send_voice_reply = AsyncMock()
+    runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
+    runner._emit_gateway_run_progress = AsyncMock()
+    return runner, adapter
+
+
+def _session_entry() -> SessionEntry:
+    source = _make_source()
+    return SessionEntry(
+        session_key=build_session_key(source),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
 
 
 # ---------------------------------------------------------------------------
-# /queue reply context propagation
+# Integration tests: _handle_message() exercises the changed lines
 # ---------------------------------------------------------------------------
 
-class TestQueueReplyContextPropagation:
-    """/queue must copy reply_to_message_id and reply_to_text onto the queued event."""
+@pytest.mark.asyncio
+async def test_queue_via_handle_message_preserves_reply_to_message_id():
+    """/queue routed through _handle_message() must propagate reply_to_message_id.
 
-    def test_queue_preserves_reply_to_message_id(self):
-        runner = _make_runner()
-        adapter = _make_adapter()
-        session_key = "telegram:123"
+    This test exercises the 6 lines added in gateway/run.py. Reverting them
+    would cause this test to fail because the queued event would have
+    reply_to_message_id=None instead of '999'.
+    """
+    runner, adapter = _make_runner()
+    sk = build_session_key(_make_source())
 
-        inbound = MessageEvent(
-            text="/queue do this next",
-            message_type=MessageType.TEXT,
-            source=_source(),
-            message_id="m1",
-            reply_to_message_id="999",
-            reply_to_text="The task has been approved.",
-        )
+    # Simulate an agent actively running so /queue is processed.
+    running_agent = MagicMock()
+    runner._running_agents[sk] = running_agent
 
-        queued_event = MessageEvent(
-            text="do this next",
-            message_type=MessageType.TEXT,
-            source=inbound.source,
-            message_id=inbound.message_id,
-            channel_prompt=inbound.channel_prompt,
-            reply_to_message_id=getattr(inbound, "reply_to_message_id", None),
-            reply_to_text=getattr(inbound, "reply_to_text", None),
-        )
-        runner._enqueue_fifo(session_key, queued_event, adapter)
+    inbound = _make_event(
+        "/queue this is approved",
+        reply_to_message_id="999",
+        reply_to_text="Task t_8698e650 is ready for your review.",
+    )
 
-        stored: MessageEvent = adapter._pending_messages[session_key]
-        assert stored.reply_to_message_id == "999"
-        assert stored.reply_to_text == "The task has been approved."
+    result = await runner._handle_message(inbound)
 
-    def test_queue_without_reply_context_is_none(self):
-        runner = _make_runner()
-        adapter = _make_adapter()
-        session_key = "telegram:123"
+    # Must acknowledge the queue.
+    assert result is not None
+    assert "queued" in result.lower()
 
-        inbound = MessageEvent(
-            text="/queue plain prompt",
-            message_type=MessageType.TEXT,
-            source=_source(),
-            message_id="m2",
-        )
+    # The fix: reply context must flow onto the queued event.
+    assert sk in adapter._pending_messages, (
+        "No queued event stored — /queue handler didn't call _enqueue_fifo"
+    )
+    queued: MessageEvent = adapter._pending_messages[sk]
+    assert queued.reply_to_message_id == "999", (
+        f"reply_to_message_id not propagated: got {queued.reply_to_message_id!r}"
+    )
+    assert queued.reply_to_text == "Task t_8698e650 is ready for your review.", (
+        f"reply_to_text not propagated: got {queued.reply_to_text!r}"
+    )
 
-        queued_event = MessageEvent(
-            text="plain prompt",
-            message_type=MessageType.TEXT,
-            source=inbound.source,
-            message_id=inbound.message_id,
-            channel_prompt=inbound.channel_prompt,
-            reply_to_message_id=getattr(inbound, "reply_to_message_id", None),
-            reply_to_text=getattr(inbound, "reply_to_text", None),
-        )
-        runner._enqueue_fifo(session_key, queued_event, adapter)
 
-        stored: MessageEvent = adapter._pending_messages[session_key]
-        assert stored.reply_to_message_id is None
-        assert stored.reply_to_text is None
+@pytest.mark.asyncio
+async def test_queue_via_handle_message_no_reply_context_stays_none():
+    """/queue with no reply context must NOT invent reply fields."""
+    runner, adapter = _make_runner()
+    sk = build_session_key(_make_source())
 
-    def test_enqueue_fifo_preserves_reply_context_across_overflow(self):
-        """reply context must survive on each item individually in a multi-/queue chain."""
-        runner = _make_runner()
-        adapter = _make_adapter()
-        session_key = "telegram:123"
+    running_agent = MagicMock()
+    runner._running_agents[sk] = running_agent
 
-        # First item has reply context; second does not.
-        ev1 = MessageEvent(
-            text="first",
-            message_type=MessageType.TEXT,
-            source=_source(),
-            message_id="q1",
-            reply_to_message_id="42",
-            reply_to_text="Approve the PR",
-        )
-        ev2 = MessageEvent(
-            text="second",
-            message_type=MessageType.TEXT,
-            source=_source(),
-            message_id="q2",
-        )
+    inbound = _make_event("/queue plain follow-up")
 
-        runner._enqueue_fifo(session_key, ev1, adapter)
-        runner._enqueue_fifo(session_key, ev2, adapter)
+    result = await runner._handle_message(inbound)
 
-        slot_event: MessageEvent = adapter._pending_messages[session_key]
-        assert slot_event.reply_to_message_id == "42"
-        assert slot_event.reply_to_text == "Approve the PR"
+    assert result is not None
+    assert "queued" in result.lower()
+    assert sk in adapter._pending_messages
+    queued: MessageEvent = adapter._pending_messages[sk]
+    assert queued.reply_to_message_id is None
+    assert queued.reply_to_text is None
 
-        overflow_event: MessageEvent = runner._queued_events[session_key][0]
-        assert overflow_event.reply_to_message_id is None
-        assert overflow_event.reply_to_text is None
+
+@pytest.mark.asyncio
+async def test_steer_pending_sentinel_via_handle_message_preserves_reply_context():
+    """/steer when agent is PENDING-sentinel must preserve reply context on fallback.
+
+    This exercises the second /steer path added in gateway/run.py.
+    """
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    runner, adapter = _make_runner()
+    sk = build_session_key(_make_source())
+
+    # Sentinel = agent booting, /steer falls back to pending-slot queue
+    runner._running_agents[sk] = _AGENT_PENDING_SENTINEL
+
+    inbound = _make_event(
+        "/steer also check auth.log",
+        reply_to_message_id="42",
+        reply_to_text="PR approved, please merge.",
+    )
+
+    result = await runner._handle_message(inbound)
+
+    assert result is not None
+    assert sk in adapter._pending_messages
+    queued: MessageEvent = adapter._pending_messages[sk]
+    assert queued.reply_to_message_id == "42"
+    assert queued.reply_to_text == "PR approved, please merge."
+
+
+@pytest.mark.asyncio
+async def test_steer_no_active_agent_via_handle_message_preserves_reply_context():
+    """/steer when no agent is active must preserve reply context on fallback.
+
+    This exercises the third /steer path added in gateway/run.py.
+    """
+    runner, adapter = _make_runner()
+    sk = build_session_key(_make_source())
+
+    # spec=[] → hasattr(agent, "steer") returns False → triggers fallback
+    running_agent = MagicMock(spec=[])
+    runner._running_agents[sk] = running_agent
+
+    inbound = _make_event(
+        "/steer focus on error handling",
+        reply_to_message_id="77",
+        reply_to_text="Test output attached.",
+    )
+
+    result = await runner._handle_message(inbound)
+
+    assert result is not None
+    assert "queued" in result.lower()
+    assert sk in adapter._pending_messages
+    queued: MessageEvent = adapter._pending_messages[sk]
+    assert queued.reply_to_message_id == "77"
+    assert queued.reply_to_text == "Test output attached."
 
 
 # ---------------------------------------------------------------------------
-# Integration: reply prefix appears when queued event is processed
+# Unit tests: _prepare_inbound_message_text injects the prefix
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_queued_event_with_reply_context_gets_prefix_injected():
     """End-to-end: a queued event carrying reply_to_text produces the
     [Replying to: "..."] prefix when _prepare_inbound_message_text runs."""
-    runner = _make_runner()
-    source = _source()
+    runner, _ = _make_runner()
+    source = _make_source()
 
     queued_event = MessageEvent(
         text="this is approved",
@@ -182,8 +253,8 @@ async def test_queued_event_with_reply_context_gets_prefix_injected():
 @pytest.mark.asyncio
 async def test_queued_event_without_reply_context_has_no_prefix():
     """A queued event with no reply context must NOT get a spurious prefix."""
-    runner = _make_runner()
-    source = _source()
+    runner, _ = _make_runner()
+    source = _make_source()
 
     queued_event = MessageEvent(
         text="plain queued message",
