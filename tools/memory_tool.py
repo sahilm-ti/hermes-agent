@@ -80,6 +80,92 @@ def _scan_memory_content(content: str) -> Optional[str]:
     return _first_threat_message(content, scope="strict")
 
 
+# ---------------------------------------------------------------------------
+# Procedural-content gate — reject recipes / procedures / skill duplicates
+# at write time so memory stays bounded to durable facts.
+# ---------------------------------------------------------------------------
+
+_PROCEDURAL_REJECTION_MSG = (
+    "Memory rejected: this looks like a procedure (numbered steps / file path / SQL / command). "
+    "Memory is for durable user/env facts. Put procedures in a skill: skill_view or skill_manage. "
+    "If this is genuinely a user-preference and the heuristic is wrong, set bypass_procedural_check=True."
+)
+
+# Imperative verbs frequently found in recipe prose.  Order does not matter —
+# all are checked.  We only trigger when a DIFFERENT procedural signal word
+# appears within ±50 chars of one of these (no self-match).
+_IMPERATIVE_VERBS: List[str] = [
+    "run", "call", "set", "add", "remove", "check", "apply", "create",
+    "install", "execute", "do", "merge", "push", "pull", "patch",
+    "read", "write", "verify", "fetch", "clear", "fix", "restart",
+    "update", "open", "close", "enable", "disable", "delete", "insert",
+]
+
+# Words whose presence is a strong signal that the entry is procedural.
+_PROCEDURAL_SIGNALS: List[str] = [
+    "via", "use", "run", "flow:", "recipe", "procedure",
+]
+
+
+def _detect_procedural_content(content: str) -> Optional[str]:
+    """Return a rejection string if *content* looks procedural, else None.
+
+    Four heuristics (any one triggers rejection):
+
+    1. A file path referencing ``/references/`` or ending in ``.md`` —
+       indicates skill content being duplicated into memory.
+    2. An SQL keyword, triple-backtick code block, or shell-command prompt.
+    3. Numbered-step markers like ``1.`` / ``2.`` or ``(1)`` / ``(2)``.
+    4. A procedural signal word (``via``, ``use``, ``run``, ``recipe``,
+       ``procedure``, ``flow:``) within ±50 chars of an imperative verb
+       (excluding self-match so e.g. ``use`` alone does not trigger).
+
+    To bypass for a legitimate edge case, pass ``bypass_procedural_check=True``
+    to the memory tool.
+    """
+    # --- Heuristic 1: skill/doc file path signals ---
+    if "/references/" in content:
+        return _PROCEDURAL_REJECTION_MSG
+    if re.search(r"\S+\.md\b", content):
+        return _PROCEDURAL_REJECTION_MSG
+
+    # --- Heuristic 2: SQL, code blocks, shell commands ---
+    if re.search(r"\b(SELECT|INSERT|UPDATE|DELETE|CREATE\s+TABLE|ALTER\s+TABLE)\b", content, re.IGNORECASE):
+        return _PROCEDURAL_REJECTION_MSG
+    if "```" in content:
+        return _PROCEDURAL_REJECTION_MSG
+    # Shell-command prompt ($  or #  at line start) or common shell verbs at line start
+    if re.search(r"(?m)^[$#] .+", content):
+        return _PROCEDURAL_REJECTION_MSG
+    if re.search(
+        r"(?m)^(cd|git|pip|uv|npm|yarn|python|hermes|gh|curl|sed|awk|grep|find|brew)\s",
+        content,
+    ):
+        return _PROCEDURAL_REJECTION_MSG
+
+    # --- Heuristic 3: numbered steps ---
+    if re.search(r"\(\d+\)\s+\S|\b\d+\.\s+\S", content):
+        return _PROCEDURAL_REJECTION_MSG
+
+    # --- Heuristic 4: procedural signal word near an imperative verb ---
+    lower = content.lower()
+    for signal in _PROCEDURAL_SIGNALS:
+        pos = lower.find(signal)
+        while pos != -1:
+            start = max(0, pos - 50)
+            end = min(len(lower), pos + len(signal) + 50)
+            window = lower[start:end]
+            for verb in _IMPERATIVE_VERBS:
+                if verb == signal:
+                    # Skip self-match (e.g. "run" signal near "run" verb)
+                    continue
+                if re.search(r"\b" + re.escape(verb) + r"\b", window):
+                    return _PROCEDURAL_REJECTION_MSG
+            pos = lower.find(signal, pos + 1)
+
+    return None
+
+
 def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
     """Build the error dict returned when external drift is detected.
 
@@ -294,7 +380,7 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
-    def add(self, target: str, content: str) -> Dict[str, Any]:
+    def add(self, target: str, content: str, bypass_procedural_check: bool = False) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
         if not content:
@@ -304,6 +390,12 @@ class MemoryStore:
         scan_error = _scan_memory_content(content)
         if scan_error:
             return {"success": False, "error": scan_error}
+
+        # Procedural-content gate — reject recipes/procedures unless bypassed
+        if not bypass_procedural_check:
+            proc_error = _detect_procedural_content(content)
+            if proc_error:
+                return {"success": False, "error": proc_error}
 
         with self._file_lock(self._path_for(target)):
             # Re-read from disk under lock to pick up writes from other sessions.
@@ -344,7 +436,7 @@ class MemoryStore:
 
         return self._success_response(target, "Entry added.")
 
-    def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
+    def replace(self, target: str, old_text: str, new_content: str, bypass_procedural_check: bool = False) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
         old_text = old_text.strip()
         new_content = new_content.strip()
@@ -357,6 +449,12 @@ class MemoryStore:
         scan_error = _scan_memory_content(new_content)
         if scan_error:
             return {"success": False, "error": scan_error}
+
+        # Procedural-content gate — reject recipes/procedures unless bypassed
+        if not bypass_procedural_check:
+            proc_error = _detect_procedural_content(new_content)
+            if proc_error:
+                return {"success": False, "error": proc_error}
 
         with self._file_lock(self._path_for(target)):
             bak = self._reload_target(target)
@@ -605,6 +703,7 @@ def memory_tool(
     content: str = None,
     old_text: str = None,
     store: Optional[MemoryStore] = None,
+    bypass_procedural_check: bool = False,
 ) -> str:
     """
     Single entry point for the memory tool. Dispatches to MemoryStore methods.
@@ -620,14 +719,14 @@ def memory_tool(
     if action == "add":
         if not content:
             return tool_error("Content is required for 'add' action.", success=False)
-        result = store.add(target, content)
+        result = store.add(target, content, bypass_procedural_check=bypass_procedural_check)
 
     elif action == "replace":
         if not old_text:
             return tool_error("old_text is required for 'replace' action.", success=False)
         if not content:
             return tool_error("content is required for 'replace' action.", success=False)
-        result = store.replace(target, old_text, content)
+        result = store.replace(target, old_text, content, bypass_procedural_check=bypass_procedural_check)
 
     elif action == "remove":
         if not old_text:
@@ -672,7 +771,12 @@ MEMORY_SCHEMA = {
         "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
         "remove (delete -- old_text identifies it).\n\n"
-        "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
+        "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state.\n\n"
+        "PROCEDURAL GATE: Entries with numbered steps, file paths ending in .md, /references/ paths, "
+        "SQL queries, code blocks, or shell commands are rejected automatically. "
+        "These belong in skills (skill_manage), not memory. "
+        "Set bypass_procedural_check=True only for legitimate env facts that happen to contain a path "
+        "(e.g. 'AWS_PROFILE=mcp-hive points at ~/.aws/credentials')."
     ),
     "parameters": {
         "type": "object",
@@ -695,6 +799,15 @@ MEMORY_SCHEMA = {
                 "type": "string",
                 "description": "Short unique substring identifying the entry to replace or remove."
             },
+            "bypass_procedural_check": {
+                "type": "boolean",
+                "description": (
+                    "Set True only when the entry is a genuine user/env fact that happens to contain "
+                    "a file path, short command, or other pattern that triggered the procedural gate. "
+                    "Example: 'AWS_PROFILE=mcp-hive' or 'Project root is at ~/Desktop/work/myapp'. "
+                    "Do NOT set True to force procedures/recipes into memory — put those in a skill."
+                ),
+            },
         },
         "required": ["action", "target"],
     },
@@ -713,6 +826,7 @@ registry.register(
         target=args.get("target", "memory"),
         content=args.get("content"),
         old_text=args.get("old_text"),
+        bypass_procedural_check=bool(args.get("bypass_procedural_check", False)),
         store=kw.get("store")),
     check_fn=check_memory_requirements,
     emoji="🧠",
