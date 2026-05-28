@@ -482,6 +482,157 @@ from gateway.platforms.helpers import (
 )
 
 
+def _is_table_row(line: str) -> bool:
+    """Return True if *line* could plausibly be a table data row."""
+    stripped = line.strip()
+    return bool(stripped) and '|' in stripped
+
+
+def _split_markdown_table_row(line: str) -> list[str]:
+    """Split a simple GFM table row into stripped cell values."""
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _normalize_table_heading(cell: str) -> str:
+    """Return a plain-text heading from a raw table cell.
+
+    Strips the outermost markdown wrapper (``**``, ``__``, ``*``, ``_``,
+    backtick) so that the caller can safely re-wrap the result in bold
+    without producing double-marker artefacts like ``****text****``.
+    Also strips NBSP (U+00A0) and zero-width space (U+200B) which can
+    survive the GFM pipe-split and would cause silent string-equality
+    failures in any comparison.
+    """
+    s = cell.strip()
+    for wrap in ("**", "__", "*", "_", "`"):
+        if s.startswith(wrap) and s.endswith(wrap) and len(s) > 2 * len(wrap):
+            s = s[len(wrap) : -len(wrap)]
+            break  # strip one outermost layer only
+    return s.replace("\u00a0", " ").replace("\u200b", "").strip()
+
+
+def _render_table_block_for_telegram(table_block: list[str]) -> str:
+    """Render a detected GFM table as Telegram-friendly row groups.
+
+    Design invariant: ``cells[0]`` of every data row ALWAYS becomes the
+    bold heading for that row-group.  ``cells[1:]`` ALWAYS become the
+    bullets, aligned with ``headers[1:]``.  There is no dedup step — the
+    heading cell is structurally excluded from the bullet list, so it
+    cannot appear twice regardless of its string content or markdown
+    wrapping.
+
+    When the first header cell is explicitly empty (the conventional
+    "row-label column" GFM style), ``headers[0]`` is blank and
+    ``headers[1:]`` are the data-column labels — the same ``headers[1:]``
+    slice applies, so no special branch is needed.
+
+    Empty bullet values (row has fewer cells than headers) are silently
+    omitted rather than emitting ``• Header: `` with a trailing blank.
+    """
+    if len(table_block) < 3:
+        return "\n".join(table_block)
+
+    headers = _split_markdown_table_row(table_block[0])
+    if len(headers) < 2:
+        return "\n".join(table_block)
+
+    # The first header labels the row-identifier column (which becomes the
+    # bold heading).  The remaining headers label the data columns that
+    # appear as bullets.
+    data_headers = headers[1:]
+
+    rendered_groups: list[str] = []
+    for index, row in enumerate(table_block[2:], start=1):
+        cells = _split_markdown_table_row(row)
+        if not cells:
+            continue
+
+        heading_raw = cells[0]
+        heading = _normalize_table_heading(heading_raw) or f"Row {index}"
+        data_cells = cells[1:]
+
+        # Pad or trim data_cells to match data_headers length.
+        if len(data_cells) < len(data_headers):
+            data_cells = data_cells + [""] * (len(data_headers) - len(data_cells))
+        elif len(data_cells) > len(data_headers):
+            data_cells = data_cells[: len(data_headers)]
+
+        # Build the bulleted lines for this row.  Skip bullets whose value
+        # is empty — avoids emitting "• Header: " with a trailing blank when
+        # a row has fewer cells than the header declares.
+        bullets = [
+            f"• {h}: {v}"
+            for h, v in zip(data_headers, data_cells)
+            if v
+        ]
+
+        # Within a row-group: single newline between heading and its bullets,
+        # and between successive bullets.  This keeps the row visually tight
+        # on Telegram instead of stretching each bullet into its own paragraph.
+        group_lines = [f"**{heading}**", *bullets]
+        rendered_groups.append("\n".join(group_lines))
+
+    # Between row-groups: blank line so each group reads as a distinct block.
+    return "\n\n".join(rendered_groups)
+
+
+def _wrap_markdown_tables(text: str) -> str:
+    """Rewrite GFM-style pipe tables into Telegram-friendly bullet groups.
+
+    Detected by a row containing '|' immediately followed by a delimiter
+    row matching :data:`_TABLE_SEPARATOR_RE`.  Subsequent pipe-containing
+    non-blank lines are consumed as the table body and rewritten as
+    per-row bullet groups. Tables inside existing fenced code blocks are left
+    alone.
+    """
+    if '|' not in text or '-' not in text:
+        return text
+
+    lines = text.split('\n')
+    out: list[str] = []
+    in_fence = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+
+        # Track existing fenced code blocks — never touch content inside.
+        if stripped.startswith('```'):
+            in_fence = not in_fence
+            out.append(line)
+            i += 1
+            continue
+        if in_fence:
+            out.append(line)
+            i += 1
+            continue
+
+        # Look for a header row (contains '|') immediately followed by a
+        # delimiter row.
+        if (
+            '|' in line
+            and i + 1 < len(lines)
+            and _TABLE_SEPARATOR_RE.match(lines[i + 1])
+        ):
+            table_block = [line, lines[i + 1]]
+            j = i + 2
+            while j < len(lines) and _is_table_row(lines[j]):
+                table_block.append(lines[j])
+                j += 1
+            out.append(_render_table_block_for_telegram(table_block))
+            i = j
+            continue
+
+        out.append(line)
+        i += 1
+
+    return '\n'.join(out)
+
 # ---------------------------------------------------------------------------
 # Rich-message newline normalization
 # ---------------------------------------------------------------------------
