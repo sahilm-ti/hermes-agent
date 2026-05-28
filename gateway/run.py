@@ -11439,6 +11439,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             message_id=event.message_id,
                             channel_prompt=event.channel_prompt,
                             channel_context=event.channel_context,
+                            reply_to_message_id=getattr(event, "reply_to_message_id", None),
+                            reply_to_text=getattr(event, "reply_to_text", None),
                         )
                         adapter._pending_messages[_quick_key] = queued_event
                     return "Agent still starting — /steer queued for the next turn."
@@ -11462,6 +11464,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
                         channel_context=event.channel_context,
+                        reply_to_message_id=getattr(event, "reply_to_message_id", None),
+                        reply_to_text=getattr(event, "reply_to_text", None),
                     )
                     adapter._pending_messages[_quick_key] = queued_event
                 return "No active agent — /steer queued for the next turn."
