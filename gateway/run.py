@@ -19873,6 +19873,18 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     _code_watcher = _start_code_watcher(cfg=config.to_dict() if config is not None else None)
 
+    # Start the hermes-home puller so ~/.hermes stays up-to-date with
+    # origin/main (fast-forward only, once per hour, skips dirty trees and
+    # non-main branches).  Opt out via HERMES_GATEWAY_NO_AUTO_PULL=1 or
+    # gateway.hermes_home_auto_pull: false in config.yaml.
+    from gateway.hermes_home_puller import (
+        start_hermes_home_puller as _start_hermes_home_puller,
+    )
+
+    _hermes_home_puller = _start_hermes_home_puller(
+        cfg=config.to_dict() if config is not None else None
+    )
+
     # Wait for shutdown
     await runner.wait_for_shutdown()
 
@@ -19881,9 +19893,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             logger.error("Gateway exiting with failure: %s", runner.exit_reason)
         return False
 
-    # Stop code watcher and cron ticker cleanly
+    # Stop code watcher, hermes-home puller, and cron ticker cleanly
     if _code_watcher is not None:
         _code_watcher.stop()
+    if _hermes_home_puller is not None:
+        _hermes_home_puller.stop()
     cron_stop.set()
     cron_thread.join(timeout=5)
 
