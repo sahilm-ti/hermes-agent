@@ -29,7 +29,22 @@
 
 set -euo pipefail
 
-HERMES_CONFIG="${HOME}/.hermes"
+# Allow explicit override via env var for operator convenience.
+# Default: the real user's ~/.hermes, resolved by stripping any profile
+# sandbox suffix from $HOME (worker sessions set HOME to a profile home dir).
+_sys_home="${HERMES_CONFIG_ROOT:-}"
+if [[ -z "$_sys_home" ]]; then
+    # Worker sandbox layout: HOME = /path/to/user/.hermes/profiles/<name>/home
+    # The real system home is two levels above .hermes.
+    # Strip /profiles/<name>/home to get /path/to/user/.hermes, then dirname again for user home.
+    if [[ "$HOME" == *"/profiles/"*"/home" ]]; then
+        _hermes_root="${HOME%%/profiles/*}"  # e.g. /Users/sahilmarwaha/.hermes
+        _sys_home="${_hermes_root%/.hermes}"  # e.g. /Users/sahilmarwaha
+    else
+        _sys_home="$HOME"
+    fi
+fi
+HERMES_CONFIG="${_sys_home}/.hermes"
 KANBAN_DB="${HERMES_KANBAN_DB:-${HERMES_CONFIG}/kanban.db}"
 DRY_RUN=true
 YES=false
