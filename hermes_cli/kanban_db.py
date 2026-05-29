@@ -7938,7 +7938,13 @@ def dispatch_once(
             from hermes_cli.profiles import profile_exists  # local import: avoids cycle
         except Exception:
             profile_exists: Optional[Callable[[str], bool]] = None
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        # Check the EFFECTIVE assignee (row_assignee), not the stale DB
+        # snapshot (row["assignee"]). After default_assignee auto-assignment
+        # row_assignee holds the fallback profile while row["assignee"] is
+        # still None — using the snapshot here would route every
+        # auto-assigned task into skipped_nonspawnable and never spawn it
+        # (#27145 regression reintroduced by #34).
+        if profile_exists is not None and not profile_exists(row_assignee):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
