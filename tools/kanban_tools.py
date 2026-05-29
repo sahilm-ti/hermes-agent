@@ -26,6 +26,7 @@ three bypass the agent entirely. The tools are for dispatcher-spawned
 worker handoffs and for configured orchestrator profiles that route work
 through the board.
 """
+
 from __future__ import annotations
 
 import json
@@ -55,6 +56,7 @@ def _profile_has_kanban_toolset() -> bool:
     # (~30s) by the tool registry.
     try:
         from hermes_cli.config import load_config
+
         cfg = load_config()
         toolsets = cfg.get("toolsets", [])
         return "kanban" in toolsets
@@ -96,6 +98,7 @@ def _check_kanban_orchestrator_mode() -> bool:
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
 
 def _default_task_id(arg: Optional[str]) -> Optional[str]:
     """Resolve ``task_id`` arg or fall back to the env var the dispatcher set."""
@@ -176,6 +179,7 @@ def _connect(board: Optional[str] = None):
     the env-pinned active board without restarting Hermes.
     """
     from hermes_cli import kanban_db as kb
+
     return kb, kb.connect(board=board)
 
 
@@ -364,14 +368,13 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 # Handlers
 # ---------------------------------------------------------------------------
 
+
 def _handle_show(args: dict, **kw) -> str:
     """Read a task's full state: task row, parents, children, comments,
     runs (attempt history), and the last N events."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -387,12 +390,17 @@ def _handle_show(args: dict, **kw) -> str:
 
             def _task_dict(t):
                 return {
-                    "id": t.id, "title": t.title, "body": t.body,
-                    "assignee": t.assignee, "status": t.status,
-                    "tenant": t.tenant, "priority": t.priority,
+                    "id": t.id,
+                    "title": t.title,
+                    "body": t.body,
+                    "assignee": t.assignee,
+                    "status": t.status,
+                    "tenant": t.tenant,
+                    "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
-                    "created_by": t.created_by, "created_at": t.created_at,
+                    "created_by": t.created_by,
+                    "created_at": t.created_at,
                     "started_at": t.started_at,
                     "completed_at": t.completed_at,
                     "result": t.result,
@@ -402,34 +410,43 @@ def _handle_show(args: dict, **kw) -> str:
 
             def _run_dict(r):
                 return {
-                    "id": r.id, "profile": r.profile,
-                    "status": r.status, "outcome": r.outcome,
-                    "summary": r.summary, "error": r.error,
+                    "id": r.id,
+                    "profile": r.profile,
+                    "status": r.status,
+                    "outcome": r.outcome,
+                    "summary": r.summary,
+                    "error": r.error,
                     "metadata": r.metadata,
-                    "started_at": r.started_at, "ended_at": r.ended_at,
+                    "started_at": r.started_at,
+                    "ended_at": r.ended_at,
                 }
 
-            return json.dumps({
-                "task": _task_dict(task),
-                "parents": parents,
-                "children": children,
-                "comments": [
-                    {"author": c.author, "body": c.body,
-                     "created_at": c.created_at}
-                    for c in comments
-                ],
-                "events": [
-                    {"kind": e.kind, "payload": e.payload,
-                     "created_at": e.created_at, "run_id": e.run_id}
-                    for e in events[-50:]   # cap; full log via CLI
-                ],
-                "runs": [_run_dict(r) for r in runs],
-                # Also surface the worker's own context block so the
-                # agent can include it directly if it wants. This is
-                # the same string build_worker_context returns to the
-                # dispatcher at spawn time.
-                "worker_context": kb.build_worker_context(conn, tid),
-            })
+            return json.dumps(
+                {
+                    "task": _task_dict(task),
+                    "parents": parents,
+                    "children": children,
+                    "comments": [
+                        {"author": c.author, "body": c.body, "created_at": c.created_at}
+                        for c in comments
+                    ],
+                    "events": [
+                        {
+                            "kind": e.kind,
+                            "payload": e.payload,
+                            "created_at": e.created_at,
+                            "run_id": e.run_id,
+                        }
+                        for e in events[-50:]  # cap; full log via CLI
+                    ],
+                    "runs": [_run_dict(r) for r in runs],
+                    # Also surface the worker's own context block so the
+                    # agent can include it directly if it wants. This is
+                    # the same string build_worker_context returns to the
+                    # dispatcher at spawn time.
+                    "worker_context": kb.build_worker_context(conn, tid),
+                }
+            )
         finally:
             conn.close()
     except ValueError as e:
@@ -481,17 +498,20 @@ def _handle_list(args: dict, **kw) -> str:
             )
             truncated = len(rows) > limit
             tasks = rows[:limit]
-            return json.dumps({
-                "tasks": [_task_summary_dict(kb, conn, t) for t in tasks],
-                "count": len(tasks),
-                "limit": limit,
-                "truncated": truncated,
-                "next_limit": (
-                    min(limit * 2, KANBAN_LIST_MAX_LIMIT)
-                    if truncated and limit < KANBAN_LIST_MAX_LIMIT else None
-                ),
-                "promoted": promoted,
-            })
+            return json.dumps(
+                {
+                    "tasks": [_task_summary_dict(kb, conn, t) for t in tasks],
+                    "count": len(tasks),
+                    "limit": limit,
+                    "truncated": truncated,
+                    "next_limit": (
+                        min(limit * 2, KANBAN_LIST_MAX_LIMIT)
+                        if truncated and limit < KANBAN_LIST_MAX_LIMIT
+                        else None
+                    ),
+                    "promoted": promoted,
+                }
+            )
         finally:
             conn.close()
     except ValueError as e:
@@ -505,9 +525,7 @@ def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -537,9 +555,7 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"{type(created_cards).__name__}"
             )
         # Normalise: strings only, stripped, non-empty.
-        created_cards = [
-            str(c).strip() for c in created_cards if str(c).strip()
-        ]
+        created_cards = [str(c).strip() for c in created_cards if str(c).strip()]
     if artifacts is not None:
         if isinstance(artifacts, str):
             # Accept a single path as a string for convenience.
@@ -549,9 +565,7 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"artifacts must be a list of file paths, got "
                 f"{type(artifacts).__name__}"
             )
-        artifacts = [
-            str(p).strip() for p in artifacts if str(p).strip()
-        ]
+        artifacts = [str(p).strip() for p in artifacts if str(p).strip()]
         # Carry the artifact list inside metadata so it rides the
         # existing completed-event payload without a schema change at
         # the DB layer.  The gateway notifier reads payload['artifacts']
@@ -580,9 +594,7 @@ def _handle_complete(args: dict, **kw) -> str:
             else:
                 metadata["artifacts"] = artifacts
     if not (summary or result):
-        return tool_error(
-            "provide at least one of: summary (preferred), result"
-        )
+        return tool_error("provide at least one of: summary (preferred), result")
     if metadata is not None and not isinstance(metadata, dict):
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
@@ -625,8 +637,11 @@ def _handle_complete(args: dict, **kw) -> str:
 
             try:
                 ok = kb.complete_task(
-                    conn, tid,
-                    result=result, summary=summary, metadata=metadata,
+                    conn,
+                    tid,
+                    result=result,
+                    summary=summary,
+                    metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
                 )
@@ -676,9 +691,7 @@ def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -721,15 +734,15 @@ def _handle_block(args: dict, **kw) -> str:
             )
         try:
             ok = kb.block_task(
-                conn, tid,
+                conn,
+                tid,
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
                 return tool_error(
-                    f"could not block {tid} (unknown id or not in "
-                    f"running/ready)"
+                    f"could not block {tid} (unknown id or not in " f"running/ready)"
                 )
             run = kb.latest_run(conn, tid)
             # Tell the worker where the task actually landed so it doesn't
@@ -762,9 +775,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     """
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -881,9 +892,12 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
+    max_iterations = args.get("max_iterations")
     initial_status = args.get("initial_status") or "running"
     auto_subscribe, bool_error = _parse_bool_arg(
-        args, "auto_subscribe", default=True,
+        args,
+        "auto_subscribe",
+        default=True,
     )
     if bool_error:
         return tool_error(bool_error)
@@ -930,16 +944,18 @@ def _handle_create(args: dict, **kw) -> str:
                 parents=tuple(parents),
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,
-                workspace_kind=(
-                    str(workspace_kind) if workspace_kind else None
-                ),
+                workspace_kind=(str(workspace_kind) if workspace_kind else None),
                 workspace_path=workspace_path,
                 project_id=project_id,
                 triage=triage,
                 idempotency_key=idempotency_key,
                 max_runtime_seconds=(
                     int(max_runtime_seconds)
-                    if max_runtime_seconds is not None else None
+                    if max_runtime_seconds is not None
+                    else None
+                ),
+                max_iterations=(
+                    int(max_iterations) if max_iterations is not None else None
                 ),
                 skills=skills,
                 goal_mode=goal_mode,
@@ -1096,7 +1112,8 @@ def _inherit_parent_subs(kb, conn, task_id: str, parent_ids: list) -> bool:
         except Exception:
             logger.exception(
                 "kanban_create parent-sub inheritance: list_notify_subs failed "
-                "for parent %s", parent_id,
+                "for parent %s",
+                parent_id,
             )
             continue
         for sub in rows:
@@ -1123,7 +1140,9 @@ def _inherit_parent_subs(kb, conn, task_id: str, parent_ids: list) -> bool:
             except Exception:
                 logger.exception(
                     "kanban_create parent-sub inheritance: add_notify_sub "
-                    "failed for child %s (parent %s)", task_id, parent_id,
+                    "failed for child %s (parent %s)",
+                    task_id,
+                    parent_id,
                 )
     return inserted
 
@@ -1160,9 +1179,7 @@ def _handle_review(args: dict, **kw) -> str:
     """Transition the worker's task to 'review' (auto-review agent handoff)."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -1176,7 +1193,8 @@ def _handle_review(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             ok = kb.move_to_review(
-                conn, tid,
+                conn,
+                tid,
                 reason=reason,
                 expected_run_id=_worker_run_id(tid),
             )
@@ -1199,9 +1217,7 @@ def _handle_human_review(args: dict, **kw) -> str:
     """Transition a task to 'human_review' (auto-review agent passed)."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -1215,7 +1231,8 @@ def _handle_human_review(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             ok = kb.move_to_human_review(
-                conn, tid,
+                conn,
+                tid,
                 reason=reason,
                 expected_run_id=_worker_run_id(tid),
             )
@@ -1269,13 +1286,15 @@ def _handle_approve(args: dict, **kw) -> str:
                 except Exception as spawn_exc:
                     logger.warning(
                         "kanban_approve: merger spawn failed for %s: %s",
-                        tid, spawn_exc,
+                        tid,
+                        spawn_exc,
                     )
                     # Spawn failed — block the task so it doesn't stay locked
                     # in running forever.
                     try:
                         kb.block_task(
-                            conn, str(tid),
+                            conn,
+                            str(tid),
                             reason=f"merger spawn failed: {spawn_exc}",
                         )
                     except Exception:
@@ -1381,6 +1400,7 @@ def _board_schema_prop() -> dict[str, str]:
     """
     return {"type": "string", "description": _DESC_BOARD}
 
+
 KANBAN_SHOW_SCHEMA = {
     "name": "kanban_show",
     "description": (
@@ -1426,8 +1446,13 @@ KANBAN_LIST_SCHEMA = {
             "status": {
                 "type": "string",
                 "enum": [
-                    "triage", "todo", "ready", "running",
-                    "blocked", "done", "archived",
+                    "triage",
+                    "todo",
+                    "ready",
+                    "running",
+                    "blocked",
+                    "done",
+                    "archived",
                 ],
                 "description": "Optional task status filter.",
             },
@@ -1487,8 +1512,8 @@ KANBAN_COMPLETE_SCHEMA = {
                 "type": "object",
                 "description": (
                     "Free-form dict of structured facts about this "
-                    "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                    "\"findings\": [...]}. Surfaced to downstream "
+                    'attempt — {"changed_files": [...], "tests_run": 12, '
+                    '"findings": [...]}. Surfaced to downstream '
                     "workers alongside ``summary``."
                 ),
             },
@@ -1524,8 +1549,8 @@ KANBAN_COMPLETE_SCHEMA = {
                     "Optional list of absolute paths to deliverable "
                     "files you produced during this run — generated "
                     "charts, PDFs, spreadsheets, images, archives. "
-                    "Examples: [\"/tmp/q3-revenue.png\", "
-                    "\"/tmp/report.pdf\"]. The gateway notifier "
+                    'Examples: ["/tmp/q3-revenue.png", '
+                    '"/tmp/report.pdf"]. The gateway notifier '
                     "uploads each path as a native attachment to the "
                     "subscribed chat (images embed inline, everything "
                     "else uploads as a file) so the deliverable "
@@ -1756,6 +1781,18 @@ KANBAN_CREATE_SCHEMA = {
                     "task with outcome='timed_out'."
                 ),
             },
+            "max_iterations": {
+                "type": "integer",
+                "description": (
+                    "Optional per-task LLM-inference iteration budget "
+                    "for the spawned worker. Injected as "
+                    "HERMES_MAX_ITERATIONS=<N> into the worker's "
+                    "environment, overriding the profile default "
+                    "(usually 90). Use this on investigate+fix+test+PR "
+                    "cards where 150–250 iterations are needed; omit for "
+                    "focused single-deliverable tasks."
+                ),
+            },
             "initial_status": {
                 "type": "string",
                 "enum": ["running", "blocked"],
@@ -1973,7 +2010,7 @@ KANBAN_LINK_SCHEMA = {
         "type": "object",
         "properties": {
             "parent_id": {"type": "string", "description": "Parent task id."},
-            "child_id":  {"type": "string", "description": "Child task id."},
+            "child_id": {"type": "string", "description": "Child task id."},
             "board": _board_schema_prop(),
         },
         "required": ["parent_id", "child_id"],
