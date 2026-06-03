@@ -8607,7 +8607,13 @@ def dispatch_once(
             from hermes_cli.profiles import profile_exists  # local import: avoids cycle
         except Exception:
             profile_exists: Optional[Callable[[str], bool]] = None
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        # Check the EFFECTIVE assignee (row_assignee), not the stale DB
+        # snapshot (row["assignee"]). After default_assignee auto-assignment
+        # row_assignee holds the fallback profile while row["assignee"] is
+        # still None — using the snapshot here would route every
+        # auto-assigned task into skipped_nonspawnable and never spawn it
+        # (#27145 regression reintroduced by #34).
+        if profile_exists is not None and not profile_exists(row_assignee):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -8660,9 +8666,9 @@ def dispatch_once(
         # tasks fall back to the blocked branch.
         is_probe = False
         if crash_breaker_enabled and not dry_run:
-            blocked_q, is_probe = is_assignee_quarantined(conn, row["assignee"])
+            blocked_q, is_probe = is_assignee_quarantined(conn, row_assignee)
             if blocked_q:
-                result.quarantine_blocked.append((row["id"], row["assignee"]))
+                result.quarantine_blocked.append((row["id"], row_assignee))
                 continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
@@ -8680,10 +8686,10 @@ def dispatch_once(
             continue
         if is_probe:
             try:
-                mark_quarantine_probe_task(conn, row["assignee"], claimed.id)
+                mark_quarantine_probe_task(conn, row_assignee, claimed.id)
             except Exception:
                 pass
-            result.quarantine_probes.append((claimed.id, row["assignee"]))
+            result.quarantine_probes.append((claimed.id, row_assignee))
         try:
             workspace = resolve_workspace(claimed, board=board)
             if claimed.workspace_kind == "worktree":
