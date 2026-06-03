@@ -26523,6 +26523,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc,
                 )
 
+    async def _send_operator_alert(self, message: str) -> int:
+        """Notify home channels that the Hermes checkout auto-pull is wedged."""
+        delivered = 0
+        for platform, platform_cfg in self.config.platforms.items():
+            home = platform_cfg.home_channel
+            if not home or not home.chat_id:
+                continue
+            transport = resolve_delivery_transport(platform, self.config, self.adapters)
+            if transport is None:
+                continue
+            try:
+                metadata = self._thread_metadata_for_target(
+                    platform,
+                    home.chat_id,
+                    home.thread_id,
+                    adapter=transport.adapter,
+                )
+                if transport.is_relay:
+                    metadata = dict(metadata or {})
+                    if home.user_id:
+                        metadata["user_id"] = home.user_id
+                    if home.scope_id:
+                        metadata["scope_id"] = home.scope_id
+                send_metadata = _non_conversational_metadata(metadata, platform=platform)
+                if send_metadata is not None or transport.is_relay:
+                    result = await transport.send(
+                        platform, str(home.chat_id), message, metadata=send_metadata
+                    )
+                else:
+                    result = await transport.adapter.send(str(home.chat_id), message)
+                if result is not None and getattr(result, "success", True) is False:
+                    continue
+                delivered += 1
+            except Exception as exc:
+                logger.warning(
+                    "operator alert notification failed for %s:%s: %s",
+                    platform.value,
+                    home.chat_id,
+                    exc,
+                )
+        return delivered
+
+    def make_operator_alert_callback(
+        self, loop: "asyncio.AbstractEventLoop"
+    ) -> Callable[[str], None]:
+        """Return a thread-safe notifier for the Hermes-home puller."""
+        from agent.async_utils import safe_schedule_threadsafe
+
+        def _alert(message: str) -> None:
+            safe_schedule_threadsafe(
+                self._send_operator_alert(message),
+                loop,
+                logger=logger,
+                log_message="operator alert: failed to schedule home-channel send",
+            )
+
+        return _alert
+
     def _set_session_env(self, context: SessionContext) -> list:
         """Set session context variables for the current async task.
 
@@ -33469,7 +33527,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     )
 
     _hermes_home_puller = _start_hermes_home_puller(
-        cfg=config.to_dict() if config is not None else None
+        cfg=config.to_dict() if config is not None else None,
+        notifier=runner.make_operator_alert_callback(asyncio.get_running_loop()),
     )
 
     # Wait for shutdown
