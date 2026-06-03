@@ -7,8 +7,6 @@ the task is skipped (existing behavior preserved).
 from __future__ import annotations
 
 import json
-import os
-import sys
 import tempfile
 
 import pytest
@@ -16,13 +14,23 @@ import pytest
 
 @pytest.fixture()
 def isolated_kanban_home(monkeypatch):
-    """Spin up a fresh HERMES_HOME with a clean kanban DB."""
+    """Spin up a fresh HERMES_HOME with a clean kanban DB.
+
+    Hermeticity note: we do NOT ``del sys.modules[...]`` + reimport here.
+    ``kanban_db`` resolves HERMES_HOME lazily at call time (via
+    ``kanban_home()`` → ``get_default_hermes_root()``), and the per-test
+    DB path is keyed off the fresh ``HERMES_HOME`` below, so a stale
+    import cannot leak board state across tests. Reimporting would create
+    a *second* ``hermes_cli.kanban_db`` module object: sibling test files
+    that captured the module at import time (e.g.
+    ``test_kanban_core_functionality.py``'s top-level ``import ... as kb``)
+    would then read process-global state (``_recent_worker_exits``,
+    ``_INITIALIZED_PATHS``) from the OLD module while a ``import ... as
+    _kb`` inside the test resolves the NEW one — a non-hermetic split that
+    flips dispatcher-contract assertions depending on test order.
+    """
     test_home = tempfile.mkdtemp(prefix="kanban_default_assignee_test_")
     monkeypatch.setenv("HERMES_HOME", test_home)
-    # Force-reimport so the fresh HERMES_HOME is picked up.
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
     from hermes_cli import kanban_db
     yield kanban_db, test_home
     # Cleanup is best-effort; tempfile dir survives but pytest isolation

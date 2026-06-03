@@ -9508,7 +9508,7 @@ def _dispatch_once_locked(
         try:
             from hermes_cli.profiles import profile_exists  # local import: avoids cycle
         except Exception:
-            profile_exists = None  # type: ignore[assignment]
+            profile_exists: Optional[Callable[[str], bool]] = None
         if profile_exists is not None and not profile_exists(row_assignee):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
@@ -9552,6 +9552,12 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        is_probe = False
+        if crash_breaker_enabled and not dry_run:
+            blocked_q, is_probe = is_assignee_quarantined(conn, row_assignee)
+            if blocked_q:
+                result.quarantine_blocked.append((row["id"], row_assignee))
+                continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             # Increment per-profile counter even in dry_run so the cap
@@ -9566,6 +9572,12 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        if is_probe:
+            try:
+                mark_quarantine_probe_task(conn, row_assignee, claimed.id)
+            except Exception:
+                pass
+            result.quarantine_probes.append((claimed.id, row_assignee))
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -9683,7 +9695,7 @@ def _dispatch_once_locked(
         try:
             from hermes_cli.profiles import profile_exists
         except Exception:
-            profile_exists = None  # type: ignore[assignment]
+            profile_exists: Optional[Callable[[str], bool]] = None
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
