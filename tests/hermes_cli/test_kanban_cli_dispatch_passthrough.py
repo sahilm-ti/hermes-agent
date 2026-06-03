@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 import tempfile
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -19,13 +18,19 @@ import pytest
 
 @pytest.fixture()
 def isolated_kanban_home(monkeypatch):
-    """Spin up a fresh HERMES_HOME with a clean kanban DB."""
+    """Spin up a fresh HERMES_HOME with a clean kanban DB.
+
+    Hermeticity note: no ``del sys.modules[...]`` + reimport. ``kanban_db``
+    resolves HERMES_HOME lazily at call time, so the fresh ``HERMES_HOME``
+    below is picked up without reimporting. Reimporting would create a
+    second ``hermes_cli.kanban_db`` module object and split process-global
+    state (``_recent_worker_exits`` etc.) from sibling test files that
+    captured the module at import time — a non-hermetic, order-dependent
+    failure.
+    """
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
     yield test_home
 
 
