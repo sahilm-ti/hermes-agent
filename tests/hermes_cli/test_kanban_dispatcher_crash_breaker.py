@@ -191,6 +191,52 @@ def test_quarantine_prevents_dispatch(kanban_home, all_assignees_spawnable):
         conn.close()
 
 
+def test_quarantine_checks_effective_assignee_for_auto_assigned_task(
+    kanban_home, all_assignees_spawnable,
+):
+    """An unassigned task auto-assigned via ``default_assignee`` to a
+    quarantined profile must be quarantine-checked under its EFFECTIVE
+    assignee (row_assignee), not the stale ``None`` DB snapshot.
+
+    Regression for the row_assignee fix: the spawn gate already used the
+    effective assignee, but the quarantine path read the stale
+    row["assignee"] (None for auto-assigned tasks), so a task routed by
+    default_assignee to a quarantined profile would slip past the breaker
+    and spawn. Assert it's blocked under "alice", not spawned.
+    """
+    conn = kb.connect()
+    try:
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO kanban_quarantine "
+            "(assignee, cooldown_until, trip_count, last_trip_at, "
+            " last_reason, probe_in_flight) "
+            "VALUES (?, ?, ?, ?, ?, 0)",
+            ("alice", now + 600, 1, now, "broken venv"),
+        )
+        # Task has NO assignee — it gets routed to "alice" by default_assignee.
+        tid = kb.create_task(conn, title="auto-routed task", assignee=None)
+        spawn_calls: list = []
+
+        def _spawn(task, ws, **_kw):
+            spawn_calls.append(task.id)
+            return 12345
+
+        res = kb.dispatch_once(
+            conn, spawn_fn=_spawn, crash_breaker_enabled=True,
+            default_assignee="alice",
+        )
+        # The auto-assigned task must be blocked under its effective
+        # assignee, not spawned and not recorded under a None assignee.
+        assert spawn_calls == []
+        assert any(
+            t == tid and a == "alice" for t, a in res.quarantine_blocked
+        )
+        assert all(a == "alice" for _t, a in res.quarantine_blocked)
+    finally:
+        conn.close()
+
+
 def test_quarantine_blocks_review_column_too(
     kanban_home, all_assignees_spawnable,
 ):
