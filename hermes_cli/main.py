@@ -8205,26 +8205,91 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 text=True,
             )
             if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                # ff-only failed — local and the remote we pull from (origin)
+                # have diverged.
+                #
+                # On a canonical checkout (origin = your fork) the historical
+                # behavior is to reset the local tree to match origin exactly,
+                # since local changes are already stashed.
+                #
+                # On an INVERTED-topology checkout (origin = NousResearch
+                # upstream, a separate `myfork` remote is the fork that runs
+                # locally) a reset-to-origin would discard every fork-only
+                # commit. Detect that case and instead MERGE upstream into the
+                # fork, never reset. See hermes_cli/fork_tracking.py.
+                from hermes_cli.fork_tracking import (
+                    detect_fork_tracking,
+                    merge_upstream_into_fork,
                 )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                    cwd=PROJECT_ROOT,
-                    capture_output=True,
-                    text=True,
-                )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
+
+                fork_cfg = detect_fork_tracking(git_cmd, PROJECT_ROOT, branch=branch)
+                if fork_cfg is not None:
                     print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        f"  ℹ Fork-tracking checkout detected "
+                        f"(origin={fork_cfg.upstream_remote} is upstream, "
+                        f"{fork_cfg.fork_remote} is the fork)."
                     )
-                    sys.exit(1)
+                    print(
+                        f"  → Merging {fork_cfg.upstream_ref} into the fork "
+                        f"(never resetting to upstream)..."
+                    )
+                    merge_res = merge_upstream_into_fork(
+                        git_cmd, PROJECT_ROOT, fork_cfg
+                    )
+                    if merge_res.status in ("merged", "ff", "up_to_date"):
+                        msg = {
+                            "merged": "✓ Merged upstream into the fork",
+                            "ff": "✓ Fast-forwarded to the fork",
+                            "up_to_date": "✓ Already contains all upstream commits",
+                        }[merge_res.status]
+                        push_note = (
+                            " and pushed to the fork"
+                            if merge_res.pushed
+                            else " (local only — push to the fork manually)"
+                        )
+                        print(f"  {msg}{push_note}.")
+                    elif merge_res.status == "blocked":
+                        print(
+                            f"  ⏸ Skipped branch update — {merge_res.detail}. "
+                            f"Re-run `hermes update` once it clears."
+                        )
+                        # Not an error: the running tree is unchanged and safe.
+                        update_succeeded = True
+                        return
+                    elif merge_res.status == "conflict":
+                        print(
+                            "  ⚠ Upstream merge conflicts with the fork — left "
+                            "on last-good fork state and alerted the operator."
+                        )
+                        print(
+                            "    An upstream change needs manual/eng conflict "
+                            "resolution; the running fork is unchanged."
+                        )
+                        # The local tree is intact (still the fork); nothing to
+                        # roll back. Surface as a non-fatal stop.
+                        sys.exit(1)
+                    else:  # "error"
+                        print(f"  ✗ Upstream merge failed: {merge_res.detail}")
+                        sys.exit(1)
+                else:
+                    # Canonical checkout (origin = fork): historical reset path.
+                    print(
+                        "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                    )
+                    reset_result = subprocess.run(
+                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if reset_result.returncode != 0:
+                        print(f"✗ Failed to reset to origin/{branch}.")
+                        if reset_result.stderr.strip():
+                            print(f"  {reset_result.stderr.strip()}")
+                        print(
+                            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        )
+                        sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
