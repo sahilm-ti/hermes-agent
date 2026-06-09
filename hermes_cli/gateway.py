@@ -4401,43 +4401,17 @@ def get_launchd_label() -> str:
     return f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
 
 
-# Cached launchd domain result — probing is cheap but should only run once per
-# process invocation (each ``hermes gateway start/stop/status`` call).
-_resolved_launchd_domain: str | None = None
+def _launchctl_session_managername() -> str | None:
+    """Return the launchd session security type (e.g. "Aqua", "Background").
 
+    `launchctl managername` reports which session the calling process belongs
+    to. An Aqua session is a GUI login (Window Server present); its LaunchAgents
+    are managed in the `gui/<uid>` domain. SSH / headless / login-item sessions
+    report "Background" (or similar) and manage LaunchAgents in `user/<uid>`.
 
-def _probe_launchd_domain_for_label(label: str) -> str:
-    """Resolve the launchd domain that manages ``label`` — uncached, per label.
-
-    Probes ``gui/<uid>`` first (Aqua sessions), then ``user/<uid>``
-    (Background/SSH sessions).  When neither domain contains a loaded
-    service, falls back to ``launchctl managername`` as a heuristic.
-
-    Sibling profile services resolve independently: a fleet can legitimately
-    mix domains (a profile installed over SSH lands in ``user/<uid>`` while
-    the rest live in ``gui/<uid>``), so the current profile's cached domain
-    (``_launchd_domain()``) must never be reused for another label.
+    Returns None when launchctl can't be queried (non-macOS, launchctl missing,
+    or the command errors) so callers can fall back to a domain heuristic.
     """
-    uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
-    gui_domain = f"gui/{uid}"
-    user_domain = f"user/{uid}"
-
-    # 1. Probe gui/<uid> first — in Aqua sessions the service is loaded here.
-    # 2. Then user/<uid> — in Background/SSH sessions this is the working domain.
-    for domain in (gui_domain, user_domain):
-        try:
-            subprocess.run(
-                ["launchctl", "print", f"{domain}/{label}"],
-                check=True,
-                timeout=5,
-                capture_output=True,
-            )
-            return domain
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-            pass
-
-    # 3. Neither domain has the service loaded — use managername as heuristic.
-    #    Aqua → gui/<uid>, anything else (Background, loginwindow) → user/<uid>.
     try:
         result = subprocess.run(
             ["launchctl", "managername"],
@@ -4445,31 +4419,72 @@ def _probe_launchd_domain_for_label(label: str) -> str:
             text=True, encoding='utf-8', errors='replace',
             timeout=5,
         )
-        if "Aqua" in (result.stdout or ""):
-            return gui_domain
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-        pass
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    name = result.stdout.strip()
+    return name or None
 
-    # 4. Default to user/<uid> (matches the pre-probing behavior for
-    #    Background/SSH sessions and is the recommended domain on macOS 26+).
-    return user_domain
+
+def _launchd_job_present_in_domain(domain: str, label: str) -> bool:
+    """True when `label` is loaded in `domain` (per `launchctl print`).
+
+    Used to discover where an existing gateway job actually lives so start/
+    restart target the right domain. A non-zero exit means the service isn't
+    registered in that domain (or the domain itself is unreachable).
+    """
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", f"{domain}/{label}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 
 def _launchd_domain() -> str:
-    """Return the launchd domain that actually manages the gateway service.
+    """Return the launchctl domain that manages this user's LaunchAgents.
 
-    Per-label probing lives in ``_probe_launchd_domain_for_label``; this
-    wrapper resolves the *current* profile's label and caches the result for
-    the lifetime of the process so that repeated calls (``start``, ``stop``,
-    ``restart``) use a consistent domain.
+    macOS LaunchAgents register in different bootstrap domains depending on how
+    the user logged in:
 
-    See #40831, #23387.
+    * GUI login (Aqua session): `gui/<uid>` — this is where the Window Server
+      and Aqua-session agents live. On macOS 26.x, `launchctl bootstrap` of a
+      LaunchAgent into `user/<uid>` fails with exit 5 ("Input/output error")
+      and `kickstart user/<uid>/<label>` returns 113 ("Could not find
+      service"), because the agent is actually loaded in `gui/<uid>`.
+    * Headless / SSH / login-item session (Background): `user/<uid>` is the
+      reachable domain; `gui/<uid>` has no Window Server attached.
+
+    An earlier fix (#23387) hardcoded `user/<uid>` for all macOS 26+ hosts,
+    which is correct only for headless sessions and breaks GUI logins — the
+    common desktop case — by forcing the detached fallback. We instead detect
+    the session type: Aqua → `gui/<uid>`, anything else → `user/<uid>`.
     """
-    global _resolved_launchd_domain
-    if _resolved_launchd_domain is not None:
-        return _resolved_launchd_domain
-    _resolved_launchd_domain = _probe_launchd_domain_for_label(get_launchd_label())
-    return _resolved_launchd_domain
+    uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+    managername = _launchctl_session_managername()
+    if managername == "Aqua":
+        return f"gui/{uid}"
+    return f"user/{uid}"
+
+
+def _launchd_domain_for_existing_job(label: str) -> str:
+    """Return the domain where `label` is currently loaded, else the default.
+
+    Start/restart must target the domain where the job actually lives — probing
+    avoids the exit-113-then-exit-5 cascade that happens when we kickstart the
+    wrong domain and then try to re-bootstrap into it. When no existing job is
+    found, fall back to the session-type default from `_launchd_domain()`.
+    """
+    uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+    for domain in (f"gui/{uid}", f"user/{uid}"):
+        if _launchd_job_present_in_domain(domain, label):
+            return domain
+    return _launchd_domain()
 
 
 # On macOS, exit code 125 ("Domain does not support specified action") and
@@ -4945,6 +4960,7 @@ def refresh_launchd_plist_if_needed() -> bool:
     plist_path.write_text(new_plist, encoding="utf-8")
     label = get_launchd_label()
     domain = _launchd_domain()
+    bootout_target = f"{_launchd_domain_for_existing_job(label)}/{label}"
     target = f"{domain}/{label}"
 
     # If this refresh is running INSIDE the gateway's own launchd process tree
@@ -5012,7 +5028,7 @@ def refresh_launchd_plist_if_needed() -> bool:
         submit_label = f"{label}.reload.{os.getpid()}.{int(time.time())}"
         reload_script = (
             f"sleep 2; "
-            f"launchctl bootout {shlex.quote(target)} 2>/dev/null; "
+            f"launchctl bootout {shlex.quote(bootout_target)} 2>/dev/null; "
             # Wait for the OLD gateway to actually exit before bootstrapping.
             # bootout only sends SIGTERM; the gateway then drains in-flight agent
             # runs (up to agent.restart_drain_timeout), and every bootstrap issued
@@ -5099,7 +5115,7 @@ def refresh_launchd_plist_if_needed() -> bool:
     # registered or the drain window elapses, verify with `launchctl list`,
     # and log exhaustion so the reload watchdog can detect a persistent orphan.
     subprocess.run(
-        ["launchctl", "bootout", target],
+        ["launchctl", "bootout", bootout_target],
         check=False,
         timeout=90,
     )
@@ -5183,7 +5199,7 @@ def launchd_uninstall():
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
     subprocess.run(
-        ["launchctl", "bootout", f"{_launchd_domain()}/{label}"],
+        ["launchctl", "bootout", f"{_launchd_domain_for_existing_job(label)}/{label}"],
         check=False,
         timeout=90,
     )
@@ -5224,21 +5240,27 @@ def launchd_start():
         return
 
     refresh_launchd_plist_if_needed()
+    # Target the domain where the job actually lives (gui/<uid> on a GUI login,
+    # user/<uid> headless) so we don't kickstart the wrong domain and then
+    # cascade into a failing re-bootstrap. See _launchd_domain_for_existing_job.
+    domain = _launchd_domain_for_existing_job(label)
     try:
         subprocess.run(
-            ["launchctl", "kickstart", f"{_launchd_domain()}/{label}"],
+            ["launchctl", "kickstart", f"{domain}/{label}"],
             check=True,
             timeout=30,
         )
     except subprocess.CalledProcessError as e:
         if not _launchd_error_indicates_unloaded(e):
             raise
-        # Job not loaded in this domain — re-bootstrap the plist and retry.
+        # Job not loaded in this domain — re-bootstrap the plist into the
+        # session-appropriate domain and retry.
         print("↻ launchd job was unloaded; reloading service definition")
+        bootstrap_domain = _launchd_domain()
         try:
             _launchctl_bootstrap(_launchd_domain(), plist_path, label, timeout=30)
             subprocess.run(
-                ["launchctl", "kickstart", f"{_launchd_domain()}/{label}"],
+                ["launchctl", "kickstart", f"{bootstrap_domain}/{label}"],
                 check=True,
                 timeout=30,
             )
@@ -5255,7 +5277,9 @@ def launchd_start():
 
 def launchd_stop():
     label = get_launchd_label()
-    target = f"{_launchd_domain()}/{label}"
+    # bootout the job from the domain it's actually loaded in (gui/<uid> on a
+    # GUI login) so KeepAlive doesn't respawn it.
+    target = f"{_launchd_domain_for_existing_job(label)}/{label}"
     try:
         from gateway.status import get_running_pid, write_planned_stop_marker
 
@@ -5375,7 +5399,10 @@ def _wait_for_launchd_service_pid(
 
 def launchd_restart():
     label = get_launchd_label()
-    target = f"{_launchd_domain()}/{label}"
+    # Restart the job in the domain it's actually loaded in (gui/<uid> on a GUI
+    # login) so `kickstart -k` finds it instead of returning 113 and cascading
+    # into a failing re-bootstrap that gets misread as "domain unsupported".
+    target = f"{_launchd_domain_for_existing_job(label)}/{label}"
     drain_timeout = _get_restart_drain_timeout()
     from gateway.status import get_running_pid
 
@@ -5432,9 +5459,11 @@ def launchd_restart():
                 _launchd_fallback_to_detached(f"launchctl kickstart exit {e.returncode}")
                 return
             raise
-        # Job not loaded — bootstrap and start fresh
+        # Job not loaded — bootstrap into the session-appropriate domain and
+        # start fresh.
         print("↻ launchd job was unloaded; reloading")
         plist_path = get_launchd_plist_path()
+        bootstrap_domain = _launchd_domain()
         try:
             # Restart is the one path where the job is almost always still
             # registered (we just drained it), so a plain bootstrap would hit
@@ -5447,11 +5476,15 @@ def launchd_restart():
                 timeout=90,
             )
             subprocess.run(
-                ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
+                ["launchctl", "bootstrap", bootstrap_domain, str(plist_path)],
                 check=True,
                 timeout=30,
             )
-            subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
+            subprocess.run(
+                ["launchctl", "kickstart", f"{bootstrap_domain}/{label}"],
+                check=True,
+                timeout=30,
+            )
         except subprocess.CalledProcessError as e2:
             if not _launchctl_domain_unsupported(e2.returncode):
                 raise
