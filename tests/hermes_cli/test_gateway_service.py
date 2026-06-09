@@ -481,6 +481,11 @@ class TestLaunchdServiceRecovery:
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        domain = f"gui/{os.getuid()}"
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: domain)
+        monkeypatch.setattr(
+            gateway_cli, "_launchd_domain_for_existing_job", lambda label: domain
+        )
 
         calls = []
 
@@ -493,7 +498,6 @@ class TestLaunchdServiceRecovery:
         gateway_cli.launchd_install()
 
         label = gateway_cli.get_launchd_label()
-        domain = gateway_cli._launchd_domain()
         assert "--replace" in plist_path.read_text(encoding="utf-8")
         assert calls[:2] == [
             ["launchctl", "bootout", f"{domain}/{label}"],
@@ -506,7 +510,11 @@ class TestLaunchdServiceRecovery:
         label = gateway_cli.get_launchd_label()
 
         calls = []
-        domain = gateway_cli._launchd_domain()
+        domain = f"gui/{os.getuid()}"
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: domain)
+        monkeypatch.setattr(
+            gateway_cli, "_launchd_domain_for_existing_job", lambda label: domain
+        )
         target = f"{domain}/{label}"
 
         def fake_run(cmd, check=False, **kwargs):
@@ -534,7 +542,11 @@ class TestLaunchdServiceRecovery:
         label = gateway_cli.get_launchd_label()
 
         calls = []
-        domain = gateway_cli._launchd_domain()
+        domain = f"gui/{os.getuid()}"
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: domain)
+        monkeypatch.setattr(
+            gateway_cli, "_launchd_domain_for_existing_job", lambda label: domain
+        )
         target = f"{domain}/{label}"
 
         def fake_run(cmd, check=False, **kwargs):
@@ -557,7 +569,12 @@ class TestLaunchdServiceRecovery:
 
     def test_launchd_restart_drains_running_gateway_before_kickstart(self, monkeypatch):
         calls = []
-        target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
+        domain = f"gui/{os.getuid()}"
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: domain)
+        monkeypatch.setattr(
+            gateway_cli, "_launchd_domain_for_existing_job", lambda label: domain
+        )
+        target = f"{domain}/{gateway_cli.get_launchd_label()}"
 
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
         monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
@@ -584,6 +601,12 @@ class TestLaunchdServiceRecovery:
     def test_launchd_restart_self_requests_graceful_restart_without_kickstart(self, monkeypatch, capsys):
         calls = []
 
+        # Pin the domain helper so computing the restart target doesn't shell
+        # out to launchctl — the assertion below is that no *launchctl* command
+        # runs once the self-restart path is taken.
+        monkeypatch.setattr(
+            gateway_cli, "_launchd_domain_for_existing_job", lambda label: f"gui/{os.getuid()}"
+        )
         monkeypatch.setattr(
             "gateway.status.get_running_pid",
             lambda: 321,
@@ -607,7 +630,10 @@ class TestLaunchdServiceRecovery:
     def test_launchd_stop_uses_bootout_not_kill(self, monkeypatch):
         """launchd_stop must bootout the service so KeepAlive doesn't respawn it."""
         label = gateway_cli.get_launchd_label()
-        domain = gateway_cli._launchd_domain()
+        domain = f"gui/{os.getuid()}"
+        monkeypatch.setattr(
+            gateway_cli, "_launchd_domain_for_existing_job", lambda label: domain
+        )
         target = f"{domain}/{label}"
 
         calls = []
@@ -626,7 +652,10 @@ class TestLaunchdServiceRecovery:
     def test_launchd_stop_tolerates_already_unloaded(self, monkeypatch, capsys):
         """launchd_stop silently handles exit codes 3/113 (job not loaded)."""
         label = gateway_cli.get_launchd_label()
-        domain = gateway_cli._launchd_domain()
+        domain = f"gui/{os.getuid()}"
+        monkeypatch.setattr(
+            gateway_cli, "_launchd_domain_for_existing_job", lambda label: domain
+        )
         target = f"{domain}/{label}"
 
         def fake_run(cmd, check=False, **kwargs):
@@ -679,10 +708,66 @@ class TestLaunchdServiceRecovery:
         assert "stale" in output.lower()
         assert "not loaded" in output.lower()
 
-    def test_launchd_domain_uses_user_domain(self):
-        # The user/<uid> domain (not gui/<uid>) is the one reachable from
-        # non-Aqua/background sessions on macOS 26+ (issue #23387).
+    def test_launchd_domain_uses_gui_for_aqua_session(self, monkeypatch):
+        # An Aqua (GUI login) session manages LaunchAgents in gui/<uid>.
+        monkeypatch.setattr(gateway_cli, "_launchctl_session_managername", lambda: "Aqua")
+        assert gateway_cli._launchd_domain() == f"gui/{os.getuid()}"
+
+    def test_launchd_domain_uses_user_for_background_session(self, monkeypatch):
+        # A headless/SSH (Background) session manages LaunchAgents in user/<uid>.
+        monkeypatch.setattr(
+            gateway_cli, "_launchctl_session_managername", lambda: "Background"
+        )
         assert gateway_cli._launchd_domain() == f"user/{os.getuid()}"
+
+    def test_launchd_domain_uses_user_when_managername_unavailable(self, monkeypatch):
+        # When launchctl can't report the session type, default to user/<uid>.
+        monkeypatch.setattr(gateway_cli, "_launchctl_session_managername", lambda: None)
+        assert gateway_cli._launchd_domain() == f"user/{os.getuid()}"
+
+    def test_launchctl_session_managername_returns_none_on_nonzero(self, monkeypatch):
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="boom"),
+        )
+        assert gateway_cli._launchctl_session_managername() is None
+
+    def test_launchctl_session_managername_parses_stdout(self, monkeypatch):
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(returncode=0, stdout="Aqua\n", stderr=""),
+        )
+        assert gateway_cli._launchctl_session_managername() == "Aqua"
+
+    def test_launchd_domain_for_existing_job_prefers_loaded_domain(self, monkeypatch):
+        # The job is loaded in gui/<uid>; restart/stop must target gui, not the
+        # session default — this is the macOS 26.5 exit-5 regression.
+        uid = os.getuid()
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_job_present_in_domain",
+            lambda domain, label: domain == f"gui/{uid}",
+        )
+        # Even if the session-type default would say user/<uid>:
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: f"user/{uid}")
+        assert (
+            gateway_cli._launchd_domain_for_existing_job("ai.hermes.gateway")
+            == f"gui/{uid}"
+        )
+
+    def test_launchd_domain_for_existing_job_falls_back_to_default(self, monkeypatch):
+        # No existing job anywhere → use the session-type default.
+        uid = os.getuid()
+        monkeypatch.setattr(
+            gateway_cli, "_launchd_job_present_in_domain", lambda domain, label: False
+        )
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: f"user/{uid}")
+        assert (
+            gateway_cli._launchd_domain_for_existing_job("ai.hermes.gateway")
+            == f"user/{uid}"
+        )
 
     def test_launchctl_domain_unsupported_recognizes_macos26_codes(self):
         # Codes that persist after a fresh bootstrap → launchd truly unavailable.
@@ -699,7 +784,11 @@ class TestLaunchdServiceRecovery:
         label = gateway_cli.get_launchd_label()
 
         calls = []
-        domain = gateway_cli._launchd_domain()
+        domain = f"gui/{os.getuid()}"
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: domain)
+        monkeypatch.setattr(
+            gateway_cli, "_launchd_domain_for_existing_job", lambda label: domain
+        )
         target = f"{domain}/{label}"
 
         def fake_run(cmd, check=False, **kwargs):
