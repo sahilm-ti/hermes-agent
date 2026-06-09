@@ -294,6 +294,56 @@ class TestPullOnce(unittest.TestCase):
             _pull_once(Path("/fake"))
 
 
+class TestPullOnceWorkerGuard(unittest.TestCase):
+    """The puller must not move HEAD while a kanban worker is running or the
+    tree is mid-merge — even for a fast-forward."""
+
+    def test_skips_when_kanban_task_running(self):
+        with (
+            patch("gateway.hermes_home_puller._current_branch", return_value="main"),
+            patch(
+                "hermes_cli.fork_tracking.any_kanban_task_running",
+                return_value=True,
+            ),
+            patch("gateway.hermes_home_puller._commits_behind") as mock_behind,
+            patch("gateway.hermes_home_puller._fast_forward") as mock_ff,
+        ):
+            _pull_once(Path("/fake"))
+            # Bailed before fetching or fast-forwarding.
+            mock_behind.assert_not_called()
+            mock_ff.assert_not_called()
+
+    def test_skips_when_mid_merge(self):
+        with (
+            patch("gateway.hermes_home_puller._current_branch", return_value="main"),
+            patch(
+                "hermes_cli.fork_tracking.any_kanban_task_running",
+                return_value=False,
+            ),
+            patch("hermes_cli.fork_tracking.is_mid_operation", return_value=True),
+            patch("gateway.hermes_home_puller._commits_behind") as mock_behind,
+            patch("gateway.hermes_home_puller._fast_forward") as mock_ff,
+        ):
+            _pull_once(Path("/fake"))
+            mock_behind.assert_not_called()
+            mock_ff.assert_not_called()
+
+    def test_proceeds_when_no_worker_and_not_mid_merge(self):
+        with (
+            patch("gateway.hermes_home_puller._current_branch", return_value="main"),
+            patch(
+                "hermes_cli.fork_tracking.any_kanban_task_running",
+                return_value=False,
+            ),
+            patch("hermes_cli.fork_tracking.is_mid_operation", return_value=False),
+            patch("gateway.hermes_home_puller._commits_behind", return_value=2),
+            patch("gateway.hermes_home_puller._is_clean", return_value=True),
+            patch("gateway.hermes_home_puller._fast_forward") as mock_ff,
+        ):
+            _pull_once(Path("/fake"))
+            mock_ff.assert_called_once_with(Path("/fake"))
+
+
 class TestStartHermesHomePuller(unittest.TestCase):
     def test_returns_none_when_disabled_by_env(self):
         with patch.dict("os.environ", {"HERMES_GATEWAY_NO_AUTO_PULL": "1"}):
