@@ -816,7 +816,16 @@ class TestLaunchdServiceRecovery:
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
         label = gateway_cli.get_launchd_label()
-        target = f"{gateway_cli._launchd_domain()}/{label}"
+        # Pin both domain helpers so the kickstart target is deterministic and
+        # does not depend on the `launchctl print` probe (which is unavailable
+        # on CI and would otherwise resolve to a domain that diverges from the
+        # locally computed `target`).
+        domain = f"gui/{os.getuid()}"
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: domain)
+        monkeypatch.setattr(
+            gateway_cli, "_launchd_domain_for_existing_job", lambda label: domain
+        )
+        target = f"{domain}/{label}"
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
         monkeypatch.setattr(gateway_cli, "refresh_launchd_plist_if_needed", lambda: False)
@@ -872,7 +881,14 @@ class TestLaunchdServiceRecovery:
 
     def test_launchd_restart_falls_back_to_detached_on_error_5(self, monkeypatch, capsys):
         """kickstart -k error 5 (domain unmanageable) should relaunch detached."""
-        target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
+        # Pin both domain helpers so the kickstart target is deterministic and
+        # does not depend on the `launchctl print` probe (unavailable on CI).
+        domain = f"gui/{os.getuid()}"
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: domain)
+        monkeypatch.setattr(
+            gateway_cli, "_launchd_domain_for_existing_job", lambda label: domain
+        )
+        target = f"{domain}/{gateway_cli.get_launchd_label()}"
 
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 5.0)
         monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
