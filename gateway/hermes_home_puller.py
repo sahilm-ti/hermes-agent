@@ -205,6 +205,35 @@ def _pull_once(
             )
             return
 
+        # Defense-in-depth: never move HEAD while a kanban worker is running or
+        # the tree is mid-merge/rebase. The puller fires inside a live checkout
+        # that workers operate in; fast-forwarding HEAD out from under a worker
+        # once wiped an in-progress merge commit. A running worker is a hard
+        # skip (no fetch, no wedged-alert) — the dirty-tree wedged path below
+        # only applies to ordinary curator/worker file churn, not an active
+        # branch-moving operation.
+        try:
+            from hermes_cli.fork_tracking import (
+                any_kanban_task_running,
+                is_mid_operation,
+            )
+
+            if any_kanban_task_running():
+                logger.debug(
+                    "hermes-home puller: skipping pull — a kanban task is running"
+                )
+                return
+            if is_mid_operation(hermes_home):
+                logger.debug(
+                    "hermes-home puller: skipping pull — tree is mid-merge/rebase"
+                )
+                return
+        except Exception:
+            logger.debug(
+                "hermes-home puller: worker-running guard unavailable; "
+                "continuing with branch/clean checks"
+            )
+
         behind = _commits_behind(hermes_home)
         if behind == 0:
             logger.debug(
