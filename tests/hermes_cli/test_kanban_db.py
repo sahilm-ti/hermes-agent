@@ -2798,7 +2798,22 @@ def test_cleanup_workspace_deferred_while_child_active(kanban_home):
 
 
 def test_cleanup_workspace_swept_after_last_child_completes(kanban_home):
-    """Once all children are terminal, the deferred parent scratch dir is removed."""
+    """Once all children are terminal, the deferred parent scratch dir is removed.
+
+    Two distinct cleanup paths are exercised here:
+
+    * The parent's deferred scratch dir is reaped *synchronously* by
+      ``_try_cleanup_parent_workspaces`` the moment its last child completes —
+      the completing child is a different process from the parent worker, so
+      rmtree-ing the parent's dir is safe in-process.
+    * A *completing task's own* scratch dir is NOT removed in-process. The
+      fork-#6 synthesis deliberately moved own-dir reaping out of
+      ``complete_task`` because that function runs inside the worker with
+      cwd == the scratch dir; rmtree-ing it inline crashes every subsequent
+      ``os.getcwd()``. The child's own dir is therefore reaped out-of-process
+      by ``gc_scratch_workspaces`` on the dispatcher's GC tick — which is
+      simulated here by calling it directly.
+    """
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent")
         child = kb.create_task(conn, title="child")
@@ -2814,14 +2829,25 @@ def test_cleanup_workspace_swept_after_last_child_completes(kanban_home):
         kb.complete_task(conn, parent, result="ok")
         assert parent_ws.exists(), "deferred while child active"
 
-        # Child completes -> recompute promotes nothing new; the child's
-        # cleanup sweep should now reap the parent's deferred workspace.
+        # Child completes -> the synchronous parent sweep
+        # (_try_cleanup_parent_workspaces) reaps the parent's deferred dir.
         kb.complete_task(conn, child, result="done")
 
-    assert not parent_ws.exists(), (
-        "Parent scratch workspace should be swept once all children are terminal"
+        assert not parent_ws.exists(), (
+            "Parent scratch workspace should be swept once all children are terminal"
+        )
+        # The child's OWN scratch dir is reaped out-of-process by the
+        # dispatcher's GC tick, not in complete_task (worker-cwd-crash safety,
+        # fork #6). The completed child is now done + claim_lock IS NULL, so
+        # gc_scratch_workspaces picks it up.
+        assert child_ws.exists(), (
+            "Child's own scratch dir is reaped async-by-design, not in complete_task"
+        )
+        kb.gc_scratch_workspaces(conn)
+
+    assert not child_ws.exists(), (
+        "Child scratch workspace should be reaped by gc_scratch_workspaces"
     )
-    assert not child_ws.exists(), "Child scratch workspace should be cleaned up too"
 
 
 def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_path):
