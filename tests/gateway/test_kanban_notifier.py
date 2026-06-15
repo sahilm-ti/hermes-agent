@@ -265,7 +265,7 @@ def test_blocked_reason_carries_full_actionable_context(tmp_path, monkeypatch):
     opening the dashboard. Caller-supplied 800-char reason must land in
     the chat message intact.
     """
-    from gateway.run import NOTIFY_BLOCKED_REASON_MAX
+    from gateway.kanban_watchers import NOTIFY_BLOCKED_REASON_MAX
 
     db_path = tmp_path / "blocked-cap.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -299,7 +299,7 @@ def test_blocked_reason_carries_full_actionable_context(tmp_path, monkeypatch):
 
 def test_blocked_reason_is_truncated_at_documented_cap(tmp_path, monkeypatch):
     """A reason longer than the cap is truncated at NOTIFY_BLOCKED_REASON_MAX."""
-    from gateway.run import NOTIFY_BLOCKED_REASON_MAX
+    from gateway.kanban_watchers import NOTIFY_BLOCKED_REASON_MAX
 
     db_path = tmp_path / "blocked-overflow.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -321,7 +321,7 @@ def test_blocked_reason_is_truncated_at_documented_cap(tmp_path, monkeypatch):
 
 def test_done_summary_carries_extended_handoff(tmp_path, monkeypatch):
     """Done summaries support up to NOTIFY_DONE_SUMMARY_MAX chars (first line)."""
-    from gateway.run import NOTIFY_DONE_SUMMARY_MAX
+    from gateway.kanban_watchers import NOTIFY_DONE_SUMMARY_MAX
 
     db_path = tmp_path / "done-cap.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -356,7 +356,7 @@ def test_done_summary_carries_extended_handoff(tmp_path, monkeypatch):
 
 def test_gave_up_error_carries_extended_traceback_snippet(tmp_path, monkeypatch):
     """gave_up errors carry up to NOTIFY_GAVE_UP_ERROR_MAX chars."""
-    from gateway.run import NOTIFY_GAVE_UP_ERROR_MAX
+    from gateway.kanban_watchers import NOTIFY_GAVE_UP_ERROR_MAX
 
     db_path = tmp_path / "gaveup-cap.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -391,7 +391,7 @@ def test_notification_caps_are_ordered_so_blocked_wins(tmp_path, monkeypatch):
     budget to a chatty ``done`` summary. Pin the ordering so future
     tuning can't accidentally invert it.
     """
-    from gateway.run import (
+    from gateway.kanban_watchers import (
         NOTIFY_BLOCKED_REASON_MAX,
         NOTIFY_DONE_RESULT_LEGACY_MAX,
         NOTIFY_DONE_SUMMARY_MAX,
