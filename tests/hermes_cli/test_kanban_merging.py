@@ -420,6 +420,74 @@ class TestRecoverStuckMerging:
             t = kb.get_task(conn, tid)
         assert t.status == "merging"
 
+    def test_alive_merger_past_max_runtime_goes_to_blocked(self, kanban_home):
+        """A merger that is alive AND heartbeating but has run past its
+        per-task max_runtime_seconds is recovered to 'blocked' (not 'ready' —
+        re-queueing risks a double-merge). This closes the runtime-cap gap:
+        enforce_max_runtime is scoped to 'running' and skips 'merging', so the
+        merger's runtime cap is enforced here.
+        """
+        import os
+        import time as _time
+
+        with kb.connect() as conn:
+            tid = self._make_merging_task(conn)
+            host = kb._claimer_id().split(":", 1)[0]
+            now = int(_time.time())
+            # Live PID (this process) + FRESH heartbeat → not dead, not stalled.
+            # Started 100s ago with a 10s cap → over the runtime cap.
+            conn.execute(
+                "UPDATE tasks SET claim_lock = ?, worker_pid = ?, "
+                "last_heartbeat_at = ?, max_runtime_seconds = ?, "
+                "started_at = ? WHERE id = ?",
+                (f"{host}:1", os.getpid(), now, 10, now - 100, tid),
+            )
+            # Also stamp the active run's started_at, since recover_stuck_merging
+            # measures elapsed from COALESCE(run.started_at, task.started_at).
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (now - 100, tid),
+            )
+            conn.commit()
+            recovered = kb.recover_stuck_merging(conn, signal_fn=lambda *a: None)
+            assert tid in recovered
+            t = kb.get_task(conn, tid)
+            events = kb.list_events(conn, tid)
+        assert t.status == "blocked"
+        assert t.claim_lock is None
+        kinds = [e.kind for e in events]
+        assert "merge_failed" in kinds
+        assert "blocked" in kinds
+        blocked = [e for e in events if e.kind == "blocked"]
+        reason = (blocked[-1].payload or {}).get("reason", "")
+        assert "max_runtime_seconds" in reason
+        merge_failed = [e for e in events if e.kind == "merge_failed"]
+        assert (merge_failed[-1].payload or {}).get("runtime_exceeded") is True
+
+    def test_alive_merger_within_max_runtime_untouched(self, kanban_home):
+        """A merger that is alive, heartbeating, and still within its runtime
+        cap is left alone (the runtime trigger must not fire early)."""
+        import os
+        import time as _time
+
+        with kb.connect() as conn:
+            tid = self._make_merging_task(conn)
+            host = kb._claimer_id().split(":", 1)[0]
+            now = int(_time.time())
+            # Started 5s ago with a 3600s cap → well within the runtime cap.
+            conn.execute(
+                "UPDATE tasks SET claim_lock = ?, worker_pid = ?, "
+                "last_heartbeat_at = ?, max_runtime_seconds = ?, "
+                "started_at = ? WHERE id = ?",
+                (f"{host}:1", os.getpid(), now, 3600, now - 5, tid),
+            )
+            conn.commit()
+            recovered = kb.recover_stuck_merging(conn, signal_fn=lambda *a: None)
+            assert tid not in recovered
+            t = kb.get_task(conn, tid)
+        assert t.status == "merging"
+
 
 # ---------------------------------------------------------------------------
 # status enum + dashboard column registration

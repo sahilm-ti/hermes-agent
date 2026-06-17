@@ -114,7 +114,19 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # Statuses in which a worker subprocess is actively claimed and running.
 # ``running`` is the normal worker state; ``merging`` is the post-approve
 # merger worker landing a PR (see claim_merger_task / recover_stuck_merging).
+# Both consume a real spawned subprocess, so both must count against the
+# dispatcher concurrency caps (max_spawn / max_in_progress / per-profile) —
+# otherwise live mergers are invisible and the dispatcher over-spawns on top
+# of them. Use ``_WORKER_ACTIVE_STATUS_SQL`` to splice the membership test
+# into a WHERE clause from a single source of truth.
 WORKER_ACTIVE_STATUSES = ("running", "merging")
+# Pre-rendered ``status IN ('running', 'merging')`` fragment for SQL counters.
+# Literal (not a bound param) because status names are a fixed internal enum,
+# never user input; this keeps the COUNT(*) queries terse without juggling a
+# variable-length placeholder tuple per call site.
+_WORKER_ACTIVE_STATUS_SQL = "status IN (" + ", ".join(
+    f"'{_s}'" for _s in WORKER_ACTIVE_STATUSES
+) + ")"
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 # Keyword fragments in a task's title/body that strongly suggest the worker
@@ -6902,6 +6914,11 @@ def enforce_max_runtime(
     Runs host-local: only tasks claimed by this host are candidates
     (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
     test hook; defaults to ``os.kill`` on POSIX.
+
+    Intentionally scoped to ``status = 'running'``. The post-approve merger
+    runs in ``merging`` and needs a different recovery destination (``blocked``,
+    never ``ready`` — re-queueing a half-finished merge risks a double-merge),
+    so its runtime cap lives in :func:`recover_stuck_merging` rather than here.
     """
     import signal
 
@@ -7484,7 +7501,12 @@ def recover_stuck_merging(
 
     * **Dead** — ``worker_pid`` is set but no longer alive, OR
     * **Stalled** — ``last_heartbeat_at`` is older than ``stale_after_seconds``
-      (or NULL with the claim TTL expired).
+      (or NULL with the claim TTL expired), OR
+    * **Over its runtime cap** — alive and heartbeating but elapsed time has
+      passed the task's ``max_runtime_seconds``. ``enforce_max_runtime`` skips
+      ``merging`` (it would send the card to ``ready`` and risk a double-merge),
+      so the merger's runtime cap is enforced here with the correct ``blocked``
+      destination.
 
     On recovery the card is transitioned ``merging -> blocked`` with a clear,
     board-visible reason. ``blocked`` (not ``ready``) is the deliberate
@@ -7503,8 +7525,10 @@ def recover_stuck_merging(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.claim_lock, t.claim_expires, "
-        "       t.last_heartbeat_at "
+        "       t.last_heartbeat_at, t.max_runtime_seconds, "
+        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'merging'"
     ).fetchall()
 
@@ -7528,7 +7552,23 @@ def recover_stuck_merging(
             expires = row["claim_expires"]
             heartbeat_stalled = expires is not None and int(expires) < now
 
-        if not (pid_dead or pid_absent or heartbeat_stalled):
+        # Runtime cap: a merger that is alive AND heartbeating but wedged past
+        # its per-task max_runtime_seconds would otherwise escape both this
+        # reaper (it's healthy) and enforce_max_runtime (scoped to 'running').
+        # Catch it here so the runtime cap covers mergers too, routing to
+        # 'blocked' (never 'ready') to avoid a double-merge — same destination
+        # as every other recovery path in this function.
+        max_runtime = row["max_runtime_seconds"]
+        started = row["active_started_at"]
+        runtime_exceeded = (
+            max_runtime is not None
+            and started is not None
+            and (now - int(started)) >= int(max_runtime)
+        )
+
+        if not (
+            pid_dead or pid_absent or heartbeat_stalled or runtime_exceeded
+        ):
             continue  # merger is healthy / still within its grace window
 
         tid = row["id"]
@@ -7541,12 +7581,21 @@ def recover_stuck_merging(
 
         if pid_dead or pid_absent:
             why = "merger worker process is no longer alive"
-        else:
+        elif heartbeat_stalled:
             hb_age = (now - int(hb)) if hb is not None else None
             why = (
                 f"merger worker silent for {hb_age}s"
                 if hb_age is not None
                 else "merger worker never heartbeated and its claim expired"
+            )
+        else:
+            # runtime_exceeded — alive and heartbeating, but wedged past the cap
+            elapsed = now - int(started) if started is not None else None
+            why = (
+                f"merger worker exceeded max_runtime_seconds "
+                f"(elapsed {elapsed}s > limit {int(max_runtime)}s)"
+                if elapsed is not None and max_runtime is not None
+                else "merger worker exceeded its max runtime"
             )
         reason = (
             f"merger died/stalled in merging — {why}. "
@@ -7558,6 +7607,7 @@ def recover_stuck_merging(
             "pid_dead": bool(pid_dead),
             "pid_absent": bool(pid_absent),
             "heartbeat_stalled": bool(heartbeat_stalled),
+            "runtime_exceeded": bool(runtime_exceeded),
             "last_heartbeat_at": (int(hb) if hb is not None else None),
         }
         payload.update(termination)
@@ -8725,7 +8775,7 @@ def dispatch_once(
     if max_spawn is not None:
         running_count = int(
             conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                f"SELECT COUNT(*) FROM tasks WHERE {_WORKER_ACTIVE_STATUS_SQL}"
             ).fetchone()[0]
         )
 
@@ -8740,7 +8790,7 @@ def dispatch_once(
     # pile up and time out.
     if max_in_progress is not None and ready_rows:
         in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+            f"SELECT COUNT(*) FROM tasks WHERE {_WORKER_ACTIVE_STATUS_SQL}"
         ).fetchone()[0]
         if in_progress >= max_in_progress:
             return result
@@ -8765,7 +8815,7 @@ def dispatch_once(
     if _per_profile_cap is not None:
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
+            f"WHERE {_WORKER_ACTIVE_STATUS_SQL} AND assignee IS NOT NULL "
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
