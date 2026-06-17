@@ -1103,7 +1103,9 @@ def _handle_approve(args: dict, **kw) -> str:
         return tool_error("task_id is required")
     reason = args.get("reason")
     board = args.get("board")
-    skip_merge = bool(args.get("skip_merge", False))
+    skip_merge, bool_error = _parse_bool_arg(args, "skip_merge")
+    if bool_error:
+        return tool_error(bool_error)
     try:
         kb, conn = _connect(board=board)
         try:

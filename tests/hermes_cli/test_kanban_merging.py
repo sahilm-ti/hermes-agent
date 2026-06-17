@@ -643,3 +643,114 @@ class TestMergingHeartbeat:
         assert t.status == "blocked"
         blocked = [e for e in events if e.kind == "blocked"]
         assert "merger died/stalled" in (blocked[-1].payload or {}).get("reason", "")
+
+
+# ---------------------------------------------------------------------------
+# Tool-layer skip_merge arg parsing (tools/kanban_tools.py _handle_approve)
+#
+# The tool surface receives `skip_merge` from the model as a JSON value.  The
+# schema declares it `type: boolean`, but every other boolean arg in
+# kanban_tools.py is run through `_parse_bool_arg` (which coerces the string
+# forms "true"/"false"/"1"/"0"/"yes"/"no" and rejects garbage with a structured
+# error) — schema type alone is not treated as a sufficient handler-layer guard.
+# `skip_merge` must follow the same convention: a stray "false" string must NOT
+# silently skip the merger on the irreversible approve path.
+# ---------------------------------------------------------------------------
+
+
+class TestApproveSkipMergeArgParsing:
+    def test_skip_merge_string_false_does_not_skip(self, kanban_home, monkeypatch):
+        """`{"skip_merge": "false"}` must route to `merging` (NOT skip the
+        merger). A naive `bool("false")` is truthy and would wrongly skip."""
+        from tools import kanban_tools as kt
+
+        # Don't actually fork a merger subprocess.
+        monkeypatch.setattr(kb, "_default_spawn", lambda *a, **k: None)
+        monkeypatch.setattr(kb, "resolve_workspace", lambda *a, **k: "/tmp/x")
+        monkeypatch.setattr(kb, "set_workspace_path", lambda *a, **k: None)
+
+        with kb.connect() as conn:
+            tid = _make_human_review_task(conn)
+
+        out = kt._handle_approve({"task_id": tid, "skip_merge": "false"})
+        d = json.loads(out)
+        assert "error" not in d, d
+        assert d["status"] == "merge_triggered"
+        assert d["card_status"] == "merging"
+
+        with kb.connect() as conn:
+            task = kb.get_task(conn, tid)
+            assert task is not None
+            assert task.status == "merging"
+            assert task.skip_merge is False
+
+    def test_skip_merge_string_true_skips(self, kanban_home, monkeypatch):
+        """`{"skip_merge": "true"}` must skip the merger → straight to done."""
+        from tools import kanban_tools as kt
+
+        spawned = []
+        monkeypatch.setattr(
+            kb, "_default_spawn", lambda *a, **k: spawned.append(a)
+        )
+
+        with kb.connect() as conn:
+            tid = _make_human_review_task(conn)
+
+        out = kt._handle_approve({"task_id": tid, "skip_merge": "true"})
+        d = json.loads(out)
+        assert "error" not in d, d
+        assert d["status"] == "done"
+        assert spawned == []  # no merger spawned
+
+        with kb.connect() as conn:
+            task = kb.get_task(conn, tid)
+            assert task is not None
+            assert task.status == "done"
+
+    def test_skip_merge_malformed_returns_structured_error(
+        self, kanban_home, monkeypatch
+    ):
+        """A non-boolean `skip_merge` returns a structured tool_error and leaves
+        the task untouched in human_review (no approve, no merger)."""
+        from tools import kanban_tools as kt
+
+        spawned = []
+        monkeypatch.setattr(
+            kb, "_default_spawn", lambda *a, **k: spawned.append(a)
+        )
+
+        with kb.connect() as conn:
+            tid = _make_human_review_task(conn)
+
+        out = kt._handle_approve({"task_id": tid, "skip_merge": "maybe"})
+        d = json.loads(out)
+        assert "error" in d
+        assert "skip_merge" in d["error"]
+        assert spawned == []
+
+        with kb.connect() as conn:
+            task = kb.get_task(conn, tid)
+            assert task is not None
+            assert task.status == "human_review"
+
+    def test_skip_merge_omitted_defaults_to_merging(self, kanban_home, monkeypatch):
+        """Omitting `skip_merge` preserves the default merging-with-visibility
+        path (parity with the no-arg/CLI behavior)."""
+        from tools import kanban_tools as kt
+
+        monkeypatch.setattr(kb, "_default_spawn", lambda *a, **k: None)
+        monkeypatch.setattr(kb, "resolve_workspace", lambda *a, **k: "/tmp/x")
+        monkeypatch.setattr(kb, "set_workspace_path", lambda *a, **k: None)
+
+        with kb.connect() as conn:
+            tid = _make_human_review_task(conn)
+
+        out = kt._handle_approve({"task_id": tid})
+        d = json.loads(out)
+        assert "error" not in d, d
+        assert d["card_status"] == "merging"
+
+        with kb.connect() as conn:
+            task = kb.get_task(conn, tid)
+            assert task is not None
+            assert task.status == "merging"
