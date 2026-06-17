@@ -2,10 +2,13 @@
 
 Covers:
 - ``_extract_pr_url``: event path, comment path, no-URL path
-- ``claim_merger_task``: human_review → running transition, merge_requested event
+- ``claim_merger_task``: human_review → merging transition, merge_requested event
 - ``approve_task`` routing:
-  - PR URL present → merge_triggered, task running
+  - PR URL present, skip_merge unset → merge_triggered, task in ``merging``
+  - PR URL present, skip_merge set → done, NO merger
   - No PR URL → done (backwards-compat path)
+- ``merging`` landing: complete_task (→ done) and block_task (→ blocked)
+- ``recover_stuck_merging``: dead/stalled merger → blocked, healthy → untouched
 """
 
 from __future__ import annotations
@@ -105,15 +108,15 @@ class TestExtractPrUrl:
 # ---------------------------------------------------------------------------
 
 class TestClaimMergerTask:
-    def test_human_review_to_running(self, kanban_home):
-        """claim_merger_task transitions human_review → running."""
+    def test_human_review_to_merging(self, kanban_home):
+        """claim_merger_task transitions human_review → merging."""
         with kb.connect() as conn:
             tid = _make_human_review_task(conn)
             task = kb.claim_merger_task(
                 conn, tid, pr_url="https://github.com/org/repo/pull/10"
             )
         assert task is not None
-        assert task.status == "running"
+        assert task.status == "merging"
 
     def test_appends_merge_requested_event(self, kanban_home):
         """A merge_requested event is appended carrying the pr_url."""
@@ -178,7 +181,7 @@ class TestApproveTaskRouting:
         assert outcome == "merge_triggered"
         assert pr_url == "https://github.com/owner/repo/pull/42"
         assert task is not None
-        assert task.status == "running"
+        assert task.status == "merging"
 
     def test_routes_to_done_when_no_pr_url(self, kanban_home):
         """When no PR URL is found, approve_task routes to done (backwards-compat)."""
@@ -240,3 +243,199 @@ class TestApproveTaskRouting:
             # Second call — task is already done.
             ok2, _, __, ___ = kb.approve_task(conn, tid)
             assert not ok2
+
+
+# ---------------------------------------------------------------------------
+# skip_merge flag (opt-out)
+# ---------------------------------------------------------------------------
+
+class TestSkipMerge:
+    def test_skip_merge_pr_card_goes_straight_to_done(self, kanban_home):
+        """skip_merge set + PR present → done directly, NO merger claim."""
+        with kb.connect() as conn:
+            tid = _make_human_review_task(conn)
+            assert kb.set_skip_merge(conn, tid, value=True) is True
+            ok, outcome, pr_url, task = kb.approve_task(conn, tid)
+        assert ok
+        assert outcome == "done"
+        # No merger task returned, no PR routing.
+        assert task is None
+        assert pr_url is None
+        with kb.connect() as conn:
+            t = kb.get_task(conn, tid)
+        assert t is not None
+        assert t.status == "done"
+        assert t.completed_at is not None
+
+    def test_skip_merge_spawns_no_merge_requested_event(self, kanban_home):
+        """skip_merge path emits NO merge_requested event (no merger)."""
+        with kb.connect() as conn:
+            tid = _make_human_review_task(conn)
+            kb.set_skip_merge(conn, tid, value=True)
+            kb.approve_task(conn, tid)
+            events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert "merge_requested" not in kinds
+        assert "approved" in kinds
+
+    def test_skip_merge_records_audit_on_approved_event(self, kanban_home):
+        """The approved event records skip_merge + pr_url for audit."""
+        with kb.connect() as conn:
+            tid = _make_human_review_task(conn)
+            kb.set_skip_merge(conn, tid, value=True)
+            kb.approve_task(conn, tid, reason="land manually")
+            events = kb.list_events(conn, tid)
+        approved = [e for e in events if e.kind == "approved"]
+        assert approved
+        payload = approved[-1].payload or {}
+        assert payload.get("skip_merge") is True
+        assert "github.com" in (payload.get("pr_url") or "")
+
+    def test_skip_merge_unset_still_routes_to_merging(self, kanban_home):
+        """Default (flag unset) preserves the merging-with-visibility path."""
+        with kb.connect() as conn:
+            tid = _make_human_review_task(conn)
+            ok, outcome, pr_url, task = kb.approve_task(conn, tid)
+        assert ok
+        assert outcome == "merge_triggered"
+        assert task is not None
+        assert task.status == "merging"
+
+    def test_set_skip_merge_persists_and_hydrates(self, kanban_home):
+        """set_skip_merge persists to the column and hydrates on get_task."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="x", assignee="worker")
+            assert kb.get_task(conn, tid).skip_merge is False
+            kb.set_skip_merge(conn, tid, value=True)
+            assert kb.get_task(conn, tid).skip_merge is True
+            kb.set_skip_merge(conn, tid, value=False)
+            assert kb.get_task(conn, tid).skip_merge is False
+
+
+# ---------------------------------------------------------------------------
+# merging → done / merging → blocked landing transitions
+# ---------------------------------------------------------------------------
+
+class TestMergingLanding:
+    def _make_merging_task(self, conn):
+        tid = _make_human_review_task(conn)
+        task = kb.claim_merger_task(
+            conn, tid, pr_url="https://github.com/org/repo/pull/10"
+        )
+        assert task is not None and task.status == "merging"
+        return tid
+
+    def test_merging_to_done_via_complete(self, kanban_home):
+        """The merger lands a successful merge: merging → done."""
+        with kb.connect() as conn:
+            tid = self._make_merging_task(conn)
+            ok = kb.complete_task(conn, tid, summary="merged PR #10")
+            assert ok
+            t = kb.get_task(conn, tid)
+        assert t.status == "done"
+        assert t.completed_at is not None
+
+    def test_merging_to_blocked_via_block(self, kanban_home):
+        """The merger hits a genuine blocker: merging → blocked with reason."""
+        reason = "merge conflict in foo.py — cannot auto-resolve"
+        with kb.connect() as conn:
+            tid = self._make_merging_task(conn)
+            ok = kb.block_task(conn, tid, reason=reason)
+            assert ok
+            t = kb.get_task(conn, tid)
+            events = kb.list_events(conn, tid)
+        assert t.status == "blocked"
+        blocked = [e for e in events if e.kind == "blocked"]
+        assert blocked
+        assert (blocked[-1].payload or {}).get("reason") == reason
+
+
+# ---------------------------------------------------------------------------
+# recover_stuck_merging reaper (the safety net)
+# ---------------------------------------------------------------------------
+
+class TestRecoverStuckMerging:
+    def _make_merging_task(self, conn):
+        tid = _make_human_review_task(conn)
+        task = kb.claim_merger_task(
+            conn, tid, pr_url="https://github.com/org/repo/pull/10"
+        )
+        assert task is not None and task.status == "merging"
+        return tid
+
+    def test_dead_pid_merging_task_goes_to_blocked(self, kanban_home):
+        """A merging task whose merger PID is dead → blocked with a reason."""
+        with kb.connect() as conn:
+            tid = self._make_merging_task(conn)
+            # Stamp a host-local claim + a definitely-dead PID.
+            host = kb._claimer_id().split(":", 1)[0]
+            conn.execute(
+                "UPDATE tasks SET claim_lock = ?, worker_pid = ? WHERE id = ?",
+                (f"{host}:999999", 2147483646, tid),
+            )
+            conn.commit()
+            recovered = kb.recover_stuck_merging(conn, signal_fn=lambda *a: None)
+            assert tid in recovered
+            t = kb.get_task(conn, tid)
+            events = kb.list_events(conn, tid)
+        assert t.status == "blocked"
+        assert t.claim_lock is None
+        kinds = [e.kind for e in events]
+        assert "merge_failed" in kinds
+        assert "blocked" in kinds
+        blocked = [e for e in events if e.kind == "blocked"]
+        assert "merger died/stalled" in (blocked[-1].payload or {}).get("reason", "")
+
+    def test_healthy_heartbeating_merging_task_untouched(self, kanban_home):
+        """A merging task with a live PID + fresh heartbeat is left alone."""
+        import os
+        import time as _time
+
+        with kb.connect() as conn:
+            tid = self._make_merging_task(conn)
+            host = kb._claimer_id().split(":", 1)[0]
+            # Live PID (this test process) + a fresh heartbeat.
+            conn.execute(
+                "UPDATE tasks SET claim_lock = ?, worker_pid = ?, "
+                "last_heartbeat_at = ? WHERE id = ?",
+                (f"{host}:1", os.getpid(), int(_time.time()), tid),
+            )
+            conn.commit()
+            recovered = kb.recover_stuck_merging(conn, signal_fn=lambda *a: None)
+            assert tid not in recovered
+            t = kb.get_task(conn, tid)
+        assert t.status == "merging"
+
+    def test_other_host_merging_task_ignored(self, kanban_home):
+        """A merging task claimed by another host is not recovered locally."""
+        with kb.connect() as conn:
+            tid = self._make_merging_task(conn)
+            conn.execute(
+                "UPDATE tasks SET claim_lock = ?, worker_pid = ? WHERE id = ?",
+                ("other-host:123", 2147483646, tid),
+            )
+            conn.commit()
+            recovered = kb.recover_stuck_merging(conn, signal_fn=lambda *a: None)
+            assert tid not in recovered
+            t = kb.get_task(conn, tid)
+        assert t.status == "merging"
+
+
+# ---------------------------------------------------------------------------
+# status enum + dashboard column registration
+# ---------------------------------------------------------------------------
+
+class TestMergingStatusRegistration:
+    def test_merging_in_valid_statuses(self, kanban_home):
+        assert "merging" in kb.VALID_STATUSES
+
+    def test_merging_in_worker_active_statuses(self, kanban_home):
+        assert "merging" in kb.WORKER_ACTIVE_STATUSES
+
+    def test_merging_in_board_columns_between_human_review_and_done(self):
+        from plugins.kanban.dashboard import plugin_api
+
+        cols = plugin_api.BOARD_COLUMNS
+        assert "merging" in cols
+        assert cols.index("human_review") < cols.index("merging") < cols.index("done")
+

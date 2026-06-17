@@ -632,6 +632,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--reason", default=None,
         help="Optional approval note (audit-only)",
     )
+    p_approve.add_argument(
+        "--skip-merge", action="store_true", dest="skip_merge",
+        help=(
+            "Approve straight to done WITHOUT spawning the post-approve "
+            "merger, even if a PR URL is present in the thread"
+        ),
+    )
 
     p_reject = sub.add_parser(
         "reject",
@@ -2152,12 +2159,18 @@ def _cmd_approve(args: argparse.Namespace) -> int:
     author = _profile_author()
     tid = args.task_id
     board = getattr(args, "board", None) or None
+    skip_merge = bool(getattr(args, "skip_merge", False))
     with kb.connect(board=board) as conn:
+        if skip_merge:
+            # Set the opt-out flag BEFORE routing so approve_task sees it and
+            # goes straight to done without spawning a merger.
+            kb.set_skip_merge(conn, tid, value=True)
         if reason:
             kb.add_comment(conn, tid, author, f"APPROVED: {reason}")
         ok, outcome, pr_url, task = kb.approve_task(conn, tid, reason=reason)
         if ok and outcome == "merge_triggered" and task is not None:
-            # Spawn the merger worker inline (same as the tool handler path).
+            # Spawn the merger worker inline (runs while the card is in the
+            # 'merging' status — see claim_merger_task).
             try:
                 workspace = kb.resolve_workspace(task, board=board)
                 kb.set_workspace_path(conn, task.id, str(workspace))
@@ -2185,8 +2198,13 @@ def _cmd_approve(args: argparse.Namespace) -> int:
         return 1
     if outcome == "merge_triggered":
         print(
-            f"Approved {tid}: merger spawned for PR {pr_url}"
+            f"Approved {tid}: merging — merger spawned for PR {pr_url}"
             + (f" — {reason}" if reason else "")
+        )
+    elif skip_merge:
+        print(
+            f"Approved {tid} → done (skip-merge: no merger spawned)"
+            + (f": {reason}" if reason else "")
         )
     else:
         print(f"Approved {tid}" + (f": {reason}" if reason else ""))

@@ -106,10 +106,15 @@ VALID_STATUSES = {
     "blocked",
     "review",
     "human_review",
+    "merging",
     "done",
     "archived",
 }
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+# Statuses in which a worker subprocess is actively claimed and running.
+# ``running`` is the normal worker state; ``merging`` is the post-approve
+# merger worker landing a PR (see claim_merger_task / recover_stuck_merging).
+WORKER_ACTIVE_STATUSES = ("running", "merging")
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 # Keyword fragments in a task's title/body that strongly suggest the worker
@@ -942,6 +947,10 @@ class Task:
     # Use this on investigate+fix+test+PR cards where 150–250 iterations are
     # needed; leave NULL for focused single-deliverable cards.
     max_iterations: Optional[int] = None
+    # When True, approving this card in human_review goes straight to ``done``
+    # WITHOUT spawning the post-approve merger, even if a PR URL is present in
+    # the thread. The explicit opt-out of the merging-with-visibility flow.
+    skip_merge: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1031,6 +1040,9 @@ class Task:
             ),
             max_iterations=(
                 row["max_iterations"] if "max_iterations" in keys else None
+            ),
+            skip_merge=(
+                bool(row["skip_merge"]) if "skip_merge" in keys else False
             ),
         )
 
@@ -1218,7 +1230,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- associated PR (regime-B completion audit). The dispatcher picks up tasks
     -- with this column non-NULL and spawns an sdlc-completion-audit agent.
     -- Cleared (set to NULL) after the audit agent is spawned.
-    completion_audit_at  INTEGER
+    completion_audit_at  INTEGER,
+    -- When 1 (true), approving this card in human_review goes straight to
+    -- ``done`` WITHOUT spawning the post-approve merger, even if a PR URL is
+    -- present in the thread.  The explicit opt-out of the merging-with-
+    -- visibility flow (default 0 = merge with the visible ``merging`` state).
+    skip_merge           INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1926,6 +1943,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tasks_completion_audit "
             "ON tasks(completion_audit_at) WHERE completion_audit_at IS NOT NULL"
+        )
+
+    if "skip_merge" not in cols:
+        # Per-card opt-out of the post-approve merger. Defaults to 0 (false)
+        # for all existing rows so approving a PR-carrying card still routes
+        # through the merging-with-visibility flow until explicitly set.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "skip_merge",
+            "skip_merge INTEGER NOT NULL DEFAULT 0",
         )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -4144,7 +4172,7 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'merging')
                 """,
                 (result, now, task_id),
             )
@@ -4159,7 +4187,7 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'merging')
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
@@ -4855,7 +4883,13 @@ def block_task(
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running -> blocked``."""
+    """Transition ``running|merging -> blocked``.
+
+    Covers the normal worker case (``running``) and the post-approve merger
+    case (``merging``) — when the merger genuinely cannot land the PR (e.g.
+    unresolvable merge conflict) it calls ``kanban_block`` and the card lands
+    in ``blocked`` with the reason carried through to the board.
+    """
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -4866,7 +4900,7 @@ def block_task(
                        claim_expires= NULL,
                        worker_pid   = NULL
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'merging')
                 """,
                 (task_id,),
             )
@@ -4879,7 +4913,7 @@ def block_task(
                        claim_expires= NULL,
                        worker_pid   = NULL
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'merging')
                    AND current_run_id = ?
                 """,
                 (task_id, int(expected_run_id)),
@@ -5241,10 +5275,12 @@ def claim_merger_task(
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
 ) -> Optional["Task"]:
-    """Atomically transition ``human_review -> running`` for the merger agent.
+    """Atomically transition ``human_review -> merging`` for the merger agent.
 
-    Analogous to ``claim_review_task`` but sourced from ``human_review``.
-    Appends a ``merge_requested`` event carrying the ``pr_url``.
+    Analogous to ``claim_review_task`` but sourced from ``human_review`` and
+    landing the task in the dedicated ``merging`` status (NOT ``running``) so
+    the board surfaces an explicit "the merger is merging / figuring it out"
+    state. Appends a ``merge_requested`` event carrying the ``pr_url``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was already
     claimed or is not in ``human_review`` status.
@@ -5256,7 +5292,7 @@ def claim_merger_task(
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status        = 'running',
+               SET status        = 'merging',
                    claim_lock    = ?,
                    claim_expires = ?,
                    started_at    = COALESCE(started_at, ?)
@@ -5318,6 +5354,34 @@ def claim_merger_task(
         return get_task(conn, task_id)
 
 
+def set_skip_merge(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    value: bool = True,
+) -> bool:
+    """Set (or clear) the per-card ``skip_merge`` opt-out flag.
+
+    When set, approving this card in ``human_review`` goes straight to
+    ``done`` with NO post-approve merger spawned, even if a PR URL is present
+    in the thread. Returns ``True`` if a row was updated, ``False`` if the
+    task does not exist.
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET skip_merge = ? WHERE id = ?",
+            (1 if value else 0, task_id),
+        )
+        if cur.rowcount == 1:
+            _append_event(
+                conn,
+                task_id,
+                "skip_merge_set",
+                {"skip_merge": bool(value)},
+            )
+    return cur.rowcount == 1
+
+
 def approve_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5327,30 +5391,39 @@ def approve_task(
 ) -> "tuple[bool, str, Optional[str], Optional[Task]]":
     # @design-guard
     # INVARIANT: approve_task() is the ONLY function that transitions
-    # human_review → done (no-PR path) or human_review → running (PR path).
+    # human_review → done (no-PR path, or skip_merge set) or
+    # human_review → merging (PR path, skip_merge unset).
     # No code path may move a task OUT of human_review except:
-    #   approve_task() (→ done or → running-for-merger) or reject_task() (→ ready).
+    #   approve_task() (→ done or → merging-for-merger) or reject_task() (→ ready).
     #
     # INVARIANT: _extract_pr_url() is called inside approve_task() before any
-    # status mutation. If it returns a URL, approve_task() MUST delegate to
-    # claim_merger_task() and return ("merge_triggered", pr_url, task).
+    # status mutation. If it returns a URL AND the card's skip_merge flag is
+    # unset, approve_task() MUST delegate to claim_merger_task() (which moves
+    # the card to ``merging``) and return ("merge_triggered", pr_url, task).
     # It must NOT go directly to done in that case.
     #
-    # INVARIANT: If _extract_pr_url() returns None, approve_task() transitions
-    # directly to done (backwards-compat path, identical to pre-merger code)
-    # and returns ("done", None, None).
+    # INVARIANT: If _extract_pr_url() returns None, OR the card's skip_merge
+    # flag is set, approve_task() transitions directly to done (the no-PR
+    # backwards-compat path / the explicit approve-without-merging escape
+    # hatch) and returns ("done", None, None). No merger is spawned.
     """Route ``human_review`` task toward done via the correct path.
 
     **No-PR path** (backwards-compat):
       ``human_review → done`` — identical to the pre-merger behavior.
       Returns ``(True, "done", None, None)``.
 
-    **PR path** (new):
+    **skip_merge path** (explicit opt-out):
+      When the card's ``skip_merge`` flag is set, ``human_review → done``
+      directly even if a PR URL is present — NO merger worker is spawned.
+      Returns ``(True, "done", None, None)``.
+
+    **PR path** (merging-with-visibility, the default for PR cards):
       Detects a GitHub PR URL in the task's event/comment history, then
       delegates to ``claim_merger_task()`` which transitions
-      ``human_review → running`` and appends a ``merge_requested`` event.
+      ``human_review → merging`` and appends a ``merge_requested`` event.
       The caller is responsible for spawning the ``post-approve-merger``
-      worker against the returned ``Task``.
+      worker against the returned ``Task`` (which runs while the card is in
+      ``merging``).
       Returns ``(True, "merge_triggered", pr_url, task)``.
 
     Returns ``(False, "not_found", None, None)`` when the task is not in
@@ -5362,8 +5435,14 @@ def approve_task(
     # transition (race condition) doesn't leave orphan events.
     pr_url = _extract_pr_url(conn, task_id)
 
-    if pr_url is not None:
-        # PR path: claim for the merger agent.
+    # Read the per-card skip_merge opt-out. When set, a PR-carrying card is
+    # approved straight to ``done`` with NO merger spawned (explicit escape
+    # hatch from the merging-with-visibility flow).
+    task_row = get_task(conn, task_id)
+    skip_merge = bool(task_row.skip_merge) if task_row is not None else False
+
+    if pr_url is not None and not skip_merge:
+        # PR path: claim for the merger agent (human_review -> merging).
         task = claim_merger_task(
             conn,
             task_id,
@@ -5374,7 +5453,9 @@ def approve_task(
             return _FAIL
         return (True, "merge_triggered", pr_url, task)
 
-    # No-PR path: transition directly to done (original behavior).
+    # No-PR path OR skip_merge set: transition directly to done. When a PR is
+    # present but skip_merge is set, this is the deliberate approve-without-
+    # merging escape hatch — no merger worker is spawned.
     now = int(time.time())
     with write_txn(conn):
         cur = conn.execute(
@@ -5402,7 +5483,15 @@ def approve_task(
             conn,
             task_id,
             "approved",
-            {"reason": reason} if reason else None,
+            (
+                {
+                    "reason": reason,
+                    "skip_merge": True,
+                    "pr_url": pr_url,
+                }
+                if skip_merge and pr_url is not None
+                else ({"reason": reason} if reason else None)
+            ),
             run_id=run_id,
         )
     _clear_failure_counter(conn, task_id)
@@ -6479,6 +6568,11 @@ class DispatchResult:
     (heartbeated at least once, then went silent past the configured
     ``stuck_after_seconds`` window).  The workers are killed and the tasks
     re-queued as ``ready`` without incrementing ``consecutive_failures``."""
+    recovered_merging: list[str] = field(default_factory=list)
+    """Task ids recovered from a stalled/dead post-approve merger. The merger
+    runs in the dedicated ``merging`` status; when its worker dies or goes
+    silent these are bounced to ``blocked`` (not ``ready``) by
+    ``recover_stuck_merging`` so a human can re-approve or merge manually."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
@@ -7369,6 +7463,143 @@ def detect_stale_running(
         # spawn_failed / timed_out / crashed counters.
 
     return reclaimed
+
+
+def recover_stuck_merging(
+    conn: sqlite3.Connection,
+    *,
+    stale_after_seconds: int = _STALE_HEARTBEAT_GAP_SECONDS,
+    signal_fn=None,
+) -> list[str]:
+    """Recover ``merging`` tasks whose merger worker died or stalled.
+
+    The post-approve merger runs in the dedicated ``merging`` status (see
+    :func:`claim_merger_task`), which the ``running``-scoped reapers
+    (``release_stale_claims``, ``detect_stale_running``,
+    ``detect_crashed_workers``, ``detect_stuck_workers``) intentionally do
+    NOT touch. This dedicated reaper is the safety net so a ``merging`` card
+    can never silently stall forever when its worker dies.
+
+    A ``merging`` task is recovered when its host-local worker is either:
+
+    * **Dead** — ``worker_pid`` is set but no longer alive, OR
+    * **Stalled** — ``last_heartbeat_at`` is older than ``stale_after_seconds``
+      (or NULL with the claim TTL expired).
+
+    On recovery the card is transitioned ``merging -> blocked`` with a clear,
+    board-visible reason. ``blocked`` (not ``ready``) is the deliberate
+    destination: a half-finished merge needs a human to re-approve or land the
+    PR manually — silently re-queueing risks a double-merge. The active run is
+    closed with ``outcome='merge_failed'`` and a ``merge_failed`` event is
+    emitted for auditability.
+
+    Only acts on tasks claimed by *this host* (PIDs from other hosts are
+    meaningless here). Returns the list of recovered task IDs. ``signal_fn``
+    is a test hook for the worker-termination path.
+    """
+    now = int(time.time())
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    recovered: list[str] = []
+
+    rows = conn.execute(
+        "SELECT t.id, t.worker_pid, t.claim_lock, t.claim_expires, "
+        "       t.last_heartbeat_at "
+        "FROM tasks t "
+        "WHERE t.status = 'merging'"
+    ).fetchall()
+
+    for row in rows:
+        lock = row["claim_lock"] or ""
+        # Only recover claims owned by this host.
+        if not lock.startswith(host_prefix):
+            continue
+
+        pid = row["worker_pid"]
+        pid_dead = pid is not None and not _pid_alive(pid)
+        # No PID at all is also a stuck state (claim with no live worker).
+        pid_absent = pid is None
+
+        hb = row["last_heartbeat_at"]
+        if hb is not None:
+            heartbeat_stalled = (now - int(hb)) > stale_after_seconds
+        else:
+            # Never heartbeated — only treat as stalled once the claim TTL
+            # has expired so a freshly-spawned merger isn't reclaimed early.
+            expires = row["claim_expires"]
+            heartbeat_stalled = expires is not None and int(expires) < now
+
+        if not (pid_dead or pid_absent or heartbeat_stalled):
+            continue  # merger is healthy / still within its grace window
+
+        tid = row["id"]
+        # Terminate the worker if it's somehow still alive (stalled case).
+        termination = _terminate_reclaimed_worker(
+            pid,
+            lock,
+            signal_fn=signal_fn,
+        )
+
+        if pid_dead or pid_absent:
+            why = "merger worker process is no longer alive"
+        else:
+            hb_age = (now - int(hb)) if hb is not None else None
+            why = (
+                f"merger worker silent for {hb_age}s"
+                if hb_age is not None
+                else "merger worker never heartbeated and its claim expired"
+            )
+        reason = (
+            f"merger died/stalled in merging — {why}. "
+            "Re-approve to retry the merge, or merge the PR manually."
+        )
+
+        payload = {
+            "pid": int(pid) if pid is not None else None,
+            "pid_dead": bool(pid_dead),
+            "pid_absent": bool(pid_absent),
+            "heartbeat_stalled": bool(heartbeat_stalled),
+            "last_heartbeat_at": (int(hb) if hb is not None else None),
+        }
+        payload.update(termination)
+
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, "
+                "last_heartbeat_at = NULL "
+                "WHERE id = ? AND status = 'merging' AND claim_lock IS ?",
+                (tid, row["claim_lock"]),
+            )
+            if cur.rowcount != 1:
+                continue  # raced — another path already moved it
+            run_id = _end_run(
+                conn,
+                tid,
+                outcome="merge_failed",
+                status="merge_failed",
+                error=reason,
+                metadata=payload,
+            )
+            # Synthesize a closing run if there was no active one so the
+            # block reason survives in attempt history.
+            if run_id is None:
+                run_id = _synthesize_ended_run(
+                    conn,
+                    tid,
+                    outcome="merge_failed",
+                    summary=reason,
+                )
+            _append_event(conn, tid, "merge_failed", payload, run_id=run_id)
+            _append_event(
+                conn, tid, "blocked", {"reason": reason}, run_id=run_id
+            )
+            recovered.append(tid)
+
+        # Like the stale/stuck reapers, do NOT count this as a worker
+        # failure — a dead merger is dispatcher-side detection, and the card
+        # is parked in ``blocked`` for a human, not re-dispatched.
+
+    return recovered
 
 
 def _error_fingerprint(error_text: str) -> str:
@@ -8418,6 +8649,14 @@ def dispatch_once(
         stale_timeout_seconds=stale_timeout_seconds,
     )
     result.crashed = detect_crashed_workers(conn)
+    # Recover post-approve mergers that died/stalled in the ``merging`` status.
+    # The ``running``-scoped reapers above intentionally skip ``merging`` (a
+    # different reclaim destination — see recover_stuck_merging), so this is the
+    # dedicated safety net that keeps a ``merging`` card from stalling forever.
+    try:
+        result.recovered_merging = recover_stuck_merging(conn)
+    except Exception:
+        pass  # never break dispatch on the merging-recovery reaper
     # Reap scratch workspaces from tasks that have settled. Safe to call
     # here because the dispatcher is out-of-process from any worker — the
     # in-process inline rmtree on complete_task was deleting the worker's
