@@ -113,7 +113,7 @@ VALID_STATUSES = {
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 # Statuses in which a worker subprocess is actively claimed and running.
 # ``running`` is the normal worker state; ``merging`` is the post-approve
-# merger worker landing a PR (see claim_merger_task / recover_stuck_merging).
+# merger worker landing a PR (see claim_merger_task).
 # Both consume a real spawned subprocess, so both must count against the
 # dispatcher concurrency caps (max_spawn / max_in_progress / per-profile) —
 # otherwise live mergers are invisible and the dispatcher over-spawns on top
@@ -4120,7 +4120,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running|ready -> done`` and record ``result``.
+    """Transition ``running|ready|blocked|merging -> done`` and record ``result``.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
@@ -6587,11 +6587,6 @@ class DispatchResult:
     (heartbeated at least once, then went silent past the configured
     ``stuck_after_seconds`` window).  The workers are killed and the tasks
     re-queued as ``ready`` without incrementing ``consecutive_failures``."""
-    recovered_merging: list[str] = field(default_factory=list)
-    """Task ids recovered from a stalled/dead post-approve merger. The merger
-    runs in the dedicated ``merging`` status; when its worker dies or goes
-    silent these are bounced to ``blocked`` (not ``ready``) by
-    ``recover_stuck_merging`` so a human can re-approve or merge manually."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
@@ -6872,12 +6867,13 @@ def heartbeat_worker(
 
     Scoped to :data:`WORKER_ACTIVE_STATUSES` (``running`` *and*
     ``merging``) rather than ``running`` alone: the post-approve merger
-    runs in ``merging`` and heartbeats through this exact path
-    (``kanban_heartbeat`` + the tool-layer auto-heartbeat). If this only
-    matched ``running``, a ``merging`` worker could never write
-    ``last_heartbeat_at``, its claim TTL would expire, and
-    :func:`recover_stuck_merging` would force-block a still-healthy
-    in-flight merger.
+    runs in ``merging`` and may heartbeat through this exact path
+    (``kanban_heartbeat`` + the tool-layer auto-heartbeat) to signal
+    liveness. If this only matched ``running``, a ``merging`` worker could
+    never write ``last_heartbeat_at`` even when it wanted to. (Nothing
+    reaps ``merging`` on a stalled heartbeat — the merger is the sole
+    authority to leave ``merging`` — but the path must still work so a live
+    merger can signal progress and extend its claim if it chooses to.)
     """
     now = int(time.time())
     with write_txn(conn):
@@ -6934,9 +6930,13 @@ def enforce_max_runtime(
     test hook; defaults to ``os.kill`` on POSIX.
 
     Intentionally scoped to ``status = 'running'``. The post-approve merger
-    runs in ``merging`` and needs a different recovery destination (``blocked``,
-    never ``ready`` — re-queueing a half-finished merge risks a double-merge),
-    so its runtime cap lives in :func:`recover_stuck_merging` rather than here.
+    runs in ``merging``, which NO reaper or runtime-cap automation touches:
+    the merger is the sole authority to leave ``merging`` (→ done on success,
+    or → blocked when it self-blocks on an unrecoverable conflict). A merger
+    that wedges past any runtime cap is left in ``merging`` for a human to
+    resolve — deliberately, so no background process can second-guess the
+    merger's judgment or risk a double-merge by re-queueing a half-finished
+    merge.
     """
     import signal
 
@@ -7498,176 +7498,6 @@ def detect_stale_running(
         # spawn_failed / timed_out / crashed counters.
 
     return reclaimed
-
-
-def recover_stuck_merging(
-    conn: sqlite3.Connection,
-    *,
-    stale_after_seconds: int = _STALE_HEARTBEAT_GAP_SECONDS,
-    signal_fn=None,
-) -> list[str]:
-    """Recover ``merging`` tasks whose merger worker died or stalled.
-
-    The post-approve merger runs in the dedicated ``merging`` status (see
-    :func:`claim_merger_task`), which the ``running``-scoped reapers
-    (``release_stale_claims``, ``detect_stale_running``,
-    ``detect_crashed_workers``, ``detect_stuck_workers``) intentionally do
-    NOT touch. This dedicated reaper is the safety net so a ``merging`` card
-    can never silently stall forever when its worker dies.
-
-    A ``merging`` task is recovered when its host-local worker is either:
-
-    * **Dead** — ``worker_pid`` is set but no longer alive, OR
-    * **Stalled** — ``last_heartbeat_at`` is older than ``stale_after_seconds``
-      (or NULL with the claim TTL expired), OR
-    * **Over its runtime cap** — alive and heartbeating but elapsed time has
-      passed the task's ``max_runtime_seconds``. ``enforce_max_runtime`` skips
-      ``merging`` (it would send the card to ``ready`` and risk a double-merge),
-      so the merger's runtime cap is enforced here with the correct ``blocked``
-      destination.
-
-    On recovery the card is transitioned ``merging -> blocked`` with a clear,
-    board-visible reason. ``blocked`` (not ``ready``) is the deliberate
-    destination: a half-finished merge needs a human to re-approve or land the
-    PR manually — silently re-queueing risks a double-merge. The active run is
-    closed with ``outcome='merge_failed'`` and a ``merge_failed`` event is
-    emitted for auditability.
-
-    Only acts on tasks claimed by *this host* (PIDs from other hosts are
-    meaningless here). Returns the list of recovered task IDs. ``signal_fn``
-    is a test hook for the worker-termination path.
-    """
-    now = int(time.time())
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
-    recovered: list[str] = []
-
-    rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.claim_lock, t.claim_expires, "
-        "       t.last_heartbeat_at, t.max_runtime_seconds, "
-        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
-        "FROM tasks t "
-        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'merging'"
-    ).fetchall()
-
-    for row in rows:
-        lock = row["claim_lock"] or ""
-        # Only recover claims owned by this host.
-        if not lock.startswith(host_prefix):
-            continue
-
-        pid = row["worker_pid"]
-        pid_dead = pid is not None and not _pid_alive(pid)
-        # No PID at all is also a stuck state (claim with no live worker).
-        pid_absent = pid is None
-
-        hb = row["last_heartbeat_at"]
-        if hb is not None:
-            heartbeat_stalled = (now - int(hb)) > stale_after_seconds
-        else:
-            # Never heartbeated — only treat as stalled once the claim TTL
-            # has expired so a freshly-spawned merger isn't reclaimed early.
-            expires = row["claim_expires"]
-            heartbeat_stalled = expires is not None and int(expires) < now
-
-        # Runtime cap: a merger that is alive AND heartbeating but wedged past
-        # its per-task max_runtime_seconds would otherwise escape both this
-        # reaper (it's healthy) and enforce_max_runtime (scoped to 'running').
-        # Catch it here so the runtime cap covers mergers too, routing to
-        # 'blocked' (never 'ready') to avoid a double-merge — same destination
-        # as every other recovery path in this function.
-        max_runtime = row["max_runtime_seconds"]
-        started = row["active_started_at"]
-        runtime_exceeded = (
-            max_runtime is not None
-            and started is not None
-            and (now - int(started)) >= int(max_runtime)
-        )
-
-        if not (
-            pid_dead or pid_absent or heartbeat_stalled or runtime_exceeded
-        ):
-            continue  # merger is healthy / still within its grace window
-
-        tid = row["id"]
-        # Terminate the worker if it's somehow still alive (stalled case).
-        termination = _terminate_reclaimed_worker(
-            pid,
-            lock,
-            signal_fn=signal_fn,
-        )
-
-        if pid_dead or pid_absent:
-            why = "merger worker process is no longer alive"
-        elif heartbeat_stalled:
-            hb_age = (now - int(hb)) if hb is not None else None
-            why = (
-                f"merger worker silent for {hb_age}s"
-                if hb_age is not None
-                else "merger worker never heartbeated and its claim expired"
-            )
-        else:
-            # runtime_exceeded — alive and heartbeating, but wedged past the cap
-            elapsed = now - int(started) if started is not None else None
-            why = (
-                f"merger worker exceeded max_runtime_seconds "
-                f"(elapsed {elapsed}s > limit {int(max_runtime)}s)"
-                if elapsed is not None and max_runtime is not None
-                else "merger worker exceeded its max runtime"
-            )
-        reason = (
-            f"merger died/stalled in merging — {why}. "
-            "Re-approve to retry the merge, or merge the PR manually."
-        )
-
-        payload = {
-            "pid": int(pid) if pid is not None else None,
-            "pid_dead": bool(pid_dead),
-            "pid_absent": bool(pid_absent),
-            "heartbeat_stalled": bool(heartbeat_stalled),
-            "runtime_exceeded": bool(runtime_exceeded),
-            "last_heartbeat_at": (int(hb) if hb is not None else None),
-        }
-        payload.update(termination)
-
-        with write_txn(conn):
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, "
-                "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'merging' AND claim_lock IS ?",
-                (tid, row["claim_lock"]),
-            )
-            if cur.rowcount != 1:
-                continue  # raced — another path already moved it
-            run_id = _end_run(
-                conn,
-                tid,
-                outcome="merge_failed",
-                status="merge_failed",
-                error=reason,
-                metadata=payload,
-            )
-            # Synthesize a closing run if there was no active one so the
-            # block reason survives in attempt history.
-            if run_id is None:
-                run_id = _synthesize_ended_run(
-                    conn,
-                    tid,
-                    outcome="merge_failed",
-                    summary=reason,
-                )
-            _append_event(conn, tid, "merge_failed", payload, run_id=run_id)
-            _append_event(
-                conn, tid, "blocked", {"reason": reason}, run_id=run_id
-            )
-            recovered.append(tid)
-
-        # Like the stale/stuck reapers, do NOT count this as a worker
-        # failure — a dead merger is dispatcher-side detection, and the card
-        # is parked in ``blocked`` for a human, not re-dispatched.
-
-    return recovered
 
 
 def _error_fingerprint(error_text: str) -> str:
@@ -8717,14 +8547,13 @@ def dispatch_once(
         stale_timeout_seconds=stale_timeout_seconds,
     )
     result.crashed = detect_crashed_workers(conn)
-    # Recover post-approve mergers that died/stalled in the ``merging`` status.
-    # The ``running``-scoped reapers above intentionally skip ``merging`` (a
-    # different reclaim destination — see recover_stuck_merging), so this is the
-    # dedicated safety net that keeps a ``merging`` card from stalling forever.
-    try:
-        result.recovered_merging = recover_stuck_merging(conn)
-    except Exception:
-        pass  # never break dispatch on the merging-recovery reaper
+    # NOTE: the post-approve merger runs in the dedicated ``merging`` status,
+    # which NO reaper / dispatcher automation touches. The merging worker is
+    # the sole authority to move a card out of ``merging`` (→ done on a
+    # successful merge, or → blocked when it calls kanban_block on an
+    # unrecoverable conflict). A merger whose process genuinely dies leaves the
+    # card in ``merging`` until a human intervenes — that tradeoff is
+    # intentional (no background process second-guesses the merger's judgment).
     # Reap scratch workspaces from tasks that have settled. Safe to call
     # here because the dispatcher is out-of-process from any worker — the
     # in-process inline rmtree on complete_task was deleting the worker's

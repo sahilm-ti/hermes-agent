@@ -8,7 +8,9 @@ Covers:
   - PR URL present, skip_merge set → done, NO merger
   - No PR URL → done (backwards-compat path)
 - ``merging`` landing: complete_task (→ done) and block_task (→ blocked)
-- ``recover_stuck_merging``: dead/stalled merger → blocked, healthy → untouched
+- ``merging`` recovery: NO reaper / dispatcher automation touches ``merging``;
+  the merger is the sole authority to leave it (→ done or → blocked). A dead
+  merger leaves the card stuck in ``merging`` indefinitely (intentional).
 """
 
 from __future__ import annotations
@@ -362,11 +364,20 @@ class TestMergingLanding:
 
 
 # ---------------------------------------------------------------------------
-# recover_stuck_merging reaper (the safety net)
+# merging is NOT reaped — the merger is the sole authority to leave `merging`
+#
+# Sahil's explicit decision (follow-up to PR #51): remove the merging-status
+# reaper entirely. NO background process (reaper / stale-claim / runtime-cap /
+# crash detection) may move a card out of `merging`. The merger itself either
+# completes (→ done) or self-blocks (→ blocked). A merger whose process
+# genuinely dies leaves the card stuck in `merging` until a human intervenes —
+# that tradeoff is intentional. These tests are the inverse of the old
+# TestRecoverStuckMerging suite: they assert that dead/stalled/over-runtime
+# mergers are LEFT ALONE.
 # ---------------------------------------------------------------------------
 
 
-class TestRecoverStuckMerging:
+class TestMergingNotReaped:
     def _make_merging_task(self, conn):
         tid = _make_human_review_task(conn)
         task = kb.claim_merger_task(
@@ -375,130 +386,103 @@ class TestRecoverStuckMerging:
         assert task is not None and task.status == "merging"
         return tid
 
-    def test_dead_pid_merging_task_goes_to_blocked(self, kanban_home):
-        """A merging task whose merger PID is dead → blocked with a reason."""
+    def test_recover_stuck_merging_is_gone(self):
+        """The dedicated merging reaper must not exist any more — its very
+        presence is the bug this card removes."""
+        assert not hasattr(kb, "recover_stuck_merging")
+
+    def test_dispatch_result_has_no_recovered_merging_field(self):
+        """DispatchResult must not carry a recovered_merging field — nothing
+        recovers merging cards, so there is nothing to report."""
+        result = kb.DispatchResult()
+        assert not hasattr(result, "recovered_merging")
+
+    def test_dead_pid_merging_task_stays_in_merging(self, kanban_home):
+        """A merging task whose merger PID is dead is NOT auto-bounced — it
+        stays in `merging` indefinitely (a human must intervene)."""
         with kb.connect() as conn:
             tid = self._make_merging_task(conn)
-            # Stamp a host-local claim + a definitely-dead PID.
             host = kb._claimer_id().split(":", 1)[0]
+            # Host-local claim + a definitely-dead PID.
             conn.execute(
                 "UPDATE tasks SET claim_lock = ?, worker_pid = ? WHERE id = ?",
                 (f"{host}:999999", 2147483646, tid),
             )
             conn.commit()
-            recovered = kb.recover_stuck_merging(conn, signal_fn=lambda *a: None)
-            assert tid in recovered
+            # A full dispatch tick (which used to run the merging reaper) must
+            # leave the card untouched.
+            kb.dispatch_once(conn, dry_run=True)
             t = kb.get_task(conn, tid)
-            events = kb.list_events(conn, tid)
-        assert t.status == "blocked"
-        assert t.claim_lock is None
-        kinds = [e.kind for e in events]
-        assert "merge_failed" in kinds
-        assert "blocked" in kinds
-        blocked = [e for e in events if e.kind == "blocked"]
-        assert "merger died/stalled" in (blocked[-1].payload or {}).get("reason", "")
+        assert t.status == "merging"
+        assert t.claim_lock == f"{host}:999999"
 
-    def test_healthy_heartbeating_merging_task_untouched(self, kanban_home):
-        """A merging task with a live PID + fresh heartbeat is left alone."""
-        import os
-        import time as _time
-
+    def test_never_heartbeating_merging_past_ttl_stays_in_merging(self, kanban_home):
+        """A merger that never heartbeated and whose claim TTL has expired is
+        still left in `merging` (the old reaper bounced this to blocked)."""
         with kb.connect() as conn:
             tid = self._make_merging_task(conn)
             host = kb._claimer_id().split(":", 1)[0]
-            # Live PID (this test process) + a fresh heartbeat.
             conn.execute(
-                "UPDATE tasks SET claim_lock = ?, worker_pid = ?, "
-                "last_heartbeat_at = ? WHERE id = ?",
-                (f"{host}:1", os.getpid(), int(_time.time()), tid),
+                "UPDATE tasks SET claim_lock = ?, worker_pid = NULL, "
+                "last_heartbeat_at = NULL, claim_expires = ? WHERE id = ?",
+                (f"{host}:1", int(time.time()) - 1, tid),
             )
             conn.commit()
-            recovered = kb.recover_stuck_merging(conn, signal_fn=lambda *a: None)
-            assert tid not in recovered
+            kb.dispatch_once(conn, dry_run=True)
             t = kb.get_task(conn, tid)
         assert t.status == "merging"
 
-    def test_other_host_merging_task_ignored(self, kanban_home):
-        """A merging task claimed by another host is not recovered locally."""
-        with kb.connect() as conn:
-            tid = self._make_merging_task(conn)
-            conn.execute(
-                "UPDATE tasks SET claim_lock = ?, worker_pid = ? WHERE id = ?",
-                ("other-host:123", 2147483646, tid),
-            )
-            conn.commit()
-            recovered = kb.recover_stuck_merging(conn, signal_fn=lambda *a: None)
-            assert tid not in recovered
-            t = kb.get_task(conn, tid)
-        assert t.status == "merging"
-
-    def test_alive_merger_past_max_runtime_goes_to_blocked(self, kanban_home):
-        """A merger that is alive AND heartbeating but has run past its
-        per-task max_runtime_seconds is recovered to 'blocked' (not 'ready' —
-        re-queueing risks a double-merge). This closes the runtime-cap gap:
-        enforce_max_runtime is scoped to 'running' and skips 'merging', so the
-        merger's runtime cap is enforced here.
-        """
-        import os
-        import time as _time
-
+    def test_alive_merger_past_max_runtime_stays_in_merging(self, kanban_home):
+        """A merger alive + heartbeating but wedged past its max_runtime_seconds
+        is NOT auto-bounced. enforce_max_runtime is scoped to `running` and
+        skips `merging`; with the reaper gone nothing enforces the cap on a
+        merging worker — it owns its own exit."""
         with kb.connect() as conn:
             tid = self._make_merging_task(conn)
             host = kb._claimer_id().split(":", 1)[0]
-            now = int(_time.time())
-            # Live PID (this process) + FRESH heartbeat → not dead, not stalled.
-            # Started 100s ago with a 10s cap → over the runtime cap.
+            now = int(time.time())
+            # Live PID + fresh heartbeat, started 100s ago with a 10s cap.
             conn.execute(
                 "UPDATE tasks SET claim_lock = ?, worker_pid = ?, "
                 "last_heartbeat_at = ?, max_runtime_seconds = ?, "
                 "started_at = ? WHERE id = ?",
                 (f"{host}:1", os.getpid(), now, 10, now - 100, tid),
             )
-            # Also stamp the active run's started_at, since recover_stuck_merging
-            # measures elapsed from COALESCE(run.started_at, task.started_at).
             conn.execute(
                 "UPDATE task_runs SET started_at = ? "
                 "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
                 (now - 100, tid),
             )
             conn.commit()
-            recovered = kb.recover_stuck_merging(conn, signal_fn=lambda *a: None)
-            assert tid in recovered
+            kb.dispatch_once(conn, dry_run=True)
+            t = kb.get_task(conn, tid)
+        assert t.status == "merging"
+
+    def test_merger_can_complete_from_merging(self, kanban_home):
+        """The merger's own success path: complete_task moves merging → done."""
+        with kb.connect() as conn:
+            tid = self._make_merging_task(conn)
+            ok = kb.complete_task(
+                conn, tid, summary="Merged PR #10 (squash+delete-branch)"
+            )
+            assert ok is True
+            t = kb.get_task(conn, tid)
+        assert t.status == "done"
+
+    def test_merger_can_block_from_merging(self, kanban_home):
+        """The merger's own give-up path: block_task moves merging → blocked
+        with the reason carried through to the board."""
+        reason = "Merge conflict on PR #10 — needs manual rebase. Files: a.py"
+        with kb.connect() as conn:
+            tid = self._make_merging_task(conn)
+            ok = kb.block_task(conn, tid, reason=reason)
+            assert ok is True
             t = kb.get_task(conn, tid)
             events = kb.list_events(conn, tid)
         assert t.status == "blocked"
-        assert t.claim_lock is None
-        kinds = [e.kind for e in events]
-        assert "merge_failed" in kinds
-        assert "blocked" in kinds
         blocked = [e for e in events if e.kind == "blocked"]
-        reason = (blocked[-1].payload or {}).get("reason", "")
-        assert "max_runtime_seconds" in reason
-        merge_failed = [e for e in events if e.kind == "merge_failed"]
-        assert (merge_failed[-1].payload or {}).get("runtime_exceeded") is True
-
-    def test_alive_merger_within_max_runtime_untouched(self, kanban_home):
-        """A merger that is alive, heartbeating, and still within its runtime
-        cap is left alone (the runtime trigger must not fire early)."""
-        import os
-        import time as _time
-
-        with kb.connect() as conn:
-            tid = self._make_merging_task(conn)
-            host = kb._claimer_id().split(":", 1)[0]
-            now = int(_time.time())
-            # Started 5s ago with a 3600s cap → well within the runtime cap.
-            conn.execute(
-                "UPDATE tasks SET claim_lock = ?, worker_pid = ?, "
-                "last_heartbeat_at = ?, max_runtime_seconds = ?, "
-                "started_at = ? WHERE id = ?",
-                (f"{host}:1", os.getpid(), now, 3600, now - 5, tid),
-            )
-            conn.commit()
-            recovered = kb.recover_stuck_merging(conn, signal_fn=lambda *a: None)
-            assert tid not in recovered
-            t = kb.get_task(conn, tid)
-        assert t.status == "merging"
+        assert blocked
+        assert (blocked[-1].payload or {}).get("reason") == reason
 
 
 # ---------------------------------------------------------------------------
@@ -524,8 +508,10 @@ class TestMergingStatusRegistration:
 # ---------------------------------------------------------------------------
 # heartbeat liveness in `merging` (regression: heartbeat_worker /
 # heartbeat_claim were scoped to status='running' only, so a merging worker
-# could never write last_heartbeat_at / extend its claim — the reaper then
-# force-blocked a still-healthy in-flight merger once its claim TTL expired)
+# could never write last_heartbeat_at / extend its claim). Nothing reaps a
+# `merging` card — the merger is the sole authority to leave it — but the
+# heartbeat path must still WORK so a live merger can signal liveness and
+# extend its claim if it chooses to.
 # ---------------------------------------------------------------------------
 
 
@@ -590,59 +576,6 @@ class TestMergingHeartbeat:
             assert after is not None
         assert after.claim_expires is not None
         assert after.claim_expires > int(time.time())
-
-    def test_real_heartbeat_protects_merger_past_claim_ttl(self, kanban_home):
-        """End-to-end regression for the rejected bug: a healthy merger running
-        past its initial 15-min claim TTL must NOT be force-blocked, as long as
-        it keeps heartbeating through the real API. Pre-fix, heartbeat_worker
-        no-oped in merging (last_heartbeat_at stayed NULL); once the claim TTL
-        expired the reaper hit the 'never heartbeated and its claim expired'
-        branch and blocked the live worker. With the fix the heartbeat lands,
-        so the reaper sees a fresh heartbeat and leaves it alone."""
-        with kb.connect() as conn:
-            tid = self._make_merging_task(conn)
-            host = kb._claimer_id().split(":", 1)[0]
-            # Live PID (this test process); claim TTL already in the past
-            # (simulating a merger that's been running >15 min).
-            conn.execute(
-                "UPDATE tasks SET claim_lock = ?, worker_pid = ?, "
-                "claim_expires = ? WHERE id = ?",
-                (f"{host}:1", os.getpid(), int(time.time()) - 1, tid),
-            )
-            conn.commit()
-            # The merger heartbeats through the real API (as it would via
-            # kanban_heartbeat / the auto-heartbeat bridge).
-            assert kb.heartbeat_worker(conn, tid) is True
-            # Now the reaper runs: fresh heartbeat → healthy → left alone.
-            recovered = kb.recover_stuck_merging(conn, signal_fn=lambda *a: None)
-            assert tid not in recovered
-            t = kb.get_task(conn, tid)
-            assert t is not None
-        assert t.status == "merging"
-
-    def test_merger_never_heartbeating_past_ttl_is_blocked(self, kanban_home):
-        """The flip side: a merger that genuinely never heartbeats and whose
-        claim TTL has expired (and whose worker is gone) is still recovered to
-        blocked (the fix must not defang the safety net for a dead/stalled
-        merger)."""
-        with kb.connect() as conn:
-            tid = self._make_merging_task(conn)
-            host = kb._claimer_id().split(":", 1)[0]
-            # No PID, never heartbeated, claim TTL in the past.
-            conn.execute(
-                "UPDATE tasks SET claim_lock = ?, worker_pid = NULL, "
-                "last_heartbeat_at = NULL, claim_expires = ? WHERE id = ?",
-                (f"{host}:1", int(time.time()) - 1, tid),
-            )
-            conn.commit()
-            recovered = kb.recover_stuck_merging(conn, signal_fn=lambda *a: None)
-            assert tid in recovered
-            t = kb.get_task(conn, tid)
-            assert t is not None
-            events = kb.list_events(conn, tid)
-        assert t.status == "blocked"
-        blocked = [e for e in events if e.kind == "blocked"]
-        assert "merger died/stalled" in (blocked[-1].payload or {}).get("reason", "")
 
 
 # ---------------------------------------------------------------------------
