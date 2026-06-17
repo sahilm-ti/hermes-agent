@@ -14,6 +14,8 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -51,6 +53,7 @@ def _make_human_review_task(conn, *, title="pr task", assignee="worker"):
 # _extract_pr_url
 # ---------------------------------------------------------------------------
 
+
 class TestExtractPrUrl:
     def test_finds_url_in_review_requested_event(self, kanban_home):
         """URL carried in review_requested event.reason is returned."""
@@ -68,7 +71,9 @@ class TestExtractPrUrl:
         with kb.connect() as conn:
             tid = kb.create_task(conn, title="x", assignee="worker")
             kb.add_comment(
-                conn, tid, "worker",
+                conn,
+                tid,
+                "worker",
                 "Opened PR: https://github.com/org/repo/pull/7",
             )
             url = kb._extract_pr_url(conn, tid)
@@ -91,7 +96,9 @@ class TestExtractPrUrl:
             _claim(conn, tid)
             # Comment has a different PR number.
             kb.add_comment(
-                conn, tid, "worker",
+                conn,
+                tid,
+                "worker",
                 "Old PR: https://github.com/org/repo/pull/1",
             )
             # Event has the newer PR.
@@ -106,6 +113,7 @@ class TestExtractPrUrl:
 # ---------------------------------------------------------------------------
 # claim_merger_task
 # ---------------------------------------------------------------------------
+
 
 class TestClaimMergerTask:
     def test_human_review_to_merging(self, kanban_home):
@@ -170,6 +178,7 @@ class TestClaimMergerTask:
 # ---------------------------------------------------------------------------
 # approve_task routing
 # ---------------------------------------------------------------------------
+
 
 class TestApproveTaskRouting:
     def test_routes_to_merge_triggered_when_pr_url_present(self, kanban_home):
@@ -249,6 +258,7 @@ class TestApproveTaskRouting:
 # skip_merge flag (opt-out)
 # ---------------------------------------------------------------------------
 
+
 class TestSkipMerge:
     def test_skip_merge_pr_card_goes_straight_to_done(self, kanban_home):
         """skip_merge set + PR present → done directly, NO merger claim."""
@@ -316,6 +326,7 @@ class TestSkipMerge:
 # merging → done / merging → blocked landing transitions
 # ---------------------------------------------------------------------------
 
+
 class TestMergingLanding:
     def _make_merging_task(self, conn):
         tid = _make_human_review_task(conn)
@@ -353,6 +364,7 @@ class TestMergingLanding:
 # ---------------------------------------------------------------------------
 # recover_stuck_merging reaper (the safety net)
 # ---------------------------------------------------------------------------
+
 
 class TestRecoverStuckMerging:
     def _make_merging_task(self, conn):
@@ -493,6 +505,7 @@ class TestRecoverStuckMerging:
 # status enum + dashboard column registration
 # ---------------------------------------------------------------------------
 
+
 class TestMergingStatusRegistration:
     def test_merging_in_valid_statuses(self, kanban_home):
         assert "merging" in kb.VALID_STATUSES
@@ -507,3 +520,126 @@ class TestMergingStatusRegistration:
         assert "merging" in cols
         assert cols.index("human_review") < cols.index("merging") < cols.index("done")
 
+
+# ---------------------------------------------------------------------------
+# heartbeat liveness in `merging` (regression: heartbeat_worker /
+# heartbeat_claim were scoped to status='running' only, so a merging worker
+# could never write last_heartbeat_at / extend its claim — the reaper then
+# force-blocked a still-healthy in-flight merger once its claim TTL expired)
+# ---------------------------------------------------------------------------
+
+
+class TestMergingHeartbeat:
+    def _make_merging_task(self, conn):
+        tid = _make_human_review_task(conn)
+        task = kb.claim_merger_task(
+            conn, tid, pr_url="https://github.com/org/repo/pull/10"
+        )
+        assert task is not None and task.status == "merging"
+        return tid
+
+    def test_heartbeat_worker_succeeds_in_merging(self, kanban_home):
+        """heartbeat_worker through the real API bumps last_heartbeat_at on a
+        merging task (not just running). Pre-fix this returned False and the
+        column stayed NULL."""
+        with kb.connect() as conn:
+            tid = self._make_merging_task(conn)
+            # claim_merger_task leaves last_heartbeat_at unset.
+            before = kb.get_task(conn, tid)
+            assert before is not None
+            assert before.last_heartbeat_at is None
+            ok = kb.heartbeat_worker(conn, tid, note="merging along")
+            assert ok is True
+            after = kb.get_task(conn, tid)
+            assert after is not None
+        assert after.status == "merging"
+        assert after.last_heartbeat_at is not None
+
+    def test_heartbeat_worker_expected_run_id_in_merging(self, kanban_home):
+        """The expected_run_id variant (used by the tool-layer auto-heartbeat)
+        also succeeds for a merging task."""
+        with kb.connect() as conn:
+            tid = self._make_merging_task(conn)
+            claimed = kb.get_task(conn, tid)
+            assert claimed is not None
+            run_id = claimed.current_run_id
+            assert run_id is not None
+            ok = kb.heartbeat_worker(conn, tid, expected_run_id=run_id)
+            assert ok is True
+            after = kb.get_task(conn, tid)
+            assert after is not None
+        assert after.last_heartbeat_at is not None
+
+    def test_heartbeat_claim_extends_merging_claim(self, kanban_home):
+        """heartbeat_claim extends claim_expires for a merging task. Pre-fix it
+        was scoped to running, so a merging claim never advanced past its TTL."""
+        with kb.connect() as conn:
+            tid = self._make_merging_task(conn)
+            claimed = kb.get_task(conn, tid)
+            assert claimed is not None
+            lock = claimed.claim_lock
+            # Force the claim near expiry, then extend via the real API.
+            conn.execute(
+                "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+                (int(time.time()) - 1, tid),
+            )
+            conn.commit()
+            ok = kb.heartbeat_claim(conn, tid, claimer=lock)
+            assert ok is True
+            after = kb.get_task(conn, tid)
+            assert after is not None
+        assert after.claim_expires is not None
+        assert after.claim_expires > int(time.time())
+
+    def test_real_heartbeat_protects_merger_past_claim_ttl(self, kanban_home):
+        """End-to-end regression for the rejected bug: a healthy merger running
+        past its initial 15-min claim TTL must NOT be force-blocked, as long as
+        it keeps heartbeating through the real API. Pre-fix, heartbeat_worker
+        no-oped in merging (last_heartbeat_at stayed NULL); once the claim TTL
+        expired the reaper hit the 'never heartbeated and its claim expired'
+        branch and blocked the live worker. With the fix the heartbeat lands,
+        so the reaper sees a fresh heartbeat and leaves it alone."""
+        with kb.connect() as conn:
+            tid = self._make_merging_task(conn)
+            host = kb._claimer_id().split(":", 1)[0]
+            # Live PID (this test process); claim TTL already in the past
+            # (simulating a merger that's been running >15 min).
+            conn.execute(
+                "UPDATE tasks SET claim_lock = ?, worker_pid = ?, "
+                "claim_expires = ? WHERE id = ?",
+                (f"{host}:1", os.getpid(), int(time.time()) - 1, tid),
+            )
+            conn.commit()
+            # The merger heartbeats through the real API (as it would via
+            # kanban_heartbeat / the auto-heartbeat bridge).
+            assert kb.heartbeat_worker(conn, tid) is True
+            # Now the reaper runs: fresh heartbeat → healthy → left alone.
+            recovered = kb.recover_stuck_merging(conn, signal_fn=lambda *a: None)
+            assert tid not in recovered
+            t = kb.get_task(conn, tid)
+            assert t is not None
+        assert t.status == "merging"
+
+    def test_merger_never_heartbeating_past_ttl_is_blocked(self, kanban_home):
+        """The flip side: a merger that genuinely never heartbeats and whose
+        claim TTL has expired (and whose worker is gone) is still recovered to
+        blocked (the fix must not defang the safety net for a dead/stalled
+        merger)."""
+        with kb.connect() as conn:
+            tid = self._make_merging_task(conn)
+            host = kb._claimer_id().split(":", 1)[0]
+            # No PID, never heartbeated, claim TTL in the past.
+            conn.execute(
+                "UPDATE tasks SET claim_lock = ?, worker_pid = NULL, "
+                "last_heartbeat_at = NULL, claim_expires = ? WHERE id = ?",
+                (f"{host}:1", int(time.time()) - 1, tid),
+            )
+            conn.commit()
+            recovered = kb.recover_stuck_merging(conn, signal_fn=lambda *a: None)
+            assert tid in recovered
+            t = kb.get_task(conn, tid)
+            assert t is not None
+            events = kb.list_events(conn, tid)
+        assert t.status == "blocked"
+        blocked = [e for e in events if e.kind == "blocked"]
+        assert "merger died/stalled" in (blocked[-1].payload or {}).get("reason", "")

@@ -3499,13 +3499,20 @@ def heartbeat_claim(
 
     Workers that know they'll exceed 15 minutes should call this every
     few minutes to keep ownership.
+
+    Scoped to :data:`WORKER_ACTIVE_STATUSES` (``running`` *and*
+    ``merging``): the post-approve merger runs in ``merging`` and extends
+    its claim through the same tool-layer auto-heartbeat bridge. If this
+    only matched ``running``, a ``merging`` worker's ``claim_expires``
+    would never advance past the initial TTL, leaving a stale claim on a
+    live worker.
     """
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
     lock = claimer or _claimer_id()
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock = ?",
+            f"WHERE id = ? AND {_WORKER_ACTIVE_STATUS_SQL} AND claim_lock = ?",
             (expires, task_id, lock),
         )
         if cur.rowcount == 1:
@@ -6860,20 +6867,31 @@ def heartbeat_worker(
     actual work process is stuck; periodic heartbeats catch that.
 
     Returns True on success, False if the task is not in a state that
-    should be heartbeating (not running, or claim expired).
+    should be heartbeating (not in an active worker status, or claim
+    expired).
+
+    Scoped to :data:`WORKER_ACTIVE_STATUSES` (``running`` *and*
+    ``merging``) rather than ``running`` alone: the post-approve merger
+    runs in ``merging`` and heartbeats through this exact path
+    (``kanban_heartbeat`` + the tool-layer auto-heartbeat). If this only
+    matched ``running``, a ``merging`` worker could never write
+    ``last_heartbeat_at``, its claim TTL would expire, and
+    :func:`recover_stuck_merging` would force-block a still-healthy
+    in-flight merger.
     """
     now = int(time.time())
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running'",
+                f"WHERE id = ? AND {_WORKER_ACTIVE_STATUS_SQL}",
                 (now, task_id),
             )
         else:
             cur = conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+                f"WHERE id = ? AND {_WORKER_ACTIVE_STATUS_SQL} "
+                "AND current_run_id = ?",
                 (now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
