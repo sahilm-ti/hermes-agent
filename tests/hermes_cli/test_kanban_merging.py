@@ -687,3 +687,77 @@ class TestApproveSkipMergeArgParsing:
             task = kb.get_task(conn, tid)
             assert task is not None
             assert task.status == "merging"
+
+    def test_skip_merge_on_non_human_review_card_fails_and_does_not_persist(
+        self, kanban_home, monkeypatch
+    ):
+        """`--skip-merge` approve on a card NOT in human_review must fail AND
+        leave skip_merge unset.
+
+        Regression for the existence-gated (not status-gated) write: the flag
+        used to be persisted before approve_task ran, so a skip_merge=true
+        approve on a `ready`/`running` card left a stray skip_merge=True on the
+        card even though the approve failed. The flag must never persist when
+        the paired approve does not go through.
+        """
+        from tools import kanban_tools as kt
+
+        # A merger spawn must never happen on this path; trip the test if it does.
+        monkeypatch.setattr(
+            kb,
+            "_default_spawn",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("spawned")),
+        )
+
+        with kb.connect() as conn:
+            # Fresh task — status 'ready'/'todo', NOT human_review.
+            tid = kb.create_task(conn, title="x", assignee="worker")
+            _pre = kb.get_task(conn, tid)
+            assert _pre is not None and _pre.skip_merge is False
+
+        out = kt._handle_approve({"task_id": tid, "skip_merge": "true"})
+        d = json.loads(out)
+        assert "error" in d, d
+
+        with kb.connect() as conn:
+            task = kb.get_task(conn, tid)
+        assert task is not None
+        # Approve did not go through → card unchanged, flag NOT persisted.
+        assert task.status != "human_review"
+        assert task.status != "merging"
+        assert task.status != "done"
+        assert task.skip_merge is False
+
+    def test_cli_skip_merge_on_non_human_review_card_fails_and_does_not_persist(
+        self, kanban_home, monkeypatch
+    ):
+        """CLI `approve --skip-merge` on a non-human_review card mirrors the
+        tool-layer behavior: returns non-zero AND leaves skip_merge unset."""
+        import argparse
+
+        from hermes_cli import kanban as kb_cli
+
+        monkeypatch.setattr(
+            kb,
+            "_default_spawn",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("spawned")),
+        )
+
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="x", assignee="worker")
+            _pre = kb.get_task(conn, tid)
+            assert _pre is not None and _pre.skip_merge is False
+
+        ns = argparse.Namespace(
+            task_id=tid, reason=None, board=None, skip_merge=True,
+        )
+        rc = kb_cli._cmd_approve(ns)
+        assert rc == 1
+
+        with kb.connect() as conn:
+            task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status != "human_review"
+        assert task.status != "merging"
+        assert task.status != "done"
+        assert task.skip_merge is False

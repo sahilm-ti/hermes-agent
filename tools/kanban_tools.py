@@ -1111,7 +1111,15 @@ def _handle_approve(args: dict, **kw) -> str:
         try:
             if skip_merge:
                 # Set the opt-out flag BEFORE routing so approve_task skips the
-                # merger and goes straight to done.
+                # merger and goes straight to done. Gate the write on the card
+                # actually being in human_review (the only state in which
+                # approve_task can succeed) so a stray skip_merge never persists
+                # when the paired approve would fail.
+                _sm_task = kb.get_task(conn, str(tid))
+                if _sm_task is None or _sm_task.status != "human_review":
+                    return tool_error(
+                        f"could not approve {tid} (not in human_review or unknown)"
+                    )
                 kb.set_skip_merge(conn, str(tid), value=True)
             ok, outcome, pr_url, task = kb.approve_task(conn, str(tid), reason=reason)
             if not ok:

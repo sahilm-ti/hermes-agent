@@ -2163,7 +2163,18 @@ def _cmd_approve(args: argparse.Namespace) -> int:
     with kb.connect(board=board) as conn:
         if skip_merge:
             # Set the opt-out flag BEFORE routing so approve_task sees it and
-            # goes straight to done without spawning a merger.
+            # goes straight to done without spawning a merger. Gate the write
+            # on the card actually being in human_review (the only state in
+            # which approve_task can succeed) so the flag never persists when
+            # the paired approve would fail — otherwise a stray skip_merge
+            # lingers on the card with the wrong intent.
+            _sm_task = kb.get_task(conn, tid)
+            if _sm_task is None or _sm_task.status != "human_review":
+                print(
+                    f"cannot approve {tid} (not in human_review?)",
+                    file=sys.stderr,
+                )
+                return 1
             kb.set_skip_merge(conn, tid, value=True)
         if reason:
             kb.add_comment(conn, tid, author, f"APPROVED: {reason}")
