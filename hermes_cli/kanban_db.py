@@ -99,7 +99,19 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "human_review", "done", "archived"}
+VALID_STATUSES = {
+    "triage",
+    "todo",
+    "scheduled",
+    "ready",
+    "running",
+    "blocked",
+    "review",
+    "human_review",
+    "merging",
+    "done",
+    "archived",
+}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -132,6 +144,23 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # spirit (default 2) but counts a different signal: manual unblock recurrences,
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
+
+# Statuses in which a worker subprocess is actively claimed and running.
+# ``running`` is the normal worker state; ``merging`` is the post-approve
+# merger worker landing a PR (see claim_merger_task).
+# Both consume a real spawned subprocess, so both must count against the
+# dispatcher concurrency caps (max_spawn / max_in_progress / per-profile) —
+# otherwise live mergers are invisible and the dispatcher over-spawns on top
+# of them. Use ``_WORKER_ACTIVE_STATUS_SQL`` to splice the membership test
+# into a WHERE clause from a single source of truth.
+WORKER_ACTIVE_STATUSES = ("running", "merging")
+# Pre-rendered ``status IN ('running', 'merging')`` fragment for SQL counters.
+# Literal (not a bound param) because status names are a fixed internal enum,
+# never user input; this keeps the COUNT(*) queries terse without juggling a
+# variable-length placeholder tuple per call site.
+_WORKER_ACTIVE_STATUS_SQL = "status IN (" + ", ".join(
+    f"'{_s}'" for _s in WORKER_ACTIVE_STATUSES
+) + ")"
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 # Keyword fragments in a task's title/body that strongly suggest the worker
@@ -1034,6 +1063,10 @@ class Task:
     # Use this on investigate+fix+test+PR cards where 150–250 iterations are
     # needed; leave NULL for focused single-deliverable cards.
     max_iterations: Optional[int] = None
+    # When True, approving this card in human_review goes straight to ``done``
+    # WITHOUT spawning the post-approve merger, even if a PR URL is present in
+    # the thread. The explicit opt-out of the merging-with-visibility flow.
+    skip_merge: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1128,6 +1161,9 @@ class Task:
             ),
             max_iterations=(
                 row["max_iterations"] if "max_iterations" in keys else None
+            ),
+            skip_merge=(
+                bool(row["skip_merge"]) if "skip_merge" in keys else False
             ),
         )
 
@@ -1317,7 +1353,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- operators can use this as an explicit opt-out for clarity.
     no_heartbeat_required INTEGER NOT NULL DEFAULT 0,
     max_iterations        INTEGER,
-    completion_audit_at   INTEGER
+    completion_audit_at   INTEGER,
+    skip_merge           INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2146,6 +2183,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "tasks",
             "no_heartbeat_required",
             "no_heartbeat_required INTEGER NOT NULL DEFAULT 0",
+        )
+
+    if "skip_merge" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "skip_merge", "skip_merge INTEGER NOT NULL DEFAULT 0"
         )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -3744,13 +3786,20 @@ def heartbeat_claim(
 
     Workers that know they'll exceed 15 minutes should call this every
     few minutes to keep ownership.
+
+    Scoped to :data:`WORKER_ACTIVE_STATUSES` (``running`` *and*
+    ``merging``): the post-approve merger runs in ``merging`` and extends
+    its claim through the same tool-layer auto-heartbeat bridge. If this
+    only matched ``running``, a ``merging`` worker's ``claim_expires``
+    would never advance past the initial TTL, leaving a stale claim on a
+    live worker.
     """
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
     lock = claimer or _claimer_id()
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock = ?",
+            f"WHERE id = ? AND {_WORKER_ACTIVE_STATUS_SQL} AND claim_lock = ?",
             (expires, task_id, lock),
         )
         if cur.rowcount == 1:
@@ -4156,7 +4205,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running|ready -> done`` and record ``result``.
+    """Transition ``running|ready|blocked|merging -> done`` and record ``result``.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
@@ -4230,7 +4279,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'merging')
                 """,
                 (result, now, task_id),
             )
@@ -4247,7 +4296,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'merging')
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
@@ -5137,7 +5186,7 @@ def block_task(
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+    """Transition ``running``/``ready``/``merging`` → ``blocked`` (or route elsewhere).
 
     ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
     un-typed block) drives routing instead of every block landing in one
@@ -5160,6 +5209,11 @@ def block_task(
     * ``transient`` — treated like a generic block for routing, but a worker
       can use it to signal "this might clear on its own"; it still participates
       in the loop breaker so a forever-flaky task eventually escalates.
+
+    Covers the normal worker case (``running``) and the post-approve merger
+    case (``merging``) — when the merger genuinely cannot land the PR (e.g.
+    unresolvable merge conflict) it calls ``kanban_block`` and the card lands
+    in ``blocked`` with the reason carried through to the board.
 
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
@@ -5199,7 +5253,7 @@ def block_task(
                        worker_pid    = NULL,
                        block_kind    = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'merging')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, task_id) if expected_run_id is None
                 else (kind, task_id, int(expected_run_id)),
@@ -5253,7 +5307,7 @@ def block_task(
                        block_kind    = ?,
                        block_recurrences = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'merging')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, recurrences, task_id) if expected_run_id is None
                 else (kind, recurrences, task_id, int(expected_run_id)),
@@ -5292,7 +5346,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('running', 'ready', 'merging')
                     """,
                     (kind, recurrences, task_id),
                 )
@@ -5307,7 +5361,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('running', 'ready', 'merging')
                        AND current_run_id = ?
                     """,
                     (kind, recurrences, task_id, int(expected_run_id)),
@@ -5682,10 +5736,12 @@ def claim_merger_task(
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
 ) -> Optional["Task"]:
-    """Atomically transition ``human_review -> running`` for the merger agent.
+    """Atomically transition ``human_review -> merging`` for the merger agent.
 
-    Analogous to ``claim_review_task`` but sourced from ``human_review``.
-    Appends a ``merge_requested`` event carrying the ``pr_url``.
+    Analogous to ``claim_review_task`` but sourced from ``human_review`` and
+    landing the task in the dedicated ``merging`` status (NOT ``running``) so
+    the board surfaces an explicit "the merger is merging / figuring it out"
+    state. Appends a ``merge_requested`` event carrying the ``pr_url``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was already
     claimed or is not in ``human_review`` status.
@@ -5697,7 +5753,7 @@ def claim_merger_task(
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status        = 'running',
+               SET status        = 'merging',
                    claim_lock    = ?,
                    claim_expires = ?,
                    started_at    = COALESCE(started_at, ?)
@@ -5751,6 +5807,34 @@ def claim_merger_task(
         return get_task(conn, task_id)
 
 
+def set_skip_merge(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    value: bool = True,
+) -> bool:
+    """Set (or clear) the per-card ``skip_merge`` opt-out flag.
+
+    When set, approving this card in ``human_review`` goes straight to
+    ``done`` with NO post-approve merger spawned, even if a PR URL is present
+    in the thread. Returns ``True`` if a row was updated, ``False`` if the
+    task does not exist.
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET skip_merge = ? WHERE id = ?",
+            (1 if value else 0, task_id),
+        )
+        if cur.rowcount == 1:
+            _append_event(
+                conn,
+                task_id,
+                "skip_merge_set",
+                {"skip_merge": bool(value)},
+            )
+    return cur.rowcount == 1
+
+
 def approve_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5760,30 +5844,39 @@ def approve_task(
 ) -> "tuple[bool, str, Optional[str], Optional[Task]]":
     # @design-guard
     # INVARIANT: approve_task() is the ONLY function that transitions
-    # human_review → done (no-PR path) or human_review → running (PR path).
+    # human_review → done (no-PR path, or skip_merge set) or
+    # human_review → merging (PR path, skip_merge unset).
     # No code path may move a task OUT of human_review except:
-    #   approve_task() (→ done or → running-for-merger) or reject_task() (→ ready).
+    #   approve_task() (→ done or → merging-for-merger) or reject_task() (→ ready).
     #
     # INVARIANT: _extract_pr_url() is called inside approve_task() before any
-    # status mutation. If it returns a URL, approve_task() MUST delegate to
-    # claim_merger_task() and return ("merge_triggered", pr_url, task).
+    # status mutation. If it returns a URL AND the card's skip_merge flag is
+    # unset, approve_task() MUST delegate to claim_merger_task() (which moves
+    # the card to ``merging``) and return ("merge_triggered", pr_url, task).
     # It must NOT go directly to done in that case.
     #
-    # INVARIANT: If _extract_pr_url() returns None, approve_task() transitions
-    # directly to done (backwards-compat path, identical to pre-merger code)
-    # and returns ("done", None, None).
+    # INVARIANT: If _extract_pr_url() returns None, OR the card's skip_merge
+    # flag is set, approve_task() transitions directly to done (the no-PR
+    # backwards-compat path / the explicit approve-without-merging escape
+    # hatch) and returns ("done", None, None). No merger is spawned.
     """Route ``human_review`` task toward done via the correct path.
 
     **No-PR path** (backwards-compat):
       ``human_review → done`` — identical to the pre-merger behavior.
       Returns ``(True, "done", None, None)``.
 
-    **PR path** (new):
+    **skip_merge path** (explicit opt-out):
+      When the card's ``skip_merge`` flag is set, ``human_review → done``
+      directly even if a PR URL is present — NO merger worker is spawned.
+      Returns ``(True, "done", None, None)``.
+
+    **PR path** (merging-with-visibility, the default for PR cards):
       Detects a GitHub PR URL in the task's event/comment history, then
       delegates to ``claim_merger_task()`` which transitions
-      ``human_review → running`` and appends a ``merge_requested`` event.
+      ``human_review → merging`` and appends a ``merge_requested`` event.
       The caller is responsible for spawning the ``post-approve-merger``
-      worker against the returned ``Task``.
+      worker against the returned ``Task`` (which runs while the card is in
+      ``merging``).
       Returns ``(True, "merge_triggered", pr_url, task)``.
 
     Returns ``(False, "not_found", None, None)`` when the task is not in
@@ -5795,8 +5888,14 @@ def approve_task(
     # transition (race condition) doesn't leave orphan events.
     pr_url = _extract_pr_url(conn, task_id)
 
-    if pr_url is not None:
-        # PR path: claim for the merger agent.
+    # Read the per-card skip_merge opt-out. When set, a PR-carrying card is
+    # approved straight to ``done`` with NO merger spawned (explicit escape
+    # hatch from the merging-with-visibility flow).
+    task_row = get_task(conn, task_id)
+    skip_merge = bool(task_row.skip_merge) if task_row is not None else False
+
+    if pr_url is not None and not skip_merge:
+        # PR path: claim for the merger agent (human_review -> merging).
         task = claim_merger_task(
             conn, task_id, pr_url=pr_url, ttl_seconds=ttl_seconds,
         )
@@ -5804,7 +5903,9 @@ def approve_task(
             return _FAIL
         return (True, "merge_triggered", pr_url, task)
 
-    # No-PR path: transition directly to done (original behavior).
+    # No-PR path OR skip_merge set: transition directly to done. When a PR is
+    # present but skip_merge is set, this is the deliberate approve-without-
+    # merging escape hatch — no merger worker is spawned.
     now = int(time.time())
     with write_txn(conn):
         cur = conn.execute(
@@ -5828,8 +5929,18 @@ def approve_task(
             summary=reason,
         )
         _append_event(
-            conn, task_id, "approved",
-            {"reason": reason} if reason else None,
+            conn,
+            task_id,
+            "approved",
+            (
+                {
+                    "reason": reason,
+                    "skip_merge": True,
+                    "pr_url": pr_url,
+                }
+                if skip_merge and pr_url is not None
+                else ({"reason": reason} if reason else None)
+            ),
             run_id=run_id,
         )
     _clear_failure_counter(conn, task_id)
@@ -7378,20 +7489,32 @@ def heartbeat_worker(
     actual work process is stuck; periodic heartbeats catch that.
 
     Returns True on success, False if the task is not in a state that
-    should be heartbeating (not running, or claim expired).
+    should be heartbeating (not in an active worker status, or claim
+    expired).
+
+    Scoped to :data:`WORKER_ACTIVE_STATUSES` (``running`` *and*
+    ``merging``) rather than ``running`` alone: the post-approve merger
+    runs in ``merging`` and may heartbeat through this exact path
+    (``kanban_heartbeat`` + the tool-layer auto-heartbeat) to signal
+    liveness. If this only matched ``running``, a ``merging`` worker could
+    never write ``last_heartbeat_at`` even when it wanted to. (Nothing
+    reaps ``merging`` on a stalled heartbeat — the merger is the sole
+    authority to leave ``merging`` — but the path must still work so a live
+    merger can signal progress and extend its claim if it chooses to.)
     """
     now = int(time.time())
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running'",
+                f"WHERE id = ? AND {_WORKER_ACTIVE_STATUS_SQL}",
                 (now, task_id),
             )
         else:
             cur = conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+                f"WHERE id = ? AND {_WORKER_ACTIVE_STATUS_SQL} "
+                "AND current_run_id = ?",
                 (now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
@@ -7430,6 +7553,15 @@ def enforce_max_runtime(
     Runs host-local: only tasks claimed by this host are candidates
     (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
     test hook; defaults to ``os.kill`` on POSIX.
+
+    Intentionally scoped to ``status = 'running'``. The post-approve merger
+    runs in ``merging``, which NO reaper or runtime-cap automation touches:
+    the merger is the sole authority to leave ``merging`` (→ done on success,
+    or → blocked when it self-blocks on an unrecoverable conflict). A merger
+    that wedges past any runtime cap is left in ``merging`` for a human to
+    resolve — deliberately, so no background process can second-guess the
+    merger's judgment or risk a double-merge by re-queueing a half-finished
+    merge.
     """
     import signal
     timed_out: list[str] = []
@@ -9221,6 +9353,13 @@ def _dispatch_once_locked(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
     result.crashed = detect_crashed_workers(conn)
+    # NOTE: the post-approve merger runs in the dedicated ``merging`` status,
+    # which NO reaper / dispatcher automation touches. The merging worker is
+    # the sole authority to move a card out of ``merging`` (→ done on a
+    # successful merge, or → blocked when it calls kanban_block on an
+    # unrecoverable conflict). A merger whose process genuinely dies leaves the
+    # card in ``merging`` until a human intervenes — that tradeoff is
+    # intentional (no background process second-guesses the merger's judgment).
     # Reap scratch workspaces from tasks that have settled. Safe to call
     # here because the dispatcher is out-of-process from any worker — the
     # in-process inline rmtree on complete_task was deleting the worker's
@@ -9277,7 +9416,7 @@ def _dispatch_once_locked(
     if max_spawn is not None:
         running_count = int(
             conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                f"SELECT COUNT(*) FROM tasks WHERE {_WORKER_ACTIVE_STATUS_SQL}"
             ).fetchone()[0]
         )
 
@@ -9292,7 +9431,7 @@ def _dispatch_once_locked(
     # pile up and time out.
     if max_in_progress is not None and ready_rows:
         in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+            f"SELECT COUNT(*) FROM tasks WHERE {_WORKER_ACTIVE_STATUS_SQL}"
         ).fetchone()[0]
         if in_progress >= max_in_progress:
             return result
@@ -9317,7 +9456,7 @@ def _dispatch_once_locked(
     if _per_profile_cap is not None:
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
+            f"WHERE {_WORKER_ACTIVE_STATUS_SQL} AND assignee IS NOT NULL "
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
