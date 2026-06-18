@@ -105,6 +105,89 @@ def test_pre_existing_running_counts_against_cap(isolated_kanban_home_with_profi
     assert capped_assignees.count("beta") == 1
 
 
+def test_pre_existing_merging_counts_against_cap(isolated_kanban_home_with_profiles):
+    """A task in 'merging' (post-approve merger worker) is a live spawned
+    subprocess and must count toward the per-profile cap exactly like
+    'running'. Regression guard for the bug where moving the merger to
+    'merging' made it invisible to the per-profile counter, letting the
+    dispatcher over-spawn on top of live mergers.
+
+    With 1 alpha merger in flight and cap=1, NO new alpha tasks spawn; beta
+    is independent so 1 beta spawns.
+    """
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        merging_alpha = kb.create_task(conn, title="merging alpha", assignee="alpha")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'merging', claim_lock = 'test:1' WHERE id = ?",
+                (merging_alpha,),
+            )
+        for i in range(2):
+            kb.create_task(conn, title=f"a{i}", assignee="alpha")
+        for i in range(2):
+            kb.create_task(conn, title=f"b{i}", assignee="beta")
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(
+            conn, spawn_fn=_fake_spawn, dry_run=True,
+            max_in_progress_per_profile=1,
+        )
+    spawn_assignees = [s[1] for s in res.spawned]
+    capped_assignees = [c[1] for c in res.skipped_per_profile_capped]
+    assert spawn_assignees.count("alpha") == 0
+    assert spawn_assignees.count("beta") == 1
+    assert capped_assignees.count("alpha") == 2
+    assert capped_assignees.count("beta") == 1
+
+
+def test_pre_existing_merging_counts_against_max_in_progress(
+    isolated_kanban_home_with_profiles,
+):
+    """A 'merging' task counts toward the global max_in_progress cap too.
+    With max_in_progress=1 and 1 merger already in flight, the board is at
+    cap and nothing new spawns this tick.
+    """
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        merging = kb.create_task(conn, title="merging alpha", assignee="alpha")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'merging', claim_lock = 'test:1' WHERE id = ?",
+                (merging,),
+            )
+        kb.create_task(conn, title="ready beta", assignee="beta")
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(
+            conn, spawn_fn=_fake_spawn, dry_run=True, max_in_progress=1,
+        )
+    assert res.spawned == []
+
+
+def test_pre_existing_merging_counts_against_max_spawn(
+    isolated_kanban_home_with_profiles,
+):
+    """A 'merging' task counts toward the max_spawn live-concurrency cap.
+    With max_spawn=1 and 1 merger in flight, no further worker spawns.
+    """
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        merging = kb.create_task(conn, title="merging alpha", assignee="alpha")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'merging', claim_lock = 'test:1' WHERE id = ?",
+                (merging,),
+            )
+        kb.create_task(conn, title="ready beta", assignee="beta")
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(
+            conn, spawn_fn=_fake_spawn, dry_run=True, max_spawn=1,
+        )
+    assert res.spawned == []
+
+
 @pytest.mark.parametrize("cap", [0, -1, "abc", None])
 def test_invalid_cap_treated_as_no_cap(isolated_kanban_home_with_profiles, cap):
     """Cap values that don't represent a positive int should be treated as
