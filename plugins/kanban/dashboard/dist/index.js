@@ -100,6 +100,7 @@
     blocked: "Blocked",
     review: "Review",
     human_review: "Human Review",
+    merging: "Merging",
     done: "Done",
     archived: "Archived",
   };
@@ -112,6 +113,7 @@
     blocked: "Worker asked for human input",
     review: "Auto-review agent is verifying the work",
     human_review: "Waiting on a human approve/reject decision",
+    merging: "Merger worker is merging the PR",
     done: "Completed",
     archived: "Archived",
   };
@@ -166,6 +168,7 @@
     blocked: "hermes-kanban-dot-blocked",
     review: "hermes-kanban-dot-review",
     human_review: "hermes-kanban-dot-human-review",
+    merging: "hermes-kanban-dot-merging",
     done: "hermes-kanban-dot-done",
     archived: "hermes-kanban-dot-archived",
   };
