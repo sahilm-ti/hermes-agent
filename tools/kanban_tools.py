@@ -1150,18 +1150,37 @@ def _handle_approve(args: dict, **kw) -> str:
     """Approve a human_review task.
 
     No-PR path: task transitions human_review → done immediately.
-    PR path: task transitions human_review → running, the post-approve-merger
-    worker is spawned in the background, and status="merge_triggered" is
-    returned so the caller knows the merge is in progress.
+    skip_merge path: when ``skip_merge`` is set on the call (or already on the
+    card), the task goes human_review → done directly with NO merger spawned,
+    even if a PR URL is present in the thread.
+    PR path (default): task transitions human_review → merging, the
+    post-approve-merger worker is spawned in the background (running while the
+    card is in ``merging``), and status="merge_triggered" is returned so the
+    caller knows the merge is in progress.
     """
     tid = args.get("task_id")
     if not tid:
         return tool_error("task_id is required")
     reason = args.get("reason")
     board = args.get("board")
+    skip_merge, bool_error = _parse_bool_arg(args, "skip_merge")
+    if bool_error:
+        return tool_error(bool_error)
     try:
         kb, conn = _connect(board=board)
         try:
+            if skip_merge:
+                # Set the opt-out flag BEFORE routing so approve_task skips the
+                # merger and goes straight to done. Gate the write on the card
+                # actually being in human_review (the only state in which
+                # approve_task can succeed) so a stray skip_merge never persists
+                # when the paired approve would fail.
+                _sm_task = kb.get_task(conn, str(tid))
+                if _sm_task is None or _sm_task.status != "human_review":
+                    return tool_error(
+                        f"could not approve {tid} (not in human_review or unknown)"
+                    )
+                kb.set_skip_merge(conn, str(tid), value=True)
             ok, outcome, pr_url, task = kb.approve_task(conn, str(tid), reason=reason)
             if not ok:
                 return tool_error(
@@ -1201,10 +1220,15 @@ def _handle_approve(args: dict, **kw) -> str:
                 return _ok(
                     task_id=str(tid),
                     status="merge_triggered",
+                    card_status="merging",
                     pr_url=pr_url,
                 )
-            # No-PR path: done.
-            return _ok(task_id=str(tid), status="done")
+            # No-PR path OR skip_merge set: done (no merger spawned).
+            return _ok(
+                task_id=str(tid),
+                status="done",
+                skip_merge=skip_merge,
+            )
         finally:
             conn.close()
     except ValueError as e:
@@ -1819,9 +1843,12 @@ KANBAN_HUMAN_REVIEW_SCHEMA = {
 KANBAN_APPROVE_SCHEMA = {
     "name": "kanban_approve",
     "description": (
-        "Approve a task currently in 'human_review' (-> done). Use this "
-        "when you (or the dispatched reviewer) judge the work meets the "
-        "task's acceptance criteria."
+        "Approve a task currently in 'human_review'. Use this when you (or "
+        "the dispatched reviewer) judge the work meets the task's acceptance "
+        "criteria. If the card has a PR URL in its thread (and skip_merge is "
+        "not set) the card transitions to 'merging' and a post-approve-merger "
+        "worker lands the PR. Otherwise (no PR, or skip_merge set) the card "
+        "goes straight to 'done'."
     ),
     "parameters": {
         "type": "object",
@@ -1833,6 +1860,16 @@ KANBAN_APPROVE_SCHEMA = {
             "reason": {
                 "type": "string",
                 "description": "Optional approval note (audit-only).",
+            },
+            "skip_merge": {
+                "type": "boolean",
+                "description": (
+                    "When true, approve straight to 'done' WITHOUT spawning "
+                    "the post-approve merger, even if a PR URL is present in "
+                    "the thread. The explicit approve-without-merging escape "
+                    "hatch. Default false (merge with the visible 'merging' "
+                    "state)."
+                ),
             },
             "board": _board_schema_prop(),
         },
