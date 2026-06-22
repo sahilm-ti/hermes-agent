@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -416,6 +415,638 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):
+    """A worker scoped to a dir: task that spawns a child without a
+    workspace arg inherits the dir, not scratch (so follow-up code-gen
+    lands in the same project)."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    proj = "/home/teknium/myproject"
+    conn = kb.connect()
+    try:
+        self_tid = kb.create_task(
+            conn, title="dir worker", assignee="test-worker",
+            workspace_kind="dir", workspace_path=proj,
+        )
+        kb.claim_task(conn, self_tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", self_tid)
+
+    d = json.loads(kt._handle_create({"title": "follow-up", "assignee": "peer"}))
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child.workspace_kind == "dir"
+        assert child.workspace_path == proj
+    finally:
+        conn.close()
+
+
+def test_create_explicit_workspace_beats_inheritance(monkeypatch, worker_env):
+    """An explicit workspace arg overrides worker-task inheritance."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        self_tid = kb.create_task(
+            conn, title="dir worker", assignee="test-worker",
+            workspace_kind="dir", workspace_path="/home/teknium/proj",
+        )
+        kb.claim_task(conn, self_tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", self_tid)
+
+    d = json.loads(kt._handle_create({
+        "title": "scratch child", "assignee": "peer",
+        "workspace_kind": "scratch",
+    }))
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child.workspace_kind == "scratch"
+    finally:
+        conn.close()
+
+
+def test_create_no_worker_task_stays_scratch(monkeypatch, worker_env):
+    """Orchestrator/CLI callers (no HERMES_KANBAN_TASK) still default to
+    scratch — inheritance only applies to task-scoped workers."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    d = json.loads(kt._handle_create({"title": "orch child", "assignee": "peer"}))
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child.workspace_kind == "scratch"
+        assert child.workspace_path is None
+    finally:
+        conn.close()
+
+
+def test_create_stamps_session_id_from_env(monkeypatch, worker_env):
+    """When the agent loop runs under ACP, the server propagates the
+    originating chat session id via HERMES_SESSION_ID. ``kanban_create``
+    reads it and stamps the new task so clients can render a per-session
+    board (issue: ACP session linkage on kanban tasks)."""
+    monkeypatch.setenv("HERMES_SESSION_ID", "acp-sess-abc")
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "from chat",
+        "assignee": "peer",
+        "parents": [worker_env],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        new_task = kb.get_task(conn, d["task_id"])
+        assert new_task.session_id == "acp-sess-abc"
+    finally:
+        conn.close()
+
+
+def test_create_session_id_arg_overrides_env(monkeypatch, worker_env):
+    """An explicit ``session_id`` arg from the model wins over the env
+    propagation. Edge case but exercised: a tool call could carry a
+    different session id (e.g. cross-session linking) and the explicit
+    arg should not be silently overwritten."""
+    monkeypatch.setenv("HERMES_SESSION_ID", "from-env")
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "explicit override",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "session_id": "explicit-arg",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        new_task = kb.get_task(conn, d["task_id"])
+        assert new_task.session_id == "explicit-arg"
+    finally:
+        conn.close()
+
+
+def test_create_session_id_absent_when_env_unset(monkeypatch, worker_env):
+    """No env var, no arg → session_id stays NULL. Important for backwards
+    compatibility: pre-ACP-propagation hosts and CLI-driven creates must
+    not accidentally inherit a stale id."""
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "no session",
+        "assignee": "peer",
+        "parents": [worker_env],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        new_task = kb.get_task(conn, d["task_id"])
+        assert new_task.session_id is None
+    finally:
+        conn.close()
+
+
+def test_create_rejects_no_title(worker_env):
+    from tools import kanban_tools as kt
+    assert json.loads(kt._handle_create({"assignee": "x"})).get("error")
+    assert json.loads(kt._handle_create({"title": "   ", "assignee": "x"})).get("error")
+
+
+def test_create_auto_subscribes_originating_gateway_chat(worker_env):
+    """When the tool runs inside a gateway message handler the session
+    context vars are bound to the originating chat. The new task should
+    get a kanban_notify_subs row pointing at that chat so the user is
+    notified on terminal events. Regression: t_ec4bbd10 (BSB) completed
+    but no Telegram notification fired because the orchestrator's
+    kanban_create tool didn't subscribe the origin."""
+    from gateway.session_context import set_session_vars, clear_session_vars
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1001234567890",
+        thread_id="17585",
+        user_id="42",
+        user_name="sahil",
+        session_key="telegram:-1001234567890:17585",
+    )
+    try:
+        out = kt._handle_create({
+            "title": "from orchestrator",
+            "assignee": "peer",
+            "parents": [worker_env],
+        })
+    finally:
+        clear_session_vars(tokens)
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d.get("subscribed") is True
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id=d["task_id"])
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    row = subs[0]
+    assert row["platform"] == "telegram"
+    assert row["chat_id"] == "-1001234567890"
+    assert row["thread_id"] == "17585"
+    assert row["user_id"] == "42"
+    assert row["notifier_profile"] == "test-worker"
+
+
+def test_create_auto_subscribe_notifier_profile_falls_back_to_active_profile(
+    worker_env, monkeypatch,
+):
+    """Regression for t_b212a749: the gateway process never exports
+    HERMES_PROFILE — only the dispatcher does, for spawned workers — so
+    the auto-subscribe path must fall back to
+    ``hermes_cli.profiles.get_active_profile_name()`` to record the
+    right ``notifier_profile``. Without this, the inserted row has
+    ``notifier_profile=NULL`` and the multi-gateway notifier filter
+    silently drops every event for the task."""
+    from gateway.session_context import set_session_vars, clear_session_vars
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    # Simulate the gateway: HERMES_PROFILE is unset but the active
+    # profile (driven by HERMES_HOME) is well-defined.
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name",
+        lambda: "braintrustorch",
+    )
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1001234567890",
+        thread_id="17585",
+        user_id="42",
+        user_name="sahil",
+        session_key="telegram:-1001234567890:17585",
+    )
+    try:
+        out = kt._handle_create({
+            "title": "fallback profile",
+            "assignee": "peer",
+            "parents": [worker_env],
+        })
+    finally:
+        clear_session_vars(tokens)
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d.get("subscribed") is True
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id=d["task_id"])
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    assert subs[0]["notifier_profile"] == "braintrustorch"
+
+
+def test_create_no_auto_subscribe_without_origin(worker_env):
+    """CLI / cron / dispatcher-spawned-worker invocations have no
+    session-origin context vars bound. ``kanban_create`` must not insert
+    a phantom subscription row in that case (status quo preserved)."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_create({
+        "title": "no origin",
+        "assignee": "peer",
+        "parents": [worker_env],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d.get("subscribed") is False
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id=d["task_id"])
+    finally:
+        conn.close()
+    assert subs == []
+
+
+def test_create_auto_subscribe_opt_out(worker_env):
+    """``auto_subscribe=false`` suppresses subscription even when the
+    gateway origin is bound. Used by orchestrators fanning out internal
+    children where only the parent should notify."""
+    from gateway.session_context import set_session_vars, clear_session_vars
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1001234567890",
+        thread_id="17585",
+        user_id="42",
+        user_name="sahil",
+        session_key="k",
+    )
+    try:
+        out = kt._handle_create({
+            "title": "no notify",
+            "assignee": "peer",
+            "parents": [worker_env],
+            "auto_subscribe": False,
+        })
+    finally:
+        clear_session_vars(tokens)
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d.get("subscribed") is False
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id=d["task_id"])
+    finally:
+        conn.close()
+    assert subs == []
+
+
+def test_create_inherits_parent_subscriptions_without_origin(worker_env):
+    """Worker spawned without a gateway session origin (CLI / dispatcher
+    path) still inherits each parent's notification subscriptions so
+    fan-outs keep pinging the chat already tracking the parent. See task
+    t_2b0e7ab6."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    # Seed the parent (worker_env's task) with a subscription as if the
+    # gateway had originally registered it.
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(
+            conn,
+            task_id=worker_env,
+            platform="telegram",
+            chat_id="-1001234567890",
+            thread_id="17585",
+            user_id="42",
+            notifier_profile="braintrustorch",
+        )
+    finally:
+        conn.close()
+
+    out = kt._handle_create({
+        "title": "fanned-out child",
+        "assignee": "peer",
+        "parents": [worker_env],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d.get("subscribed") is True
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id=d["task_id"])
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    sub = subs[0]
+    assert sub["platform"] == "telegram"
+    assert sub["chat_id"] == "-1001234567890"
+    assert sub["thread_id"] == "17585"
+    assert sub["user_id"] == "42"
+    assert sub["notifier_profile"] == "braintrustorch"
+
+
+def test_create_inherits_multi_parent_subs_unioned_and_deduped(worker_env):
+    """Multi-parent fan-in: child inherits the UNION of every parent's
+    subscriptions, deduped by (platform, chat_id, thread_id)."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        # Parent A — Telegram thread.
+        kb.add_notify_sub(
+            conn,
+            task_id=worker_env,
+            platform="telegram",
+            chat_id="-1001111111111",
+            thread_id="100",
+            user_id="42",
+            notifier_profile="braintrustorch",
+        )
+        # Second parent with two subs, one of which overlaps parent A.
+        parent_b = kb.create_task(
+            conn, title="parent B", assignee="peer",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=parent_b,
+            platform="telegram",
+            chat_id="-1001111111111",
+            thread_id="100",
+            user_id="42",
+            notifier_profile="braintrustorch",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=parent_b,
+            platform="discord",
+            chat_id="999",
+            thread_id=None,
+            user_id=None,
+            notifier_profile="braintrustorch",
+        )
+    finally:
+        conn.close()
+
+    out = kt._handle_create({
+        "title": "child of A+B",
+        "assignee": "peer",
+        "parents": [worker_env, parent_b],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d.get("subscribed") is True
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id=d["task_id"])
+    finally:
+        conn.close()
+    # Two distinct rows: telegram thread 100 + discord 999. Telegram row
+    # appears once even though both parents had it.
+    assert len(subs) == 2
+    keyed = {(s["platform"], s["chat_id"], s["thread_id"]) for s in subs}
+    assert ("telegram", "-1001111111111", "100") in keyed
+    assert ("discord", "999", "") in keyed
+
+
+def test_create_parent_inheritance_dedupes_with_origin(worker_env):
+    """When both the session origin AND a parent point at the same chat,
+    only one row is inserted (add_notify_sub is INSERT OR IGNORE on the
+    (task, platform, chat, thread) uniqueness key)."""
+    from gateway.session_context import set_session_vars, clear_session_vars
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(
+            conn,
+            task_id=worker_env,
+            platform="telegram",
+            chat_id="-1001234567890",
+            thread_id="17585",
+            user_id="42",
+            notifier_profile="braintrustorch",
+        )
+    finally:
+        conn.close()
+
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="-1001234567890",
+        thread_id="17585",
+        user_id="42",
+        user_name="sahil",
+        session_key="k",
+    )
+    try:
+        out = kt._handle_create({
+            "title": "origin + parent overlap",
+            "assignee": "peer",
+            "parents": [worker_env],
+        })
+    finally:
+        clear_session_vars(tokens)
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id=d["task_id"])
+    finally:
+        conn.close()
+    assert len(subs) == 1
+
+
+def test_create_parent_inheritance_respects_opt_out(worker_env):
+    """``auto_subscribe=False`` suppresses parent inheritance too — used
+    by orchestrators that want only the parent card to notify."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(
+            conn,
+            task_id=worker_env,
+            platform="telegram",
+            chat_id="-1001234567890",
+            thread_id="17585",
+            user_id="42",
+            notifier_profile="braintrustorch",
+        )
+    finally:
+        conn.close()
+
+    out = kt._handle_create({
+        "title": "silent child",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "auto_subscribe": False,
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d.get("subscribed") is False
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id=d["task_id"])
+    finally:
+        conn.close()
+    assert subs == []
+
+
+def test_create_parent_inheritance_no_op_when_parent_has_no_subs(worker_env):
+    """Parent with zero subs → child with zero subs (matches today's
+    'background cron job creates standalone card' pattern)."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_create({
+        "title": "lonely child",
+        "assignee": "peer",
+        "parents": [worker_env],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d.get("subscribed") is False
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id=d["task_id"])
+    finally:
+        conn.close()
+    assert subs == []
+
+
+def test_create_schema_advertises_auto_subscribe():
+    from tools.kanban_tools import KANBAN_CREATE_SCHEMA
+    props = KANBAN_CREATE_SCHEMA["parameters"]["properties"]
+    assert "auto_subscribe" in props
+    assert props["auto_subscribe"]["type"] == "boolean"
+def test_create_rejects_no_assignee(worker_env):
+    from tools import kanban_tools as kt
+    assert json.loads(kt._handle_create({"title": "t"})).get("error")
+
+
+def test_create_rejects_non_list_parents(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_create({"title": "t", "assignee": "a", "parents": 42})
+    assert json.loads(out).get("error")
+
+
+def test_create_parses_triage_string_false(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "not triage",
+        "assignee": "peer",
+        "triage": "false",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, d["task_id"])
+        assert task.status == "ready"
+    finally:
+        conn.close()
+
+
+def test_create_parses_triage_string_true(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "needs triage",
+        "assignee": "peer",
+        "triage": "true",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, d["task_id"])
+        assert task.status == "triage"
+    finally:
+        conn.close()
+
+
+def test_create_rejects_bad_triage(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_create({
+        "title": "bad triage",
+        "assignee": "peer",
+        "triage": "sometimes",
+    })
+    assert "triage must be" in json.loads(out).get("error", "")
+
+
+def test_create_accepts_string_parent(worker_env):
+    """Convenience: a single parent id as string is coerced to [id]."""
+    from tools import kanban_tools as kt
+    out = kt._handle_create({
+        "title": "t", "assignee": "a", "parents": worker_env,
+    })
+    assert json.loads(out)["ok"]
+
+
+def test_create_accepts_skills_list(worker_env):
+    """Tool writes the per-task skills through to the kernel."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "skilled",
+        "assignee": "linguist",
+        "skills": ["translation", "github-code-review"],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, d["task_id"])
+    assert task.skills == ["translation", "github-code-review"]
+
+
+def test_create_accepts_skills_string(worker_env):
+    """Convenience: a single skill name as string is coerced to [name]."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "one-skill",
+        "assignee": "a",
+        "skills": "translation",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, d["task_id"])
+    assert task.skills == ["translation"]
+
+
+def test_create_rejects_non_list_skills(worker_env):
+    """skills: 42 must be rejected, not silently dropped."""
+    from tools import kanban_tools as kt
+    out = kt._handle_create({
+        "title": "t", "assignee": "a", "skills": 42,
+    })
+    assert json.loads(out).get("error")
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
@@ -560,11 +1191,10 @@ def test_kanban_guidance_prompt_size_bounded():
     (pasted docs, duplicated sections) before it ships to every worker.
     """
     from agent.prompt_builder import KANBAN_GUIDANCE
-
-    assert len(KANBAN_GUIDANCE) < 8000, (
-        f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars; it is injected into "
-        "every kanban worker's system prompt — trim it or consciously re-bound "
-        "this invariant with justification."
+    guidance_len = len(KANBAN_GUIDANCE)
+    assert 1_500 < guidance_len < 8_000, (
+        f"KANBAN_GUIDANCE is {guidance_len} chars; expected 1500-8000 so "
+        "guidance is not missing and the per-worker prompt tax stays bounded"
     )
 
 
@@ -832,8 +1462,6 @@ def _sub_index(subs):
                 "chat_id": getattr(s, "chat_id", None),
                 "thread_id": getattr(s, "thread_id", None),
                 "user_id": getattr(s, "user_id", None),
-                "delivery_metadata": getattr(s, "delivery_metadata", None),
-                "notifier_profile": getattr(s, "notifier_profile", None),
             })
     return out
 
@@ -843,17 +1471,25 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     to its own kanban_create result, and the response surfaces the
     ``subscribed`` flag so the orchestrator can react."""
     from tools import kanban_tools as kt
-    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
-    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
-    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-7")
-    monkeypatch.setenv("HERMES_SESSION_USER_ID", "user-9")
-    monkeypatch.setenv("HERMES_SESSION_USER_ID_ALT", "alt-user-9")
-    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "forum")
-
-    out = kt._handle_create({
-        "title": "auto-sub gateway",
-        "assignee": "peer",
-    })
+    # Use set_session_vars so ContextVars take precedence over os.environ
+    # regardless of which test ran before (clear_session_vars sets CVars to ""
+    # which blocks the os.environ fallback path — see get_session_env).
+    from gateway.session_context import set_session_vars, clear_session_vars
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="chat-42",
+        thread_id="thread-7",
+        user_id="user-9",
+        user_id_alt="alt-user-9",
+        chat_type="forum",
+    )
+    try:
+        out = kt._handle_create({
+            "title": "auto-sub gateway",
+            "assignee": "peer",
+        })
+    finally:
+        clear_session_vars(tokens)
     d = json.loads(out)
     assert d["ok"] is True
     new_tid = d["task_id"]
