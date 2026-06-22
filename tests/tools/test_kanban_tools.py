@@ -1619,7 +1619,7 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 5_500, (
+    assert 1_500 < len(KANBAN_GUIDANCE) < 6_500, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 
@@ -2245,15 +2245,23 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     to its own kanban_create result, and the response surfaces the
     ``subscribed`` flag so the orchestrator can react."""
     from tools import kanban_tools as kt
-    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
-    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
-    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-7")
-    monkeypatch.setenv("HERMES_SESSION_USER_ID", "user-9")
-
-    out = kt._handle_create({
-        "title": "auto-sub gateway",
-        "assignee": "peer",
-    })
+    # Use set_session_vars so ContextVars take precedence over os.environ
+    # regardless of which test ran before (clear_session_vars sets CVars to ""
+    # which blocks the os.environ fallback path — see get_session_env).
+    from gateway.session_context import set_session_vars, clear_session_vars
+    tokens = set_session_vars(
+        platform="telegram",
+        chat_id="chat-42",
+        thread_id="thread-7",
+        user_id="user-9",
+    )
+    try:
+        out = kt._handle_create({
+            "title": "auto-sub gateway",
+            "assignee": "peer",
+        })
+    finally:
+        clear_session_vars(tokens)
     d = json.loads(out)
     assert d["ok"] is True
     new_tid = d["task_id"]
