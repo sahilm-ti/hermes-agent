@@ -11695,6 +11695,11 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    crash_breaker_enabled: bool = False,
+    crash_breaker_max_crashes: int = DEFAULT_CRASH_BREAKER_MAX_CRASHES,
+    crash_breaker_window_seconds: int = DEFAULT_CRASH_BREAKER_WINDOW_SECONDS,
+    crash_breaker_cooldown_seconds: int = DEFAULT_CRASH_BREAKER_COOLDOWN_SECONDS,
+    crash_breaker_max_cooldown_seconds: int = DEFAULT_CRASH_BREAKER_MAX_COOLDOWN_SECONDS,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -11717,7 +11722,7 @@ def dispatch_once(
         # Path resolution should never fail, but if it somehow does we
         # must not lose the tick — fall through to an unguarded dispatch
         # rather than dropping work.
-        result = _dispatch_once_locked(
+        return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
             ttl_seconds=ttl_seconds,
@@ -11726,13 +11731,17 @@ def dispatch_once(
             max_in_progress=max_in_progress,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
+            stuck_after_seconds_default=stuck_after_seconds_default,
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            crash_breaker_enabled=crash_breaker_enabled,
+            crash_breaker_max_crashes=crash_breaker_max_crashes,
+            crash_breaker_window_seconds=crash_breaker_window_seconds,
+            crash_breaker_cooldown_seconds=crash_breaker_cooldown_seconds,
+            crash_breaker_max_cooldown_seconds=crash_breaker_max_cooldown_seconds,
         )
-        _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
-        return result
     with _dispatch_tick_lock(db_path) as held:
         if not held:
             result = DispatchResult(skipped_locked=True)
@@ -11746,10 +11755,16 @@ def dispatch_once(
                 max_in_progress=max_in_progress,
                 failure_limit=failure_limit,
                 stale_timeout_seconds=stale_timeout_seconds,
+                stuck_after_seconds_default=stuck_after_seconds_default,
                 board=board,
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                crash_breaker_enabled=crash_breaker_enabled,
+                crash_breaker_max_crashes=crash_breaker_max_crashes,
+                crash_breaker_window_seconds=crash_breaker_window_seconds,
+                crash_breaker_cooldown_seconds=crash_breaker_cooldown_seconds,
+                crash_breaker_max_cooldown_seconds=crash_breaker_max_cooldown_seconds,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -11773,10 +11788,16 @@ def _dispatch_once_locked(
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
+    stuck_after_seconds_default: int = DEFAULT_STUCK_AFTER_SECONDS,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    crash_breaker_enabled: bool = False,
+    crash_breaker_max_crashes: int = DEFAULT_CRASH_BREAKER_MAX_CRASHES,
+    crash_breaker_window_seconds: int = DEFAULT_CRASH_BREAKER_WINDOW_SECONDS,
+    crash_breaker_cooldown_seconds: int = DEFAULT_CRASH_BREAKER_COOLDOWN_SECONDS,
+    crash_breaker_max_cooldown_seconds: int = DEFAULT_CRASH_BREAKER_MAX_COOLDOWN_SECONDS,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
