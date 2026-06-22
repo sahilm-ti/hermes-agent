@@ -495,11 +495,8 @@ class TestToBoolHardening:
             )
         )
         assert add_result["success"] is True
-        # The add response carries the live entries list — confirm the entry is there
-        assert any(content in entry for entry in add_result.get("entries", [])), (
-            "bypassed entry should be present in the store's entries after add"
-        )
-        # Also confirm via the MemoryStore object directly
+        # Confirm via the MemoryStore object directly (response no longer echoes entries
+        # to avoid model thrash — see _success_response comment in memory_tool.py)
         assert content in store._entries_for("memory"), (
             "bypassed entry should be persisted in the in-memory store"
         )
