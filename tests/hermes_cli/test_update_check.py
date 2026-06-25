@@ -173,7 +173,9 @@ def test_check_via_local_git_shallow_clone_behind_reports_no_count(tmp_path):
     with patch("hermes_cli.banner.subprocess.run", side_effect=fake_run):
         result = banner._check_via_local_git(repo_dir)
 
-    assert result == banner.UPDATE_AVAILABLE_NO_COUNT
+    behind, baseline = result
+    assert behind == banner.UPDATE_AVAILABLE_NO_COUNT
+    assert baseline == banner.BASELINE_UPSTREAM
     # The shallow fetch must preserve the boundary (--depth 1), not unshallow.
     assert ["git", "fetch", "origin", "--depth", "1", "--quiet"] in calls
 
@@ -202,7 +204,9 @@ def test_check_via_local_git_shallow_clone_up_to_date(tmp_path):
     with patch("hermes_cli.banner.subprocess.run", side_effect=fake_run):
         result = banner._check_via_local_git(repo_dir)
 
-    assert result == 0
+    behind, baseline = result
+    assert behind == 0
+    assert baseline == banner.BASELINE_UPSTREAM
 
 
 def test_check_via_local_git_full_clone_keeps_exact_count(tmp_path):
@@ -227,7 +231,9 @@ def test_check_via_local_git_full_clone_keeps_exact_count(tmp_path):
     with patch("hermes_cli.banner.subprocess.run", side_effect=fake_run):
         result = banner._check_via_local_git(repo_dir)
 
-    assert result == 7
+    behind, baseline = result
+    assert behind == 7
+    assert baseline == banner.BASELINE_UPSTREAM
 
 
 def test_check_for_updates_no_git_dir(tmp_path, monkeypatch):
