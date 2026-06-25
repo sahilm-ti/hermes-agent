@@ -2957,6 +2957,39 @@ def test_setup_runtime_check_rejects_implicit_bedrock_when_unconfigured(monkeypa
     assert resp["result"]["provider"] == "bedrock"
 
 
+def test_setup_runtime_check_honors_requested_provider(monkeypatch):
+    """Onboarding must be able to validate the provider the user just connected."""
+    monkeypatch.setattr("hermes_cli.main._has_any_provider_configured", lambda: True)
+
+    def fake_resolve(requested=None, **kwargs):
+        if requested == "nous":
+            return {
+                "provider": "nous",
+                "api_key": "invoke-jwt",
+                "source": "portal",
+            }
+        return {
+            "provider": "anthropic",
+            "api_key": "",
+            "source": "config",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        fake_resolve,
+    )
+
+    scoped = server.handle_request(
+        {"id": "1", "method": "setup.runtime_check", "params": {"provider": "nous"}}
+    )
+    assert scoped["result"]["ok"] is True
+    assert scoped["result"]["provider"] == "nous"
+
+    default = server.handle_request({"id": "1", "method": "setup.runtime_check", "params": {}})
+    assert default["result"]["ok"] is False
+    assert default["result"]["provider"] == "anthropic"
+
+
 def test_complete_slash_drops_removed_provider_alias():
     # `/provider` was folded into a single `/model` command, so autocomplete
     # must no longer offer the dead alias...
@@ -6104,6 +6137,65 @@ def test_session_most_recent_handles_db_unavailable(monkeypatch):
     )
 
     assert resp["result"]["session_id"] is None
+
+
+# ── verification.status ──────────────────────────────────────────────
+
+
+def test_verification_status_returns_recorded_evidence(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "package.json").write_text(
+        json.dumps({"scripts": {"test": "vitest"}}),
+        encoding="utf-8",
+    )
+    (project / "pnpm-lock.yaml").write_text("", encoding="utf-8")
+    try:
+        from agent.verification_evidence import record_terminal_result
+
+        record_terminal_result(
+            command="pnpm run test",
+            cwd=project,
+            session_id="sid",
+            exit_code=0,
+            output="green",
+        )
+
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "verification.status",
+                "params": {"cwd": str(project), "session_id": "sid"},
+            }
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    verification = resp["result"]["verification"]
+    assert verification["status"] == "passed"
+    assert verification["evidence"]["canonical_command"] == "pnpm run test"
+    assert verification["evidence"]["scope"] == "full"
+
+
+def test_verification_status_outside_workspace_is_not_applicable(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "verification.status",
+                "params": {"cwd": str(tmp_path), "session_id": "sid"},
+            }
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert resp["result"]["verification"]["status"] == "not_applicable"
 
 
 # ── browser.manage ───────────────────────────────────────────────────
