@@ -765,11 +765,19 @@ class TestLaunchdServiceRecovery:
         monkeypatch.setattr(
             gateway_cli, "_is_pid_ancestor_of_current_process", lambda pid: False
         )
+        # Pin the session type to headless so _launchd_domain() returns
+        # user/<uid> regardless of whether the runner is an Aqua GUI session.
+        monkeypatch.setattr(gateway_cli, "_launchctl_session_managername", lambda: None)
+        fixed_domain = f"user/{os.getuid()}"
 
         run_calls = []
 
         def fake_run(cmd, check=False, **kwargs):
             run_calls.append(cmd)
+            # launchctl print probes must fail so _launchd_domain_for_existing_job
+            # falls through to _launchd_domain() rather than returning gui/<uid>.
+            if cmd and cmd[0] == "launchctl" and len(cmd) > 1 and cmd[1] == "print":
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
@@ -786,11 +794,10 @@ class TestLaunchdServiceRecovery:
         # No detached helper — direct path taken.
         assert not popen_calls
         label = gateway_cli.get_launchd_label()
-        domain = gateway_cli._launchd_domain()
         service_calls = [c for c in run_calls if "bootout" in c or "bootstrap" in c]
         assert service_calls[:2] == [
-            ["launchctl", "bootout", f"{domain}/{label}"],
-            ["launchctl", "bootstrap", domain, str(plist_path)],
+            ["launchctl", "bootout", f"{fixed_domain}/{label}"],
+            ["launchctl", "bootstrap", fixed_domain, str(plist_path)],
         ]
 
     def test_launchd_start_reloads_unloaded_job_and_retries(self, tmp_path, monkeypatch):

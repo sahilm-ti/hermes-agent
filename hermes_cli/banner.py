@@ -253,8 +253,6 @@ def _check_via_local_git(repo_dir: Path) -> tuple[Optional[int], str]:
     if _is_official_ssh_remote(origin_url):
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         behind = _check_via_rev(head_rev) if head_rev else None
-        if behind == UPDATE_AVAILABLE_NO_COUNT:
-            return 1, BASELINE_UPSTREAM
         return behind, BASELINE_UPSTREAM
 
     # Installer checkouts are shallow (`git clone --depth 1`). On a shallow
