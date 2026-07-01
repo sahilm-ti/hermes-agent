@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import platform
+import secrets
 import shlex
 import socket
 import subprocess
@@ -90,7 +91,16 @@ _SAFE_ENV_PREFIXES = ("PATH", "HOME", "USER", "LANG", "LC_", "TERM",
                       "TMPDIR", "TMP", "TEMP", "SHELL", "LOGNAME",
                       "XDG_", "PYTHONPATH", "VIRTUAL_ENV", "CONDA")
 _SECRET_SUBSTRINGS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL",
-                      "PASSWD", "AUTH", "DSN", "WEBHOOK")
+                      "PASSWD", "AUTH", "DSN", "WEBHOOK",
+                      # Abbreviations that appear in real-world credential
+                      # variable names but were previously undetected:
+                      # CREDS (CREDENTIALS abbreviated), BEARER
+                      # (Authorization: Bearer tokens), APIKEY (written
+                      # without an underscore). "PASS" is intentionally NOT
+                      # added — it false-positives on legitimate non-secret
+                      # vars (BYPASS_CACHE, COMPASS_DIR, PASSENGER_HOST) while
+                      # PASSWORD/PASSWD already cover the credential cases.
+                      "CREDS", "BEARER", "APIKEY")
 
 # Operational HERMES_* vars the child legitimately needs by exact name — these
 # are non-secret runtime-location flags (the same set hermes_cli treats as the
@@ -223,9 +233,9 @@ _TOOL_STUBS = {
     ),
     "web_extract": (
         "web_extract",
-        "urls: list",
-        '"""Extract content from URLs. Returns dict with results list of {url, title, content, error}."""',
-        '{"urls": urls}',
+        "urls: list, char_limit: int = None",
+        '"""Extract content from URLs (no LLM summarization). Returns dict with results list of {url, title, content, error}. Pages over char_limit (default 15000) are head+tail truncated with the full text stored on disk; the content footer gives the path. content is markdown."""',
+        '{"urls": urls, "char_limit": char_limit}',
     ),
     "read_file": (
         "read_file",
@@ -380,7 +390,11 @@ def _connect():
 
 def _call(tool_name, args):
     """Send a tool call to the parent process and return the parsed result."""
-    request = json.dumps({"tool": tool_name, "args": args}) + "\\n"
+    request = json.dumps({
+        "tool": tool_name,
+        "args": args,
+        "token": os.environ.get("HERMES_RPC_TOKEN", ""),
+    }) + "\\n"
     with _call_lock:
         conn = _connect()
         conn.sendall(request.encode())
@@ -437,7 +451,12 @@ def _call(tool_name, args):
     # non-ASCII chars in tool args when encoding them as JSON.
     tmp = req_file + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"tool": tool_name, "args": args, "seq": seq}, f)
+        json.dump({
+            "tool": tool_name,
+            "args": args,
+            "seq": seq,
+            "token": os.environ.get("HERMES_RPC_TOKEN", ""),
+        }, f)
     os.rename(tmp, req_file)
 
     # Wait for response with adaptive polling
@@ -486,6 +505,7 @@ def _rpc_server_loop(
     max_tool_calls: int,
     allowed_tools: frozenset,
     stop_event: threading.Event,
+    rpc_token: str,
 ):
     """
     Accept one client connection and dispatch tool-call requests until
@@ -528,6 +548,13 @@ def _rpc_server_loop(
                     request = json.loads(line.decode())
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     resp = tool_error(f"Invalid RPC request: {exc}")
+                    conn.sendall((resp + "\n").encode())
+                    continue
+
+                if not rpc_token or not secrets.compare_digest(
+                    str(request.get("token") or ""), rpc_token
+                ):
+                    resp = json.dumps({"error": "Unauthorized RPC request"})
                     conn.sendall((resp + "\n").encode())
                     continue
 
@@ -779,6 +806,7 @@ def _rpc_poll_loop(
     max_tool_calls: int,
     allowed_tools: frozenset,
     stop_event: threading.Event,
+    rpc_token: str,
 ):
     """Poll the remote filesystem for tool call requests and dispatch them.
 
@@ -832,6 +860,13 @@ def _rpc_poll_loop(
                 except (json.JSONDecodeError, ValueError):
                     logger.debug("Malformed RPC request in %s", req_file)
                     # Remove bad request to avoid infinite retry
+                    env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
+                    continue
+
+                if not rpc_token or not secrets.compare_digest(
+                    str(request.get("token") or ""), rpc_token
+                ):
+                    logger.debug("Unauthorized RPC request in %s", req_file)
                     env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
                     continue
 
@@ -986,6 +1021,8 @@ def _execute_remote(
             timeout=10,
         )
 
+        rpc_token = secrets.token_urlsafe(32)
+
         # Generate and ship files
         tools_src = generate_hermes_tools_module(
             list(sandbox_tools),
@@ -1000,14 +1037,9 @@ def _execute_remote(
         rpc_thread = threading.Thread(
             target=propagate_context_to_thread(_rpc_poll_loop),
             args=(
-                env,
-                f"{sandbox_dir}/rpc",
-                effective_task_id,
-                tool_call_log,
-                tool_call_counter,
-                max_tool_calls,
-                sandbox_tools,
-                stop_event,
+                env, f"{sandbox_dir}/rpc", effective_task_id,
+                tool_call_log, tool_call_counter, max_tool_calls,
+                sandbox_tools, stop_event, rpc_token,
             ),
             daemon=True,
         )
@@ -1016,6 +1048,7 @@ def _execute_remote(
         # Build environment variable prefix for the script
         env_prefix = (
             f"HERMES_RPC_DIR={shlex.quote(f'{sandbox_dir}/rpc')} "
+            f"HERMES_RPC_TOKEN={shlex.quote(rpc_token)} "
             f"PYTHONDONTWRITEBYTECODE=1"
         )
         tz = os.getenv("HERMES_TIMEZONE", "").strip()
@@ -1098,10 +1131,11 @@ def _execute_remote(
 
     stdout_text = strip_ansi(stdout_text)
 
-    # Redact secrets
+    # Redact secrets. code_file=True: execute_code output is code-execution
+    # output that often echoes source/config — skip false-positive ENV/JSON/
+    # f-string-template redaction while still masking real credentials.
     from agent.redact import redact_sensitive_text
-
-    stdout_text = redact_sensitive_text(stdout_text)
+    stdout_text = redact_sensitive_text(stdout_text, code_file=True)
 
     # Build response
     result: Dict[str, Any] = {
@@ -1354,16 +1388,21 @@ def execute_code(
         return tool_error(_gate_msg)
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
-    from tools.terminal_tool import _get_env_config
-
-    env_type = _get_env_config()["env_type"]
+    from tools.terminal_tool import _get_env_config, _docker_has_host_access
+    _env_config = _get_env_config()
+    env_type = _env_config["env_type"]
 
     # execute_code runs arbitrary Python (subprocess/os.system/...) that never
     # passes through terminal()/DANGEROUS_PATTERNS, so guard the whole script
     # here before either dispatch path spawns it. Runs synchronously in the
     # caller (tool-executor) thread, which holds the session context (#30882).
+    # A Docker sandbox with host bind mounts is no longer isolated, so its
+    # script does not get the container fast-path.
     from tools.approval import check_execute_code_guard
-    _guard = check_execute_code_guard(code, env_type)
+    _guard = check_execute_code_guard(
+        code, env_type,
+        has_host_access=_docker_has_host_access(_env_config),
+    )
     if not _guard.get("approved", False):
         return json.dumps({
             "status": "error",
@@ -1440,6 +1479,7 @@ def execute_code(
             f.write(code)
 
         # --- Start RPC server ---
+        rpc_token = secrets.token_urlsafe(32)
         # Two transports:
         #   POSIX: AF_UNIX stream socket on sock_path, chmod 0600 for
         #   owner-only access.  Filesystem permissions gate the socket.
@@ -1466,7 +1506,7 @@ def execute_code(
             target=propagate_context_to_thread(_rpc_server_loop),
             args=(
                 server_sock, task_id, tool_call_log,
-                tool_call_counter, max_tool_calls, sandbox_tools, stop_event,
+                tool_call_counter, max_tool_calls, sandbox_tools, stop_event, rpc_token,
             ),
             daemon=True,
         )
@@ -1484,6 +1524,7 @@ def execute_code(
         # or spawn a subprocess.  See ``_scrub_child_env`` for the rules.
         child_env = _scrub_child_env(os.environ)
         child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
+        child_env["HERMES_RPC_TOKEN"] = rpc_token
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"
         # Force UTF-8 for the child's stdio and default file encoding.
         #
@@ -1543,7 +1584,7 @@ def execute_code(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
-            preexec_fn=None if _IS_WINDOWS else os.setsid,
+            start_new_session=True,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
         )
 
@@ -1706,10 +1747,11 @@ def execute_code(
         # The sandbox env-var filter (lines 434-454) blocks os.environ access,
         # but scripts can still read secrets from disk (e.g. open('~/.hermes/.env')).
         # This ensures leaked secrets never enter the model context.
+        # code_file=True: this is code-execution output — skip false-positive
+        # ENV/JSON/f-string-template redaction; real credentials still masked.
         from agent.redact import redact_sensitive_text
-
-        stdout_text = redact_sensitive_text(stdout_text)
-        stderr_text = redact_sensitive_text(stderr_text)
+        stdout_text = redact_sensitive_text(stdout_text, code_file=True)
+        stderr_text = redact_sensitive_text(stderr_text, code_file=True)
 
         # Build response
         result: Dict[str, Any] = {
@@ -2001,41 +2043,28 @@ def _resolve_child_cwd(mode: str, staging_dir: str) -> str:
 # Per-tool documentation lines for the execute_code description.
 # Ordered to match the canonical display order.
 _TOOL_DOC_LINES = [
-    (
-        "web_search",
-        "  web_search(query: str, limit: int = 5) -> dict\n"
-        '    Returns {"data": {"web": [{"url", "title", "description"}, ...]}}',
-    ),
-    (
-        "web_extract",
-        "  web_extract(urls: list[str]) -> dict\n"
-        '    Returns {"results": [{"url", "title", "content", "error"}, ...]} where content is markdown',
-    ),
-    (
-        "read_file",
-        "  read_file(path: str, offset: int = 1, limit: int = 500) -> dict\n"
-        '    Lines are 1-indexed. Returns {"content": "...", "total_lines": N}',
-    ),
-    (
-        "write_file",
-        "  write_file(path: str, content: str) -> dict\n"
-        "    Always overwrites the entire file.",
-    ),
-    (
-        "search_files",
-        '  search_files(pattern: str, target="content", path=".", file_glob=None, limit=50) -> dict\n'
-        '    target: "content" (search inside files) or "files" (find files by name). Returns {"matches": [...]}',
-    ),
-    (
-        "patch",
-        "  patch(path: str, old_string: str, new_string: str, replace_all: bool = False) -> dict\n"
-        "    Replaces old_string with new_string in the file.",
-    ),
-    (
-        "terminal",
-        "  terminal(command: str, timeout=None, workdir=None) -> dict\n"
-        '    Foreground only (no background/pty). Returns {"output": "...", "exit_code": N}',
-    ),
+    ("web_search",
+     "  web_search(query: str, limit: int = 5) -> dict\n"
+     "    Returns {\"data\": {\"web\": [{\"url\", \"title\", \"description\"}, ...]}}"),
+    ("web_extract",
+     "  web_extract(urls: list[str], char_limit: int = None) -> dict\n"
+     "    Returns {\"results\": [{\"url\", \"title\", \"content\", \"error\"}, ...]} where content is markdown.\n"
+     "    No LLM summarization. Pages over char_limit (default 15000) are head+tail truncated; full text stored on disk (path in the content footer)."),
+    ("read_file",
+     "  read_file(path: str, offset: int = 1, limit: int = 500) -> dict\n"
+     "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}"),
+    ("write_file",
+     "  write_file(path: str, content: str) -> dict\n"
+     "    Always overwrites the entire file."),
+    ("search_files",
+     "  search_files(pattern: str, target=\"content\", path=\".\", file_glob=None, limit=50) -> dict\n"
+     "    target: \"content\" (search inside files) or \"files\" (find files by name). Returns {\"matches\": [...]}"),
+    ("patch",
+     "  patch(path: str, old_string: str, new_string: str, replace_all: bool = False) -> dict\n"
+     "    Replaces old_string with new_string in the file."),
+    ("terminal",
+     "  terminal(command: str, timeout=None, workdir=None) -> dict\n"
+     "    Foreground only (no background/pty). Returns {\"output\": \"...\", \"exit_code\": N}"),
 ]
 
 
