@@ -1227,7 +1227,10 @@ class TestLaunchdServiceRecovery:
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
         label = gateway_cli.get_launchd_label()
-        domain = gateway_cli._launchd_domain()
+        # Pin the session type to headless so _launchd_domain() returns
+        # user/<uid> regardless of whether the runner is an Aqua GUI session.
+        monkeypatch.setattr(gateway_cli, "_launchctl_session_managername", lambda: None)
+        domain = f"user/{os.getuid()}"
         target = f"{domain}/{label}"
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
@@ -1242,6 +1245,12 @@ class TestLaunchdServiceRecovery:
         calls = []
 
         def fake_run(cmd, check=False, **kwargs):
+            # launchctl print probes must fail so _launchd_domain_for_existing_job
+            # falls through to _launchd_domain() rather than returning gui/<uid>.
+            # These are excluded from `calls` — they're domain-resolution
+            # preliminaries, not part of the restart action sequence under test.
+            if cmd and cmd[0] == "launchctl" and len(cmd) > 1 and cmd[1] == "print":
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
             if cmd and cmd[0] == "launchctl":
                 calls.append(cmd)
             if cmd == ["launchctl", "kickstart", "-k", target]:
