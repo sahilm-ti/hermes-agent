@@ -56,6 +56,32 @@ def test_idle_worker_reuse():
         pool.shutdown(wait=True)
 
 
+def test_many_concurrent_submits_like_tool_executor():
+    """Regression test for the 3.14 AttributeError on ``_initializer``.
+
+    ``agent/tool_executor.py`` submits N tool calls to a fresh
+    DaemonThreadPoolExecutor whenever the model requests 2+ tool calls in
+    the same turn (see ``_run_concurrent_tools``). Before the 3.14
+    WorkerContext fix, ``_adjust_thread_count`` read ``self._initializer``/
+    ``self._initargs`` directly — attributes that no longer exist on
+    ThreadPoolExecutor as of CPython 3.14 (replaced by
+    ``prepare_context()``/``WorkerContext``) — and every worker spawn
+    raised ``AttributeError: 'DaemonThreadPoolExecutor' object has no
+    attribute '_initializer'`` inside the worker thread, silently failing
+    every concurrently-submitted tool call. This test reproduces that
+    exact shape: more submissions than max_workers, forcing multiple
+    ``_adjust_thread_count`` calls, and asserts every future actually
+    completes with the right value instead of erroring.
+    """
+    pool = DaemonThreadPoolExecutor(max_workers=4)
+    try:
+        futures = [pool.submit(lambda n=i: n * n) for i in range(12)]
+        results = [f.result(timeout=10) for f in futures]
+        assert results == [n * n for n in range(12)]
+    finally:
+        pool.shutdown(wait=True)
+
+
 def test_wedged_worker_does_not_block_interpreter_exit():
     """A worker stuck in a long sleep must not hold the process open.
 
