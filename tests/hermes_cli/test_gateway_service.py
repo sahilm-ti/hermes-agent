@@ -68,6 +68,7 @@ class TestSystemdServiceRefresh:
 
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
         monkeypatch.setattr(gateway_cli, "generate_systemd_unit", lambda system=False, run_as_user=None: "new unit\n")
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
 
         calls = []
 
@@ -93,6 +94,7 @@ class TestSystemdServiceRefresh:
         monkeypatch.setattr(gateway_cli, "generate_systemd_unit", lambda system=False, run_as_user=None: "new unit\n")
 
         calls = []
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
         monkeypatch.setattr(gateway_cli, "_recover_pending_systemd_restart", lambda system=False, previous_pid=None: False)
         monkeypatch.setattr(
@@ -1467,6 +1469,111 @@ class TestLaunchdServiceRecovery:
         assert "No fallback process is running" in out
         assert "NOT available" in out
 
+class TestLaunchdDomainDetection:
+    """Regression tests for _launchd_domain() probing (#40831).
+
+    The function must detect which launchd domain actually contains (or can
+    manage) the service, rather than hardcoding ``user/<uid>`` or ``gui/<uid>``.
+    """
+
+    def _reset_domain_cache(self):
+        """Clear any cached domain result between tests."""
+        gateway_cli._resolved_launchd_domain = None
+
+    def test_prefers_gui_domain_when_service_loaded_there(self, monkeypatch):
+        """In an Aqua session where the service is loaded under gui/<uid>,
+        _launchd_domain() must return ``gui/<uid>`` — not ``user/<uid>``."""
+        self._reset_domain_cache()
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+
+        run_calls = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            run_calls.append(cmd)
+            if cmd == ["launchctl", "managername"]:
+                return SimpleNamespace(returncode=0, stdout="Aqua\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        domain = gateway_cli._launchd_domain()
+        assert domain == "gui/501"
+        assert run_calls == [["launchctl", "managername"]]
+
+    def test_falls_back_to_user_domain_when_gui_fails(self, monkeypatch):
+        """In a Background/SSH session where gui/<uid> fails but user/<uid>
+        works, _launchd_domain() must return ``user/<uid>``."""
+        self._reset_domain_cache()
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+
+        run_calls = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            run_calls.append(cmd)
+            if cmd == ["launchctl", "managername"]:
+                return SimpleNamespace(returncode=0, stdout="Background\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        domain = gateway_cli._launchd_domain()
+        assert domain == "user/501"
+        assert run_calls == [["launchctl", "managername"]]
+
+    def test_uses_managername_heuristic_when_both_probe_fail(self, monkeypatch):
+        """When neither domain contains a loaded service, use
+        ``launchctl managername`` as a tiebreaker: Aqua -> gui, else -> user."""
+        self._reset_domain_cache()
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+        label = gateway_cli.get_launchd_label()
+
+        def fake_run(cmd, check=False, **kwargs):
+            if "print" in cmd:
+                raise subprocess.CalledProcessError(1, cmd, stderr="not found")
+            if "managername" in cmd:
+                return SimpleNamespace(returncode=0, stdout="Aqua\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        domain = gateway_cli._launchd_domain()
+        assert domain == "gui/501"
+
+    def test_managername_background_selects_user_domain(self, monkeypatch):
+        """When managername is Background (non-Aqua), use user/<uid>."""
+        self._reset_domain_cache()
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+
+        def fake_run(cmd, check=False, **kwargs):
+            if "print" in cmd:
+                raise subprocess.CalledProcessError(1, cmd, stderr="not found")
+            if "managername" in cmd:
+                return SimpleNamespace(returncode=0, stdout="Background\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        domain = gateway_cli._launchd_domain()
+        assert domain == "user/501"
+
+    def test_queries_managername_each_call(self, monkeypatch):
+        """Domain detection is cheap and reflects the current launchctl session."""
+        self._reset_domain_cache()
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+
+        run_count = [0]
+
+        def fake_run(cmd, check=False, **kwargs):
+            run_count[0] += 1
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        d1 = gateway_cli._launchd_domain()
+        d2 = gateway_cli._launchd_domain()
+        assert d1 == d2
+        assert run_count[0] == 2
+
 
 class TestGatewayServiceDetection:
     def test_supports_systemd_services_requires_systemctl_binary(self, monkeypatch):
@@ -1531,6 +1638,7 @@ class TestGatewaySystemServiceRouting:
 
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: calls.append(("refresh", system)))
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
         monkeypatch.setattr(
@@ -1576,6 +1684,7 @@ class TestGatewaySystemServiceRouting:
 
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 10.0)
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
@@ -1635,6 +1744,7 @@ class TestGatewaySystemServiceRouting:
 
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
         monkeypatch.setattr(gateway_cli, "_recover_pending_systemd_restart", lambda system=False, previous_pid=None: False)
@@ -1665,6 +1775,7 @@ class TestGatewaySystemServiceRouting:
     def test_systemd_restart_recovers_failed_planned_restart(self, monkeypatch, capsys):
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
         monkeypatch.setattr(
             "gateway.status.read_runtime_status",
@@ -2772,7 +2883,7 @@ class TestLegacyHermesUnitDetection:
             "ExecStart=/venv/bin/python /opt/hermes/gateway/run.py",
         ]
         for i, execstart in enumerate(variants):
-            name = f"hermes.service" if i == 0 else f"hermes.service"  # same name
+            name = "hermes.service" if i == 0 else "hermes.service"  # same name
             # Test each variant fresh
             (user_dir / "hermes.service").write_text(
                 f"[Unit]\nDescription=Old Hermes\n[Service]\n{execstart}\n",
