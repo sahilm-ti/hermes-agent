@@ -2227,8 +2227,8 @@ def test_respawn_guard_stale_success_not_guarded(kanban_home):
     assert reason is None
 
 
-def test_respawn_guard_active_pr_in_comment(kanban_home):
-    """A GitHub PR URL in a recent comment triggers active_pr."""
+def test_respawn_guard_pr_comment_not_guarded(kanban_home):
+    """A GitHub PR URL in a recent comment does not block respawn."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
         kb.add_comment(
@@ -2238,7 +2238,7 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
             "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
         )
         reason = kb.check_respawn_guard(conn, t)
-    assert reason == "active_pr"
+    assert reason is None
 
 
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
@@ -2327,8 +2327,8 @@ def test_dispatch_respawn_guard_skips_recent_success(
         assert kb.get_task(conn, t).status == "ready"  # not blocked, just skipped
 
 
-def test_dispatch_respawn_guard_skips_active_pr(kanban_home, all_assignees_spawnable):
-    """dispatch_once skips (but does not block) a task with an active PR comment."""
+def test_dispatch_respawn_guard_allows_active_pr(kanban_home, all_assignees_spawnable):
+    """dispatch_once spawns a task with a PR comment; PRs are not guards."""
     spawned_ids = []
 
     def fake_spawn(task, workspace):
@@ -2344,11 +2344,13 @@ def test_dispatch_respawn_guard_skips_active_pr(kanban_home, all_assignees_spawn
         )
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
 
-    assert (t, "active_pr") in res.respawn_guarded
-    assert t not in spawned_ids
+    assert t in spawned_ids
+    assert (t, "active_pr") not in res.respawn_guarded
     assert t not in res.auto_blocked
     with kb.connect() as conn:
-        assert kb.get_task(conn, t).status == "ready"
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "running"
 
 
 def test_dispatch_respawn_guard_dry_run_no_auto_block(
@@ -5626,43 +5628,12 @@ def test_reject_task_from_human_review_status(kanban_home):
 
 
 # ---------------------------------------------------------------------------
-# check_respawn_guard — active_pr suppressed on post-PR rejection (Bug 2)
+# check_respawn_guard — PR comments do not guard respawn
 # ---------------------------------------------------------------------------
 
 
-def test_respawn_guard_active_pr_suppressed_when_rejection_postdates_pr(
-    kanban_home,
-):
-    """If a 'rejected' event/run post-dates the PR-URL comment, the
-    active_pr guard yields so the next worker can iterate on the same PR.
-    """
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="reject-then-fix", assignee="alice")
-        now = int(time.time())
-        # PR URL comment first, rejection event later.
-        conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, 'worker', "
-            "'PR: https://github.com/totemx-AI/subsidysmart/pull/7', ?)",
-            (t, now - 60),
-        )
-        conn.execute(
-            "INSERT INTO task_events (task_id, kind, payload, created_at) "
-            "VALUES (?, 'rejected', NULL, ?)",
-            (t, now - 30),
-        )
-        reason = kb.check_respawn_guard(conn, t)
-    assert (
-        reason is None
-    ), f"expected guard suppressed (rejection > pr_ts), got {reason!r}"
-
-
-def test_respawn_guard_active_pr_still_fires_when_pr_post_dates_rejection(
-    kanban_home,
-):
-    """If the PR-URL comment is newer than the rejection, the guard
-    still fires (the worker opened a fresh PR after the reject — don't
-    spawn a third one)."""
+def test_respawn_guard_ignores_pr_comment_after_rejection(kanban_home):
+    """A PR URL newer than a rejection still allows respawn."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="rej-then-pr", assignee="alice")
         now = int(time.time())
@@ -5678,70 +5649,11 @@ def test_respawn_guard_active_pr_still_fires_when_pr_post_dates_rejection(
             (t, now - 30),
         )
         reason = kb.check_respawn_guard(conn, t)
-    assert reason == "active_pr"
-
-
-def test_respawn_guard_active_pr_uses_rejected_run_outcome(kanban_home):
-    """A task_runs row with outcome='rejected' counts as a rejection
-    signal for the guard suppression (covers the reject_task path that
-    closes via _end_run on running-claimed-from-review)."""
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="run-reject", assignee="alice")
-        now = int(time.time())
-        conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, 'worker', "
-            "'https://github.com/totemx-AI/foo/pull/3', ?)",
-            (t, now - 60),
-        )
-        conn.execute(
-            "INSERT INTO task_runs (task_id, status, outcome, "
-            "started_at, ended_at) "
-            "VALUES (?, 'rejected', 'rejected', ?, ?)",
-            (t, now - 35, now - 30),
-        )
-        reason = kb.check_respawn_guard(conn, t)
     assert reason is None
 
 
-# ---------------------------------------------------------------------------
-# check_respawn_guard — active_pr suppressed on merge_requested / reclaimed
-# (Bug: tasks stuck forever after external merge when merge worker dies)
-# ---------------------------------------------------------------------------
-
-
-def test_respawn_guard_active_pr_suppressed_on_merge_requested_event(
-    kanban_home,
-):
-    """A merge_requested event post-dating the PR-URL comment suppresses
-    the active_pr guard so the dispatcher can respawn the merge worker."""
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="merge-req-resume", assignee="alice")
-        now = int(time.time())
-        # PR URL comment first, merge_requested event later.
-        conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, 'worker', "
-            "'PR: https://github.com/totemx-AI/subsidysmart/pull/11', ?)",
-            (t, now - 60),
-        )
-        conn.execute(
-            "INSERT INTO task_events (task_id, kind, payload, created_at) "
-            "VALUES (?, 'merge_requested', NULL, ?)",
-            (t, now - 30),
-        )
-        reason = kb.check_respawn_guard(conn, t)
-    assert (
-        reason is None
-    ), f"expected guard suppressed (merge_requested > pr_ts), got {reason!r}"
-
-
-def test_respawn_guard_active_pr_still_fires_when_pr_postdates_merge_requested(
-    kanban_home,
-):
-    """If the PR-URL comment is newer than the merge_requested event,
-    the guard still fires — a fresh PR was opened after the merge
-    attempt, don't spawn again."""
+def test_respawn_guard_ignores_pr_comment_after_merge_requested(kanban_home):
+    """A PR URL newer than merge_requested still allows respawn."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="pr-after-merge-req", assignee="alice")
         now = int(time.time())
@@ -5757,98 +5669,7 @@ def test_respawn_guard_active_pr_still_fires_when_pr_postdates_merge_requested(
             (t, now - 30),
         )
         reason = kb.check_respawn_guard(conn, t)
-    assert reason == "active_pr"
-
-
-def test_respawn_guard_active_pr_suppressed_on_reclaimed_event(
-    kanban_home,
-):
-    """A reclaimed event post-dating the PR-URL comment suppresses
-    the active_pr guard — the prior run was killed before finishing."""
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="reclaimed-resume", assignee="alice")
-        now = int(time.time())
-        conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, 'worker', "
-            "'PR: https://github.com/totemx-AI/subsidysmart/pull/13', ?)",
-            (t, now - 60),
-        )
-        conn.execute(
-            "INSERT INTO task_events (task_id, kind, payload, created_at) "
-            "VALUES (?, 'reclaimed', NULL, ?)",
-            (t, now - 30),
-        )
-        reason = kb.check_respawn_guard(conn, t)
-    assert (
-        reason is None
-    ), f"expected guard suppressed (reclaimed event > pr_ts), got {reason!r}"
-
-
-def test_respawn_guard_active_pr_suppressed_on_reclaimed_run_outcome(
-    kanban_home,
-):
-    """A task_runs row with outcome='reclaimed' post-dating the PR-URL
-    comment suppresses the active_pr guard — dispatcher must be allowed
-    to respawn after a mid-run kill (gateway restart, etc.)."""
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="reclaimed-run-resume", assignee="alice")
-        now = int(time.time())
-        conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, 'worker', "
-            "'PR: https://github.com/totemx-AI/subsidysmart/pull/14', ?)",
-            (t, now - 60),
-        )
-        conn.execute(
-            "INSERT INTO task_runs (task_id, status, outcome, "
-            "started_at, ended_at) "
-            "VALUES (?, 'reclaimed', 'reclaimed', ?, ?)",
-            (t, now - 45, now - 30),
-        )
-        reason = kb.check_respawn_guard(conn, t)
-    assert (
-        reason is None
-    ), f"expected guard suppressed (reclaimed run > pr_ts), got {reason!r}"
-
-
-def test_respawn_guard_exact_scenario_merge_worker_dies_pr_externally_merged(
-    kanban_home,
-):
-    """Regression for the 2026-05-29 incident: PR comment → merge_requested
-    → merge worker reclaimed (gateway restart) → guard blocks forever.
-
-    Timeline: PR comment at T-90, merge_requested event at T-60,
-    reclaimed run ended at T-30. Guard must return None."""
-    with kb.connect() as conn:
-        t = kb.create_task(
-            conn, title="merge-die-stuck-regression", assignee="alice"
-        )
-        now = int(time.time())
-        # Step 1: worker opens PR and leaves comment
-        conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, 'worker', "
-            "'PR https://github.com/sahilm-ti/hermes-agent/pull/99 opened', ?)",
-            (t, now - 90),
-        )
-        # Step 2: human approves → merge_requested event
-        conn.execute(
-            "INSERT INTO task_events (task_id, kind, payload, created_at) "
-            "VALUES (?, 'merge_requested', NULL, ?)",
-            (t, now - 60),
-        )
-        # Step 3: merge worker is killed mid-run → reclaimed run
-        conn.execute(
-            "INSERT INTO task_runs (task_id, status, outcome, "
-            "started_at, ended_at) "
-            "VALUES (?, 'reclaimed', 'reclaimed', ?, ?)",
-            (t, now - 55, now - 30),
-        )
-        reason = kb.check_respawn_guard(conn, t)
-    assert reason is None, (
-        f"expected guard suppressed after merge_requested+reclaimed, got {reason!r}"
-    )
+    assert reason is None
 
 
 # ---------------------------------------------------------------------------
@@ -6640,39 +6461,8 @@ def test_pin_workspace_git_identity_non_git_dir_is_noop(
     assert (hooks_dir / "pre-commit").exists()
 
 
-def test_respawn_guard_active_pr_suppressed_when_unblock_postdates_pr(
-    kanban_home,
-):
-    """If an 'unblocked' event post-dates the PR-URL comment, the
-    active_pr guard yields so the next worker can iterate on the same PR.
-    """
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="unblock-then-fix", assignee="alice")
-        now = int(time.time())
-        # PR URL comment first, unblocked event later.
-        conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, 'worker', "
-            "'PR: https://github.com/totemx-AI/subsidysmart/pull/11', ?)",
-            (t, now - 60),
-        )
-        conn.execute(
-            "INSERT INTO task_events (task_id, kind, payload, created_at) "
-            "VALUES (?, 'unblocked', NULL, ?)",
-            (t, now - 30),
-        )
-        reason = kb.check_respawn_guard(conn, t)
-    assert (
-        reason is None
-    ), f"expected guard suppressed (unblocked > pr_ts), got {reason!r}"
-
-
-def test_respawn_guard_active_pr_still_fires_when_pr_postdates_unblock(
-    kanban_home,
-):
-    """If the PR-URL comment is newer than the unblocked event, the guard
-    still fires (the worker opened a fresh PR after being unblocked — don't
-    spawn a second run on top of it)."""
+def test_respawn_guard_ignores_pr_comment_after_unblock(kanban_home):
+    """A PR URL newer than unblocked still allows respawn."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="unblock-then-pr", assignee="alice")
         now = int(time.time())
@@ -6688,4 +6478,4 @@ def test_respawn_guard_active_pr_still_fires_when_pr_postdates_unblock(
             (t, now - 30),
         )
         reason = kb.check_respawn_guard(conn, t)
-    assert reason == "active_pr"
+    assert reason is None
