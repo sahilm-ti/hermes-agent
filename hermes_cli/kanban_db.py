@@ -7449,9 +7449,8 @@ class DispatchResult:
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
-    Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
-    ``"recent_success"`` (completed run within guard window),
-    ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    Reasons: ``"blocker_auth"`` (quota/auth error),
+    ``"recent_success"`` (completed run within guard window)."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -9172,13 +9171,9 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         explicit re-queue event (status change, promote, unblock, reclaim)
         arrives AFTER that completion — that's a deliberate re-run request.
 
-    ``"active_pr"``
-        A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
-
-        The guard is suppressed when a rejected/unblocked/merge-requested/
-        reclaimed resume signal post-dates the PR comment.
+    GitHub PR URLs in task comments are intentionally NOT a guard reason.
+    A rejected PR task must respawn so the worker can amend the existing PR,
+    and duplicate-PR risk is handled by worker discipline/review instead.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -9260,86 +9255,9 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #
-    # Exception: if the task was rejected (auto-reviewer or human), or
-    # explicitly unblocked, AFTER the most recent PR-URL comment, the
-    # resume signal is a decision to keep working on the existing PR.
-    # Re-spawn so the next worker can read the rationale and force-push a
-    # fix. Without this, the reject→fix-same-PR loop deadlocks because the
-    # dispatcher keeps seeing the PR URL and refusing to spawn.
-    #
-    # The entire active_pr guard can be disabled board-wide via
-    # ``kanban.disable_pr_respawn_guard: true`` in config.yaml.
-    try:
-        from hermes_cli.config import load_config
-
-        _kanban_cfg = load_config().get("kanban") or {}
-        if _kanban_cfg.get("disable_pr_respawn_guard"):
-            return None
-    except Exception:
-        pass
-    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    latest_pr_ts: Optional[int] = None
-    for c in conn.execute(
-        "SELECT body, created_at FROM task_comments "
-        "WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            if latest_pr_ts is None or c["created_at"] > latest_pr_ts:
-                latest_pr_ts = int(c["created_at"])
-    if latest_pr_ts is not None:
-        # Most recent resume signal: a 'rejected' event, a rejected run
-        # outcome, or an 'unblocked' event — whichever is newest wins.
-        # Both rejected and unblocked are explicit human-or-orchestrator
-        # decisions that the worker should keep iterating on the same PR.
-        reject_event = conn.execute(
-            "SELECT MAX(created_at) AS ts FROM task_events "
-            "WHERE task_id = ? AND kind = 'rejected'",
-            (task_id,),
-        ).fetchone()
-        reject_run = conn.execute(
-            "SELECT MAX(ended_at) AS ts FROM task_runs "
-            "WHERE task_id = ? AND outcome = 'rejected'",
-            (task_id,),
-        ).fetchone()
-        unblock_event = conn.execute(
-            "SELECT MAX(created_at) AS ts FROM task_events "
-            "WHERE task_id = ? AND kind = 'unblocked'",
-            (task_id,),
-        ).fetchone()
-        merge_event = conn.execute(
-            "SELECT MAX(created_at) AS ts FROM task_events "
-            "WHERE task_id = ? AND kind = 'merge_requested'",
-            (task_id,),
-        ).fetchone()
-        reclaimed_event = conn.execute(
-            "SELECT MAX(created_at) AS ts FROM task_events "
-            "WHERE task_id = ? AND kind = 'reclaimed'",
-            (task_id,),
-        ).fetchone()
-        reclaimed_run = conn.execute(
-            "SELECT MAX(ended_at) AS ts FROM task_runs "
-            "WHERE task_id = ? AND outcome = 'reclaimed'",
-            (task_id,),
-        ).fetchone()
-        candidates = [
-            int(r["ts"])
-            for r in (
-                reject_event,
-                reject_run,
-                unblock_event,
-                merge_event,
-                reclaimed_event,
-                reclaimed_run,
-            )
-            if r is not None and r["ts"] is not None
-        ]
-        latest_resume_ts = max(candidates) if candidates else None
-        if latest_resume_ts is None or latest_resume_ts <= latest_pr_ts:
-            return "active_pr"
-        # else: resume signal post-dates the PR → fall through, no guard.
+    # 4. GitHub PR URLs in comments are not a respawn guard. Workers should
+    # keep iterating on the same PR after rejection; blocking here deadlocks
+    # the review-fix loop.
 
     return None
 
