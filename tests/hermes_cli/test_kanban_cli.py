@@ -107,6 +107,12 @@ def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     assert task.branch_name == "wt/t6-wire"
 
 
+def test_run_slash_rejects_unresolved_worktree_workspace(kanban_home):
+    out = kc.run_slash("create 'bad worktree' --workspace worktree")
+    assert "workspace_kind=worktree requires" in out
+    assert "Created" not in out
+
+
 def test_run_slash_rejects_branch_without_worktree(kanban_home):
     out = kc.run_slash("create 'bad branch' --workspace scratch --branch wt/bad")
     assert "--branch is only valid with --workspace worktree" in out
