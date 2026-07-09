@@ -1004,6 +1004,18 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_tool_rejects_unresolved_worktree(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_create({
+        "title": "needs repo",
+        "assignee": "peer",
+        "workspace_kind": "worktree",
+    })
+    d = json.loads(out)
+    assert "workspace_kind=worktree requires" in d["error"]
+
+
 def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):
     """A worker scoped to a dir: task that spawns a child without a
     workspace arg inherits the dir, not scratch (so follow-up code-gen
