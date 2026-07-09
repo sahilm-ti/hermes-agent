@@ -2769,16 +2769,38 @@ def create_task(
     # task would point cleanup at the user's source tree (#28818). The
     # containment guard in ``_cleanup_workspace`` is the safety rail, but
     # we also stop the bad state from being created in the first place.
+    board_slug = board if board else get_current_board()
     if (
         workspace_path is None
         and project_repo is None
         and workspace_kind in {"dir", "worktree"}
     ):
-        board_slug = board if board else get_current_board()
         board_meta = read_board_metadata(board_slug)
         board_default = board_meta.get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+
+    if workspace_kind == "worktree":
+        if workspace_path is not None:
+            workspace_candidate = Path(str(workspace_path)).expanduser()
+            if not workspace_candidate.is_absolute():
+                raise ValueError(
+                    "workspace_kind=worktree requires an absolute workspace_path; "
+                    f"got {workspace_path!r}"
+                )
+        elif project_repo is None:
+            raise ValueError(
+                "workspace_kind=worktree requires one of: an absolute "
+                "workspace_path, a project with a primary repo, or board "
+                f"{board_slug!r} default_workdir"
+            )
+        if project_repo is not None:
+            project_repo_path = Path(str(project_repo)).expanduser()
+            if not project_repo_path.is_absolute():
+                raise ValueError(
+                    "project-linked worktree tasks require the project's "
+                    f"primary repo path to be absolute; got {project_repo!r}"
+                )
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):

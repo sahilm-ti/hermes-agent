@@ -276,12 +276,15 @@ def test_branch_name_requires_worktree_workspace(kanban_home):
 # ---------------------------------------------------------------------------
 
 
-def test_workspace_kind_inference_hermes_agent_body_picks_worktree(kanban_home):
-    with kb.connect() as conn:
+def test_workspace_kind_inference_hermes_agent_body_picks_worktree(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    kb.create_board("inference-board", default_workdir=str(repo))
+    with kb.connect(board="inference-board") as conn:
         tid = kb.create_task(
             conn,
             title="fix bug in hermes_cli/kanban_db.py",
             body="touches tools/ and tests/",
+            board="inference-board",
         )
         t = kb.get_task(conn, tid)
     assert t.workspace_kind == "worktree"
@@ -310,9 +313,15 @@ def test_workspace_kind_inference_respects_explicit_caller(kanban_home):
     assert t.workspace_kind == "scratch"
 
 
-def test_workspace_kind_inference_keyword_git_rebase(kanban_home):
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="git rebase staging branch")
+def test_workspace_kind_inference_keyword_git_rebase(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    kb.create_board("rebase-board", default_workdir=str(repo))
+    with kb.connect(board="rebase-board") as conn:
+        tid = kb.create_task(
+            conn,
+            title="git rebase staging branch",
+            board="rebase-board",
+        )
         t = kb.get_task(conn, tid)
     assert t.workspace_kind == "worktree"
 
@@ -2525,21 +2534,17 @@ def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path
 
 def test_worktree_no_path_no_board_default_raises(kanban_home, tmp_path, monkeypatch):
     """With neither an explicit workspace_path nor a board default_workdir,
-    resolution fails loudly pointing at default_workdir / worktree:<path> —
-    rather than silently materializing under the dispatcher's CWD (the old
-    behavior that scattered worktrees under whatever dir launched the
-    gateway)."""
+    creation fails loudly pointing at default_workdir / workspace_path —
+    rather than saving a task that will fail later when the dispatcher spawns
+    it."""
     # Park the dispatcher CWD inside a real git repo so the OLD cwd-anchored
     # code would have "succeeded" — proving the new code does NOT use cwd.
     decoy_repo = tmp_path / "decoy"
     _init_git_repo(decoy_repo)
     monkeypatch.chdir(decoy_repo)
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="ship", workspace_kind="worktree")
-        task = kb.get_task(conn, t)
-        assert task is not None
-        with pytest.raises(ValueError, match="default_workdir"):
-            kb.resolve_workspace(task)
+        with pytest.raises(ValueError, match="workspace_kind=worktree requires"):
+            kb.create_task(conn, title="ship", workspace_kind="worktree")
 
 
 def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_home, tmp_path):
@@ -4336,6 +4341,25 @@ def test_create_task_dir_without_workspace_inherits_board_default_workdir(
         t = kb.get_task(conn, tid)
     assert t is not None
     assert t.workspace_path == default_wd
+
+
+def test_create_task_worktree_without_workspace_rejects_without_board_default(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="workspace_kind=worktree requires"):
+            kb.create_task(conn, title="needs repo", workspace_kind="worktree")
+
+
+def test_create_task_worktree_rejects_relative_workspace_path(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="absolute workspace_path"):
+            kb.create_task(
+                conn,
+                title="needs repo",
+                workspace_kind="worktree",
+                workspace_path="relative/repo",
+            )
 
 
 def test_create_task_without_workspace_no_default_stays_none(kanban_home):
