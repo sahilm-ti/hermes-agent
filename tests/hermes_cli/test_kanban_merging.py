@@ -111,6 +111,55 @@ class TestExtractPrUrl:
         # Should return the event URL, not the comment URL.
         assert url == "https://github.com/org/repo/pull/55"
 
+    def test_uses_latest_human_review_handoff_after_rejected_pr(self, kanban_home):
+        """A replacement PR handoff must win over a rejected historical PR."""
+        stale_pr = "https://github.com/org/repo/pull/56"
+        replacement_pr = "https://github.com/org/repo/pull/57"
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="x", assignee="worker")
+            _claim(conn, tid)
+            assert kb.move_to_review(conn, tid, reason=f"PR {stale_pr}")
+            assert kb.move_to_human_review(conn, tid, reason=f"PR {stale_pr}")
+            assert kb.reject_task(conn, tid, reason="Use the replacement PR")
+
+            _claim(conn, tid)
+            assert kb.move_to_review(conn, tid, reason=f"PR {replacement_pr}")
+            assert kb.move_to_human_review(conn, tid, reason=f"PR {replacement_pr}")
+
+            handoffs = [
+                event
+                for event in kb.list_events(conn, tid)
+                if event.kind == "human_review_requested"
+            ]
+            assert handoffs[-1].payload == {
+                "reason": f"PR {replacement_pr}",
+                "pr_url": replacement_pr,
+            }
+            assert kb._extract_pr_url(conn, tid) == replacement_pr
+            ok, outcome, pr_url, task = kb.approve_task(conn, tid)
+
+        assert ok is True
+        assert outcome == "merge_triggered"
+        assert pr_url == replacement_pr
+        assert task is not None and task.status == "merging"
+
+    def test_rejected_handoff_does_not_fall_back_to_historical_comment(self, kanban_home):
+        """A comment naming a rejected PR is not an active merger target."""
+        stale_pr = "https://github.com/org/repo/pull/56"
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="x", assignee="worker")
+            _claim(conn, tid)
+            kb.add_comment(conn, tid, "worker", f"Old PR: {stale_pr}")
+            assert kb.move_to_review(conn, tid, reason=f"PR {stale_pr}")
+            assert kb.move_to_human_review(conn, tid, reason=f"PR {stale_pr}")
+            assert kb.reject_task(conn, tid, reason="PR was rejected")
+
+            _claim(conn, tid)
+            assert kb.move_to_review(conn, tid, reason="Replacement work has no PR yet")
+            assert kb.move_to_human_review(conn, tid, reason="AC verified")
+
+            assert kb._extract_pr_url(conn, tid) is None
+
 
 # ---------------------------------------------------------------------------
 # claim_merger_task
@@ -361,6 +410,25 @@ class TestMergingLanding:
         blocked = [e for e in events if e.kind == "blocked"]
         assert blocked
         assert (blocked[-1].payload or {}).get("reason") == reason
+
+    def test_closed_wrong_target_can_be_blocked_then_unblocked_safely(self, kanban_home):
+        """A human can recover a stuck merger without an automatic reaper."""
+        with kb.connect() as conn:
+            tid = self._make_merging_task(conn)
+            assert kb.block_task(
+                conn,
+                tid,
+                reason="PR closed without merging; replacement PR must be reviewed",
+            )
+            blocked = kb.get_task(conn, tid)
+            assert blocked is not None and blocked.status == "blocked"
+            assert blocked.current_run_id is None
+            assert kb.unblock_task(conn, tid)
+            recovered = kb.get_task(conn, tid)
+
+        assert recovered is not None
+        assert recovered.status == "ready"
+        assert recovered.current_run_id is None
 
 
 # ---------------------------------------------------------------------------
