@@ -5697,6 +5697,14 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def _pr_url_from_text(value: Optional[str]) -> Optional[str]:
+    """Extract one normalized GitHub PR URL from a human handoff string."""
+    if not value:
+        return None
+    match = _RESPAWN_GUARD_PR_URL_RE.search(value)
+    return match.group(0) if match else None
+
+
 def move_to_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5764,7 +5772,11 @@ def move_to_review(
             conn,
             task_id,
             "review_requested",
-            {"reason": reason} if reason else None,
+            (
+                {"reason": reason, "pr_url": _pr_url_from_text(reason)}
+                if reason
+                else None
+            ),
             run_id=run_id,
         )
         return True
@@ -5837,7 +5849,11 @@ def move_to_human_review(
             conn,
             task_id,
             "human_review_requested",
-            {"reason": reason} if reason else None,
+            (
+                {"reason": reason, "pr_url": _pr_url_from_text(reason)}
+                if reason
+                else None
+            ),
             run_id=run_id,
         )
         return True
@@ -5848,54 +5864,62 @@ def _extract_pr_url(
     task_id: str,
 ) -> Optional[str]:
     # @design-guard
-    # INVARIANT: _extract_pr_url() scans (1) task events for review_requested.reason,
-    # then (2) task comments, in that order. It returns the FIRST GitHub PR URL found
-    # via _RESPAWN_GUARD_PR_URL_RE (already defined in this file). Returns None when no
-    # URL is found anywhere.
+    # INVARIANT: The merger target is taken only from the current review cycle:
+    # scan review/human-review handoffs newest-first and stop at the most recent
+    # rejected event. Historical handoffs/comments must never resurrect a rejected
+    # PR. Comments are a legacy fallback only when no review handoff exists.
     #
     # INVARIANT: This function is pure/read-only — no DB writes, no network calls.
-    """Scan task events and comments for a GitHub PR URL.
+    """Return the PR URL bound to the latest non-rejected review cycle.
 
-    Checks (in order):
-    1. ``review_requested`` event payloads (most recent first) — the ``reason``
-       field typically carries ``"PR <url>"``.
-    2. Task comments (most recent first).
+    A task may have multiple review attempts.  We inspect the latest active
+    ``human_review_requested`` / ``review_requested`` handoffs and never cross
+    the latest ``rejected`` event.  An explicit ``payload.pr_url`` wins; the
+    historical ``payload.reason`` URL remains supported for old events.
 
-    Returns the first URL that matches ``_RESPAWN_GUARD_PR_URL_RE``, or ``None``
-    if no PR URL is found anywhere.
+    Comments remain a compatibility fallback for legacy cards with no review
+    handoff at all.  Once a handoff exists, comments are deliberately ignored:
+    they are unstructured historical context and cannot safely authorize a
+    post-approval mutation.
     """
-    # Pass 1: scan events
     events = conn.execute(
-        "SELECT payload FROM task_events "
-        "WHERE task_id = ? AND kind = 'review_requested' "
-        "ORDER BY created_at DESC, id DESC",
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN "
+        "('human_review_requested', 'review_requested', 'rejected') "
+        "ORDER BY id DESC",
         (task_id,),
     ).fetchall()
+    saw_handoff = False
     for row in events:
+        if row["kind"] == "rejected":
+            break
+        saw_handoff = True
         if not row["payload"]:
             continue
         try:
             payload = json.loads(row["payload"])
         except (ValueError, TypeError):
             continue
-        reason = payload.get("reason") or ""
-        m = _RESPAWN_GUARD_PR_URL_RE.search(str(reason))
-        if m:
-            return m.group(0)
+        if not isinstance(payload, dict):
+            continue
+        for value in (payload.get("pr_url"), payload.get("reason")):
+            if not value:
+                continue
+            match = _RESPAWN_GUARD_PR_URL_RE.search(str(value))
+            if match:
+                return match.group(0)
 
-    # Pass 2: scan comments (newest first)
+    if saw_handoff or events:
+        return None
+
     comments = conn.execute(
-        "SELECT body FROM task_comments "
-        "WHERE task_id = ? "
-        "ORDER BY created_at DESC, id DESC",
+        "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id DESC",
         (task_id,),
     ).fetchall()
     for row in comments:
-        body = row["body"] or ""
-        m = _RESPAWN_GUARD_PR_URL_RE.search(body)
-        if m:
-            return m.group(0)
-
+        match = _RESPAWN_GUARD_PR_URL_RE.search(row["body"] or "")
+        if match:
+            return match.group(0)
     return None
 
 
