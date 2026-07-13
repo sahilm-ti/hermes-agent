@@ -20,14 +20,20 @@ has an associated GitHub PR. Your job: merge that PR, then call
 ## Trigger and context
 
 1. Call `kanban_show()` at startup (no args — defaults to your task).
-2. Find the PR URL in the most recent `merge_requested` event payload:
+2. Find the PR URL in the `merge_requested` event for the current merger run:
    ```
-   events where kind == "merge_requested" → payload.pr_url
+   events where kind == "merge_requested" and run_id == current_run_id → payload.pr_url
    ```
-   If no `merge_requested` event is found, scan task comments for a
-   `https://github.com/.../pull/N` URL as fallback.
-3. If you cannot find any PR URL after both passes → `kanban_complete`
-   with summary "approved, no PR to merge". Stop.
+   This payload is the approval-time authorization binding. Never replace it
+   with a URL from a historical review event or comment. If the current-run
+   binding is absent or ambiguous, `kanban_block` and request an explicit
+   re-approval.
+3. Before any GitHub or git mutation, re-read the bound PR with `gh-as-ai pr
+   view` and confirm that it is the expected open PR for this task. A closed,
+   draft, already-merged, or scope-mismatched target is a stop condition — do
+   not select another historical URL. A closed unmerged target must be blocked,
+   then a human can use `hermes kanban unblock <task_id>` after the replacement
+   PR reaches review and is explicitly re-approved.
 
 ---
 
