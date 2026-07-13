@@ -2727,6 +2727,7 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
             result="ok",
             metadata={"artifacts": [str(artifact)]},
         )
+        kb.gc_scratch_workspaces(conn)
 
         completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
         persisted = Path(completed.payload["artifacts"][0])
@@ -2784,6 +2785,7 @@ def test_complete_task_preserves_legacy_artifact_path_from_summary(kanban_home):
             t,
             summary=f"Task complete — delivered {report}",
         )
+        kb.gc_scratch_workspaces(conn)
         run = kb.latest_run(conn, t)
 
     persisted = Path(run.metadata["artifacts"][0])
@@ -2812,6 +2814,7 @@ def test_complete_task_leaves_non_scratch_artifact_paths_unchanged(
             result="ok",
             metadata={"artifacts": [str(external)]},
         )
+        kb.gc_scratch_workspaces(conn)
 
         completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
         run = kb.latest_run(conn, t)
@@ -2843,6 +2846,7 @@ def test_complete_task_persists_duplicate_scratch_artifact_names(kanban_home):
             result="ok",
             metadata={"artifacts": [str(first), str(second)]},
         )
+        kb.gc_scratch_workspaces(conn)
 
         completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
         persisted = [Path(p) for p in completed.payload["artifacts"]]
@@ -2871,6 +2875,7 @@ def test_complete_task_persists_board_scratch_artifacts_to_board_attachments(kan
             result="ok",
             metadata={"artifacts": [str(artifact)]},
         )
+        kb.gc_scratch_workspaces(conn)
 
         completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
         persisted = Path(completed.payload["artifacts"][0])
