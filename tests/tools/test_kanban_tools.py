@@ -86,6 +86,7 @@ def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_pat
     assert "kanban_complete" in names
     assert "kanban_block" in names
     assert "kanban_list" not in names
+    assert "kanban_archive" not in names
 
 
 def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_path):
@@ -112,6 +113,7 @@ def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_p
     assert {
         "kanban_list",
         "kanban_unblock",
+        "kanban_archive",
     }.isdisjoint(kanban), (
         f"Board-routing tools leaked into worker schema: "
         f"{kanban & {'kanban_list', 'kanban_unblock'}}"
@@ -138,7 +140,7 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
         "kanban_list",
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
-        "kanban_unblock",
+        "kanban_unblock", "kanban_archive",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
@@ -147,6 +149,38 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 # Handler happy paths
 # ---------------------------------------------------------------------------
+
+
+def test_archive_archives_task_through_kanban_api(monkeypatch, worker_env):
+    """Orchestrators archive through archive_task and preserve its events."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="stale task", assignee="peer")
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    result = json.loads(kt._handle_archive({"task_id": tid}))
+    assert result == {"ok": True, "task_id": tid, "status": "archived"}
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "archived"
+        assert any(event.kind == "archived" for event in kb.list_events(conn, tid))
+    finally:
+        conn.close()
+
+
+def test_archive_rejects_dispatcher_worker(worker_env):
+    """A dispatcher worker cannot archive even its own task."""
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_archive({"task_id": worker_env}))
+    assert "orchestrator-only" in result["error"]
 
 @pytest.fixture
 def worker_env(monkeypatch, tmp_path):
