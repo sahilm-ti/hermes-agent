@@ -1183,6 +1183,32 @@ def _handle_unblock(args: dict, **kw) -> str:
         return tool_error(f"kanban_unblock: {e}")
 
 
+def _handle_archive(args: dict, **kw) -> str:
+    """Archive a task through the Kanban DB API."""
+    guard = _require_orchestrator_tool("kanban_archive")
+    if guard:
+        return guard
+    tid = args.get("task_id")
+    if not tid:
+        return tool_error("task_id is required")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            if not kb.archive_task(conn, str(tid)):
+                return tool_error(
+                    f"could not archive {tid} (unknown or already archived)"
+                )
+            return _ok(task_id=str(tid), status="archived")
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_archive: {e}")
+    except Exception as e:
+        logger.exception("kanban_archive failed")
+        return tool_error(f"kanban_archive: {e}")
+
+
 def _handle_review(args: dict, **kw) -> str:
     """Transition the worker's task to 'review' (auto-review agent handoff)."""
     tid = _default_task_id(args.get("task_id"))
@@ -1918,6 +1944,27 @@ KANBAN_UNBLOCK_SCHEMA = {
     },
 }
 
+KANBAN_ARCHIVE_SCHEMA = {
+    "name": "kanban_archive",
+    "description": (
+        "Archive a stale Kanban task through the audited board API. Archived "
+        "parents stop blocking dependents, and any active run is closed as "
+        "reclaimed. Orchestrator-only — dispatcher-spawned task workers never "
+        "see this tool."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Task id to archive.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id"],
+    },
+}
+
 KANBAN_REVIEW_SCHEMA = {
     "name": "kanban_review",
     "description": (
@@ -2137,6 +2184,15 @@ registry.register(
     handler=_handle_unblock,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
+)
+
+registry.register(
+    name="kanban_archive",
+    toolset="kanban",
+    schema=KANBAN_ARCHIVE_SCHEMA,
+    handler=_handle_archive,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🗄",
 )
 
 registry.register(
