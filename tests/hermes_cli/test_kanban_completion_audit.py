@@ -282,6 +282,39 @@ def test_dispatch_completion_audit_no_double_spawn(kanban_home, all_assignees_sp
     assert spawn_count[0] == 1
 
 
+def test_stale_completion_audit_claim_closes_run_and_requeues(kanban_home, monkeypatch):
+    """A post-spawn audit-worker crash is reclaimed without stranding its run."""
+    host = kb._claimer_id().split(":", 1)[0]
+    lock = f"{host}:audit-worker"
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="recover dead audit", assignee="alice")
+        _complete_task_no_pr(conn, task_id)
+        assert kb.claim_completion_audit_task(conn, task_id, claimer=lock) is not None
+        kb._set_worker_pid(conn, task_id, 12345)
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 1, task_id),
+        )
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+        assert kb.release_stale_claims(conn) == 1
+        task = kb.get_task(conn, task_id)
+        run = kb.latest_run(conn, task_id)
+        audit_at = conn.execute(
+            "SELECT completion_audit_at FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()["completion_audit_at"]
+
+    assert task is not None
+    assert task.status == "done"
+    assert task.claim_lock is None
+    assert task.current_run_id is None
+    assert audit_at is not None
+    assert run is not None
+    assert run.status == "reclaimed"
+    assert run.outcome == "reclaimed"
+    assert run.ended_at is not None
+
+
 @pytest.mark.parametrize("failure", ["workspace", "spawn"])
 def test_dispatch_completion_audit_failure_closes_run_and_requeues(
     kanban_home, all_assignees_spawnable, monkeypatch, failure, tmp_path

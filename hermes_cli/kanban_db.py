@@ -3891,9 +3891,10 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
+        "SELECT id, status, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
         "FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
+        "WHERE (status = 'running' OR (status = 'done' AND current_run_id IS NOT NULL)) "
+        "  AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
         (now,),
     ).fetchall()
@@ -3919,11 +3920,11 @@ def release_stale_claims(
             with write_txn(conn):
                 cur = conn.execute(
                     "UPDATE tasks SET claim_expires = ? "
-                    "WHERE id = ? AND status = 'running' "
+                    "WHERE id = ? AND status = ? "
                     "  AND claim_lock IS ? "
                     "  AND claim_expires IS NOT NULL "
                     "  AND claim_expires < ?",
-                    (new_expires, row["id"], row["claim_lock"], now),
+                    (new_expires, row["id"], row["status"], row["claim_lock"], now),
                 )
                 if cur.rowcount != 1:
                     continue
@@ -3963,21 +3964,6 @@ def release_stale_claims(
             )
             continue
         with write_txn(conn):
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
-                "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
-            )
-            if cur.rowcount != 1:
-                continue
-            run_id = _end_run(
-                conn, row["id"],
-                outcome="reclaimed", status="reclaimed",
-                error=f"stale_lock={row['claim_lock']}",
-                metadata=termination,
-            )
             payload = {
                 "stale_lock": row["claim_lock"],
                 "worker_pid": (
@@ -3994,6 +3980,32 @@ def release_stale_claims(
                 "heartbeat_stale": bool(heartbeat_stale),
             }
             payload.update(termination)
+            if row["status"] == "done":
+                run_id = _recover_stale_completion_audit_claim(
+                    conn,
+                    row["id"],
+                    claim_lock=row["claim_lock"],
+                    error=f"stale_lock={row['claim_lock']}",
+                    metadata=payload,
+                )
+                if run_id is not None:
+                    reclaimed += 1
+                continue
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
+                "AND claim_expires IS NOT NULL AND claim_expires < ?",
+                (row["id"], row["claim_lock"], now),
+            )
+            if cur.rowcount != 1:
+                continue
+            run_id = _end_run(
+                conn, row["id"],
+                outcome="reclaimed", status="reclaimed",
+                error=f"stale_lock={row['claim_lock']}",
+                metadata=termination,
+            )
             _append_event(
                 conn, row["id"], "reclaimed",
                 payload,
@@ -4441,6 +4453,48 @@ def _rearm_completion_audit(
         {"error": error[:200], "run_id": run_id},
         run_id=run_id,
     )
+
+
+def _recover_stale_completion_audit_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    claim_lock: Optional[str],
+    error: str,
+    metadata: dict,
+) -> Optional[int]:
+    """Close and requeue a claimed completion audit after its worker disappears.
+
+    Completion-audit workers intentionally leave their parent task ``done``.
+    They still own an active ``task_runs`` row, so generic running-task
+    recovery cannot release a dead audit worker. The caller must hold
+    ``write_txn``.
+    """
+    cur = conn.execute(
+        "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+        "worker_pid = NULL, last_heartbeat_at = NULL, completion_audit_at = ? "
+        "WHERE id = ? AND status = 'done' AND claim_lock IS ?",
+        (int(time.time()), task_id, claim_lock),
+    )
+    if cur.rowcount != 1:
+        return None
+    run_id = _end_run(
+        conn,
+        task_id,
+        outcome="reclaimed",
+        status="reclaimed",
+        error=error,
+        metadata=metadata,
+    )
+    _append_event(conn, task_id, "reclaimed", metadata, run_id=run_id)
+    _append_event(
+        conn,
+        task_id,
+        "completion_audit_requeued",
+        {"error": error[:200], "run_id": run_id},
+        run_id=run_id,
+    )
+    return run_id
 
 
 def complete_task(
