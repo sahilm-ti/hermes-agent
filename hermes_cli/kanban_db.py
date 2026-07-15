@@ -1442,6 +1442,16 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+CREATE TABLE IF NOT EXISTS kanban_quarantine (
+    assignee         TEXT PRIMARY KEY,
+    cooldown_until   INTEGER NOT NULL,
+    trip_count       INTEGER NOT NULL DEFAULT 1,
+    last_trip_at     INTEGER NOT NULL,
+    last_reason      TEXT,
+    probe_in_flight  INTEGER NOT NULL DEFAULT 0,
+    probe_task_id    TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -4215,6 +4225,59 @@ class HallucinatedCardsError(ValueError):
 
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
+
+
+def _maybe_schedule_completion_audit(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> None:
+    """Set ``completion_audit_at`` if this task should be regime-B audited.
+
+    Conditions for scheduling an audit (all must hold):
+    1. The task had at least one claimed run (was dispatched to a worker, not
+       just manually completed via ``hermes kanban complete``).
+    2. No GitHub PR URL anywhere in the task's comments or events.
+    3. No ``skip-review: …`` directive in the task body.
+    4. ``completion_audit_at`` is not already set (idempotent).
+
+    Silent on failure — audit scheduling is best-effort.
+    """
+    try:
+        row = conn.execute(
+            "SELECT body, completion_audit_at FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return
+        # Already scheduled.
+        if row["completion_audit_at"] is not None:
+            return
+        # Body opts out.
+        body = row["body"] or ""
+        if _SKIP_REVIEW_RE.search(body):
+            return
+        # Only audit tasks that had at least one real worker run — i.e., a
+        # ``claimed`` event exists. Manually completed tasks (via
+        # ``hermes kanban complete`` on a never-dispatched task) skip audit
+        # because there's no deliverable for the agent to inspect.
+        claimed_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'claimed'",
+            (task_id,),
+        ).fetchone()[0]
+        if claimed_events == 0:
+            return
+        # Skip if the task has an associated PR.
+        if _extract_pr_url(conn, task_id):
+            return
+        # Schedule.
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET completion_audit_at = ? WHERE id = ? AND status = 'done'",
+                (int(time.time()), task_id),
+            )
+    except Exception:
+        pass  # never break completion on an audit-scheduling fault
 
 
 def complete_task(
@@ -7131,6 +7194,19 @@ DEFAULT_KANBAN_GIT_IDENTITY_NAME = "Sahil (AI)"
 KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
 
 # ---------------------------------------------------------------------------
+# Crash-loop circuit breaker (per-assignee quarantine)
+# ---------------------------------------------------------------------------
+#
+# A burst from one broken worker environment should not consume the entire
+# dispatcher spawn budget. After a cooldown, exactly one probe is allowed;
+# successful completion clears the quarantine and another crash backs off.
+DEFAULT_CRASH_BREAKER_MAX_CRASHES = 3
+DEFAULT_CRASH_BREAKER_WINDOW_SECONDS = 120
+DEFAULT_CRASH_BREAKER_COOLDOWN_SECONDS = 300
+DEFAULT_CRASH_BREAKER_MAX_COOLDOWN_SECONDS = 3600
+_QUARANTINE_REASON_MAX = 200
+
+# ---------------------------------------------------------------------------
 # Respawn guard constants
 # ---------------------------------------------------------------------------
 
@@ -9227,6 +9303,11 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    crash_breaker_enabled: bool = False,
+    crash_breaker_max_crashes: int = DEFAULT_CRASH_BREAKER_MAX_CRASHES,
+    crash_breaker_window_seconds: int = DEFAULT_CRASH_BREAKER_WINDOW_SECONDS,
+    crash_breaker_cooldown_seconds: int = DEFAULT_CRASH_BREAKER_COOLDOWN_SECONDS,
+    crash_breaker_max_cooldown_seconds: int = DEFAULT_CRASH_BREAKER_MAX_COOLDOWN_SECONDS,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -9724,12 +9805,24 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        is_probe = False
+        if crash_breaker_enabled and not dry_run:
+            blocked_q, is_probe = is_assignee_quarantined(conn, row["assignee"])
+            if blocked_q:
+                result.quarantine_blocked.append((row["id"], row["assignee"]))
+                continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        if is_probe:
+            try:
+                mark_quarantine_probe_task(conn, row["assignee"], claimed.id)
+            except Exception:
+                pass
+            result.quarantine_probes.append((claimed.id, row["assignee"]))
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
