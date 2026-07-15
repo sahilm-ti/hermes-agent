@@ -315,6 +315,135 @@ def test_stale_completion_audit_claim_closes_run_and_requeues(kanban_home, monke
     assert run.ended_at is not None
 
 
+def _claim_active_completion_audit(conn, *, max_runtime_seconds=None):
+    """Create a done task with a claimed completion-audit worker."""
+    host = kb._claimer_id().split(":", 1)[0]
+    lock = f"{host}:audit-worker"
+    task_id = kb.create_task(
+        conn,
+        title="recover active audit",
+        assignee="alice",
+        max_runtime_seconds=max_runtime_seconds,
+    )
+    _complete_task_no_pr(conn, task_id)
+    assert kb.claim_completion_audit_task(conn, task_id, claimer=lock) is not None
+    return task_id, lock
+
+
+def test_active_completion_audit_can_heartbeat(kanban_home):
+    """A claimed audit records liveness without changing its parent from done."""
+    with kb.connect() as conn:
+        task_id, lock = _claim_active_completion_audit(conn)
+        claimed_task = kb.get_task(conn, task_id)
+        assert claimed_task is not None
+        run_id = claimed_task.current_run_id
+        assert run_id is not None
+
+        assert kb.heartbeat_claim(conn, task_id, claimer=lock)
+        assert kb.heartbeat_worker(conn, task_id, expected_run_id=run_id)
+
+        task = kb.get_task(conn, task_id)
+        run = kb.latest_run(conn, task_id)
+
+    assert task is not None
+    assert task.status == "done"
+    assert task.last_heartbeat_at is not None
+    assert run is not None
+    assert run.last_heartbeat_at is not None
+
+
+def test_active_completion_audit_timeout_requeues_without_blocking_parent(
+    kanban_home, monkeypatch
+):
+    """Runtime enforcement retries an overrun audit while retaining done status."""
+    with kb.connect() as conn:
+        task_id, _ = _claim_active_completion_audit(conn, max_runtime_seconds=1)
+        kb._set_worker_pid(conn, task_id, 12345)
+        conn.execute(
+            "UPDATE task_runs SET started_at = ? WHERE id = ("
+            "SELECT current_run_id FROM tasks WHERE id = ?)",
+            (int(time.time()) - 2, task_id),
+        )
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+        assert kb.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None) == [task_id]
+        task = kb.get_task(conn, task_id)
+        run = conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+
+    assert task is not None
+    assert task.status == "done"
+    assert task.claim_lock is None
+    assert task.current_run_id is None
+    assert run is not None
+    assert run["outcome"] == "timed_out"
+
+
+def test_active_completion_audit_stuck_worker_requeues_without_blocking_parent(
+    kanban_home, monkeypatch
+):
+    """Stuck-worker enforcement retries an audit while retaining done status."""
+    alive = [True]
+
+    def signal_worker(_pid, _sig):
+        alive[0] = False
+
+    with kb.connect() as conn:
+        task_id, _ = _claim_active_completion_audit(conn)
+        kb._set_worker_pid(conn, task_id, 12345)
+        claimed_task = kb.get_task(conn, task_id)
+        assert claimed_task is not None
+        run_id = claimed_task.current_run_id
+        assert run_id is not None
+        assert kb.heartbeat_worker(conn, task_id, expected_run_id=run_id)
+        stale_at = int(time.time()) - 2
+        conn.execute(
+            "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
+            (stale_at, run_id),
+        )
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: alive[0])
+
+        assert kb.detect_stuck_workers(
+            conn, stuck_after_seconds_default=1, signal_fn=signal_worker
+        ) == [task_id]
+        task = kb.get_task(conn, task_id)
+        run = kb.latest_run(conn, task_id)
+
+    assert task is not None
+    assert task.status == "done"
+    assert task.claim_lock is None
+    assert task.current_run_id is None
+    assert run is not None
+    assert run.outcome == "stuck"
+
+
+def test_active_completion_audit_crash_requeues_without_blocking_parent(
+    kanban_home, monkeypatch
+):
+    """Immediate crash detection retries an audit while retaining done status."""
+    with kb.connect() as conn:
+        task_id, _ = _claim_active_completion_audit(conn)
+        kb._set_worker_pid(conn, task_id, 12345)
+        conn.execute(
+            "UPDATE tasks SET started_at = ? WHERE id = ?",
+            (int(time.time()) - 60, task_id),
+        )
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+        assert kb.detect_crashed_workers(conn) == [task_id]
+        task = kb.get_task(conn, task_id)
+        run = kb.latest_run(conn, task_id)
+
+    assert task is not None
+    assert task.status == "done"
+    assert task.claim_lock is None
+    assert task.current_run_id is None
+    assert run is not None
+    assert run.outcome == "crashed"
+
+
 @pytest.mark.parametrize("failure", ["workspace", "spawn"])
 def test_dispatch_completion_audit_failure_closes_run_and_requeues(
     kanban_home, all_assignees_spawnable, monkeypatch, failure, tmp_path
