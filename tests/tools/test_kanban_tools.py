@@ -151,6 +151,63 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_reject_handles_running_task_claimed_from_review(monkeypatch, worker_env):
+    """The auto-review worker can reject its own review-claimed task.
+
+    ``claim_review_task`` moves the card to ``running`` before the sdlc
+    reviewer starts. Exercise the tool handler rather than only the DB helper
+    so a reviewer does not need a direct-SQLite workaround.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="reviewed task", assignee="test-worker")
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
+        claimed = kb.claim_review_task(conn, tid)
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+        review_run_id = claimed.current_run_id
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    reason = "acceptance criteria not met"
+    result = json.loads(kt._handle_reject({"task_id": tid, "reason": reason}))
+
+    assert result == {"ok": True, "task_id": tid, "status": "ready"}
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.claim_lock is None
+        assert task.current_run_id is None
+
+        run = conn.execute(
+            "SELECT status, outcome, summary, claim_lock, claim_expires "
+            "FROM task_runs WHERE id = ?",
+            (review_run_id,),
+        ).fetchone()
+        assert run is not None
+        assert dict(run) == {
+            "status": "rejected",
+            "outcome": "rejected",
+            "summary": reason,
+            "claim_lock": None,
+            "claim_expires": None,
+        }
+
+        event = conn.execute(
+            "SELECT kind, payload, run_id FROM task_events "
+            "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert event is not None
+        assert dict(event) == {
+            "kind": "rejected",
+            "payload": json.dumps({"reason": reason}),
+            "run_id": review_run_id,
+        }
+
+
 def test_archive_archives_task_through_kanban_api(monkeypatch, worker_env):
     """Orchestrators archive through archive_task and preserve its events."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
