@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -2195,6 +2195,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "no_heartbeat_required INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "completion_audit_at" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "completion_audit_at",
+            "completion_audit_at INTEGER",
+        )
+
     if "skip_merge" not in cols:
         _add_column_if_missing(
             conn, "tasks", "skip_merge", "skip_merge INTEGER NOT NULL DEFAULT 0"
@@ -2213,6 +2221,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_completion_audit "
+        "ON tasks(completion_audit_at) WHERE completion_audit_at IS NOT NULL"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -4227,6 +4239,9 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+_SKIP_REVIEW_RE = re.compile(r"(?m)^skip-review\s*:", re.IGNORECASE)
+
+
 def _maybe_schedule_completion_audit(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4278,6 +4293,118 @@ def _maybe_schedule_completion_audit(
             )
     except Exception:
         pass  # never break completion on an audit-scheduling fault
+
+
+def claim_completion_audit_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    ttl_seconds: Optional[int] = None,
+    claimer: Optional[str] = None,
+) -> Optional[Task]:
+    """Atomically claim a done task for a read-only completion audit."""
+    now = int(time.time())
+    lock = claimer or _claimer_id()
+    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET completion_audit_at = NULL,
+                   claim_lock          = ?,
+                   claim_expires       = ?
+             WHERE id = ?
+               AND status = 'done'
+               AND completion_audit_at IS NOT NULL
+               AND claim_lock IS NULL
+            """,
+            (lock, expires, task_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        trow = conn.execute(
+            "SELECT assignee, max_runtime_seconds, current_step_key "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        run_cur = conn.execute(
+            """
+            INSERT INTO task_runs (
+                task_id, profile, step_key, status,
+                claim_lock, claim_expires, max_runtime_seconds, started_at
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                trow["assignee"] if trow else None,
+                trow["current_step_key"] if trow else None,
+                lock,
+                expires,
+                trow["max_runtime_seconds"] if trow else None,
+                now,
+            ),
+        )
+        run_id = run_cur.lastrowid
+        conn.execute(
+            "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+            (run_id, task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "claimed",
+            {
+                "lock": lock,
+                "expires": expires,
+                "run_id": run_id,
+                "source_status": "done",
+                "audit_kind": "completion_audit",
+            },
+            run_id=run_id,
+        )
+        return get_task(conn, task_id)
+
+
+def complete_completion_audit(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    claimer: Optional[str] = None,
+) -> bool:
+    """Release an audit claim while preserving the task's ``done`` status."""
+    lock = claimer or _claimer_id()
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET claim_lock = NULL,
+                   claim_expires = NULL
+             WHERE id = ?
+               AND status = 'done'
+               AND claim_lock = ?
+            """,
+            (task_id, lock),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="completed",
+            status="done",
+            summary=summary,
+            metadata=metadata,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "completion_audit_done",
+            {"summary": (summary or "")[:200] or None, "run_id": run_id},
+            run_id=run_id,
+        )
+    return True
 
 
 def complete_task(
@@ -9777,6 +9904,102 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+
+    # ---- completion-audit column dispatch ----
+    audit_rows = conn.execute(
+        "SELECT id, assignee FROM tasks "
+        "WHERE status = 'done' AND completion_audit_at IS NOT NULL "
+        "AND claim_lock IS NULL ORDER BY completion_audit_at ASC"
+    ).fetchall()
+    for row in audit_rows:
+        if max_spawn is not None and running_count + spawned >= max_spawn:
+            break
+        if not row["assignee"]:
+            result.skipped_unassigned.append(row["id"])
+            continue
+        try:
+            from hermes_cli.profiles import profile_exists as audit_profile_exists
+        except Exception:
+            audit_profile_exists: Optional[Callable[[str], bool]] = None
+        if audit_profile_exists is not None and not audit_profile_exists(row["assignee"]):
+            result.skipped_nonspawnable.append(row["id"])
+            continue
+        if dry_run:
+            result.audited.append((row["id"], row["assignee"], ""))
+            continue
+        claimed = claim_completion_audit_task(
+            conn, row["id"], ttl_seconds=ttl_seconds
+        )
+        if claimed is None:
+            continue
+        try:
+            resolved_branch_name = None
+            if claimed.workspace_kind == "worktree":
+                workspace, resolved_branch_name = _resolve_worktree_workspace(
+                    claimed, board=board
+                )
+            else:
+                workspace = resolve_workspace(claimed, board=board)
+                pin_workspace_git_identity(workspace)
+            set_workspace_path(conn, claimed.id, str(workspace))
+            if claimed.workspace_kind == "worktree":
+                set_branch_name(
+                    conn,
+                    claimed.id,
+                    resolved_branch_name
+                    or (claimed.branch_name or "").strip()
+                    or f"wt/{claimed.id}",
+                )
+        except Exception:
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                    "completion_audit_at = ? WHERE id = ? AND status = 'done'",
+                    (int(time.time()), claimed.id),
+                )
+            continue
+        claimed.skills = ["sdlc-completion-audit"]
+        if spawn_fn is None:
+            try:
+                from hermes_cli.profiles import resolve_profile_env
+
+                worker_home = (
+                    resolve_profile_env(claimed.assignee) if claimed.assignee else None
+                )
+            except Exception:
+                worker_home = None
+            missing_skills = _validate_task_skills(claimed, worker_home)
+            if missing_skills:
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                        "completion_audit_at = ? WHERE id = ? AND status = 'done'",
+                        (int(time.time()), claimed.id),
+                    )
+                continue
+        audit_spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        try:
+            import inspect
+
+            try:
+                sig = inspect.signature(audit_spawn)
+                if "board" in sig.parameters:
+                    pid = audit_spawn(claimed, str(workspace), board=board)
+                else:
+                    pid = audit_spawn(claimed, str(workspace))
+            except (TypeError, ValueError):
+                pid = audit_spawn(claimed, str(workspace))
+            if pid:
+                _set_worker_pid(conn, claimed.id, int(pid))
+            result.audited.append((claimed.id, claimed.assignee or "", str(workspace)))
+            spawned += 1
+        except Exception:
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                    "completion_audit_at = ? WHERE id = ? AND status = 'done'",
+                    (int(time.time()), claimed.id),
+                )
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
