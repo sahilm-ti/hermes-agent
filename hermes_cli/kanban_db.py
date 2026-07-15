@@ -7918,7 +7918,6 @@ def enforce_max_runtime(
     merger's judgment or risk a double-merge by re-queueing a half-finished
     merge.
     """
-    import signal
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -7948,38 +7947,22 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
-        # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
-        killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        termination = _terminate_reclaimed_worker(
+            pid, row["claim_lock"], signal_fn=signal_fn,
         )
-        if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
+        if row["status"] == "done" and _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, tid, row["claim_lock"], now, termination,
+                reason="max_runtime_worker_alive",
+            )
+            continue
 
         payload = {
             "pid": pid,
             "elapsed_seconds": int(elapsed),
             "limit_seconds": int(row["max_runtime_seconds"]),
-            "sigkill": killed,
         }
+        payload.update(termination)
         if row["status"] == "done":
             with write_txn(conn):
                 run_id = _recover_stale_completion_audit_claim(
@@ -8012,8 +7995,8 @@ def enforce_max_runtime(
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
                     "limit_seconds": int(row["max_runtime_seconds"]),
-                    "sigkill": killed,
                 }
+                payload.update(termination)
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
@@ -8036,7 +8019,7 @@ def enforce_max_runtime(
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
-                event_payload_extra={"pid": pid, "sigkill": killed},
+                event_payload_extra={"pid": pid, **termination},
             )
     return timed_out
 
@@ -8053,6 +8036,7 @@ def enforce_missing_heartbeat(
     *,
     warn_after_seconds: int = MISSING_HB_WARN_SECONDS,
     block_after_seconds: int = MISSING_HB_BLOCK_SECONDS,
+    signal_fn=None,
 ) -> tuple[list[str], list[str]]:
     """Enforce the heartbeat protocol on workers that have never sent one.
 
@@ -8084,8 +8068,6 @@ def enforce_missing_heartbeat(
     Returns ``(warned_ids, blocked_ids)`` — the task IDs that received
     each action this tick.
     """
-    import signal as _signal_mod
-
     if warn_after_seconds <= 0 and block_after_seconds <= 0:
         return [], []
 
@@ -8122,14 +8104,15 @@ def enforce_missing_heartbeat(
 
         # Hard-block tier (30 min).
         if block_after_seconds > 0 and elapsed >= block_after_seconds:
-            # Terminate the worker if it's host-local and still alive.
-            if pid and lock.startswith(host_prefix) and _pid_alive(int(pid)):
-                kill = getattr(os, "kill", None)
-                if kill is not None:
-                    try:
-                        kill(int(pid), _signal_mod.SIGTERM)
-                    except (ProcessLookupError, OSError):
-                        pass
+            termination = _terminate_reclaimed_worker(
+                int(pid) if pid else None, row["claim_lock"], signal_fn=signal_fn,
+            )
+            if row["status"] == "done" and _worker_survived_termination(termination):
+                _defer_reclaim_for_live_worker(
+                    conn, tid, row["claim_lock"], now, termination,
+                    reason="missing_heartbeat_worker_alive",
+                )
+                continue
 
             reason = (
                 f"worker ran {elapsed // 60}m ({elapsed}s) without sending any "
@@ -8148,6 +8131,7 @@ def enforce_missing_heartbeat(
                             "threshold_seconds": block_after_seconds,
                             "action": "requeued",
                             "pid": int(pid) if pid else None,
+                            **termination,
                         },
                         outcome="stuck",
                         event_kind="stuck",
@@ -8260,8 +8244,6 @@ def detect_stuck_workers(
     Returns the list of re-queued task IDs.  ``signal_fn`` is a test hook;
     defaults to ``os.kill`` on POSIX.
     """
-    import signal as _signal_mod
-
     stuck_ids: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -8310,27 +8292,15 @@ def detect_stuck_workers(
 
         tid = row["id"]
 
-        # Terminate: SIGTERM first, SIGKILL after grace window.
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        termination = _terminate_reclaimed_worker(
+            pid, lock, signal_fn=signal_fn,
         )
-        killed = False
-        if kill is not None:
-            try:
-                kill(pid, _signal_mod.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    _sigkill = getattr(_signal_mod, "SIGKILL", _signal_mod.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
+        if row["status"] == "done" and _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, tid, lock, now, termination,
+                reason="stuck_worker_alive",
+            )
+            continue
 
         error_msg = (
             f"worker silent for {hb_age // 60}m ({hb_age}s) despite live pid {pid}"
@@ -8340,8 +8310,8 @@ def detect_stuck_workers(
             "last_heartbeat_at": int(row["last_heartbeat_at"]),
             "heartbeat_age_seconds": hb_age,
             "stuck_after_seconds": effective,
-            "sigkill": killed,
         }
+        payload.update(termination)
 
         with write_txn(conn):
             if row["status"] == "done":
@@ -8967,10 +8937,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, status, worker_pid, claim_lock, started_at FROM tasks "
-            "WHERE (status = 'running' "
-            "       OR (status = 'done' AND current_run_id IS NOT NULL)) "
-            "  AND worker_pid IS NOT NULL"
+            "SELECT t.id, t.status, t.worker_pid, t.claim_lock, "
+            "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+            "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE (t.status = 'running' "
+            "       OR (t.status = 'done' AND t.current_run_id IS NOT NULL)) "
+            "  AND t.worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -8981,7 +8953,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             # Skip liveness check inside the launch-window grace period
             # so a freshly-spawned worker isn't reclaimed before its PID
             # is visible on /proc.
-            started_at = row["started_at"] if "started_at" in row.keys() else None
+            started_at = row["active_started_at"]
             if started_at is not None:
                 grace = _resolve_crash_grace_seconds()
                 if time.time() - started_at < grace:
@@ -9054,17 +9026,25 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_code"] = code
 
             if row["status"] == "done":
+                outcome = "rate_limited" if rate_limited_exit else "crashed"
                 run_id = _recover_stale_completion_audit_claim(
                     conn,
                     row["id"],
                     claim_lock=row["claim_lock"],
                     error=error_text,
                     metadata=dict(event_payload),
-                    outcome="crashed",
+                    outcome=outcome,
                     event_kind=event_kind,
                 )
                 if run_id is not None:
-                    crashed.append(row["id"])
+                    if rate_limited_exit:
+                        conn.execute(
+                            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                            (error_text[:500], row["id"]),
+                        )
+                        rate_limited.append(row["id"])
+                    else:
+                        crashed.append(row["id"])
                 continue
 
             cur = conn.execute(
