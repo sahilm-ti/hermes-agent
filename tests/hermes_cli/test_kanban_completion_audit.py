@@ -372,11 +372,15 @@ def test_active_completion_audit_timeout_requeues_without_blocking_parent(
             "SELECT outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
+        audit_at = conn.execute(
+            "SELECT completion_audit_at FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()["completion_audit_at"]
 
     assert task is not None
     assert task.status == "done"
     assert task.claim_lock is None
     assert task.current_run_id is None
+    assert audit_at is not None
     assert run is not None
     assert run["outcome"] == "timed_out"
 
@@ -483,11 +487,15 @@ def test_active_completion_audit_stuck_worker_requeues_without_blocking_parent(
         ) == [task_id]
         task = kb.get_task(conn, task_id)
         run = kb.latest_run(conn, task_id)
+        audit_at = conn.execute(
+            "SELECT completion_audit_at FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()["completion_audit_at"]
 
     assert task is not None
     assert task.status == "done"
     assert task.claim_lock is None
     assert task.current_run_id is None
+    assert audit_at is not None
     assert run is not None
     assert run.outcome == "stuck"
 
@@ -518,11 +526,15 @@ def test_active_completion_audit_crash_requeues_without_blocking_parent(
         run = conn.execute(
             "SELECT outcome FROM task_runs WHERE id = ?", (run_id,)
         ).fetchone()
+        audit_at = conn.execute(
+            "SELECT completion_audit_at FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()["completion_audit_at"]
 
     assert task is not None
     assert task.status == "done"
     assert task.claim_lock is None
     assert task.current_run_id is None
+    assert audit_at is not None
     assert run is not None
     assert run["outcome"] == "crashed"
 
