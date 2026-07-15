@@ -4407,6 +4407,42 @@ def complete_completion_audit(
     return True
 
 
+def _rearm_completion_audit(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    error: str,
+) -> None:
+    """Close a failed audit attempt and make its task eligible for retry.
+
+    Completion audits retain their task's ``done`` status, but claiming one
+    still opens a normal task-run record. Every failure before a worker starts
+    must therefore close that run before clearing the task claim; otherwise a
+    later reaper sees a completed task with a permanently running run.
+
+    The caller must hold ``write_txn(conn)``.
+    """
+    run_id = _end_run(
+        conn,
+        task_id,
+        outcome="spawn_failed",
+        status="spawn_failed",
+        error=error,
+    )
+    conn.execute(
+        "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+        "completion_audit_at = ? WHERE id = ? AND status = 'done'",
+        (int(time.time()), task_id),
+    )
+    _append_event(
+        conn,
+        task_id,
+        "completion_audit_requeued",
+        {"error": error[:200], "run_id": run_id},
+        run_id=run_id,
+    )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5035,7 +5071,8 @@ def gc_scratch_workspaces(conn: sqlite3.Connection) -> int:
         "WHERE workspace_kind = 'scratch' "
         "  AND workspace_path IS NOT NULL "
         "  AND status IN ('done', 'blocked', 'archived') "
-        "  AND claim_lock IS NULL"
+        "  AND claim_lock IS NULL "
+        "  AND completion_audit_at IS NULL"
     ).fetchall()
     reaped = 0
     for row in rows:
@@ -5088,6 +5125,7 @@ def gc_worktree_workspaces(
         "  AND workspace_path IS NOT NULL "
         "  AND status IN ('done', 'archived') "
         "  AND claim_lock IS NULL "
+        "  AND completion_audit_at IS NULL "
         "  AND (completed_at IS NULL OR completed_at <= ?)",
         (cutoff,),
     ).fetchall()
@@ -9950,13 +9988,9 @@ def _dispatch_once_locked(
                     or (claimed.branch_name or "").strip()
                     or f"wt/{claimed.id}",
                 )
-        except Exception:
+        except Exception as exc:
             with write_txn(conn):
-                conn.execute(
-                    "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
-                    "completion_audit_at = ? WHERE id = ? AND status = 'done'",
-                    (int(time.time()), claimed.id),
-                )
+                _rearm_completion_audit(conn, claimed.id, error=str(exc))
             continue
         claimed.skills = ["sdlc-completion-audit"]
         if spawn_fn is None:
@@ -9971,10 +10005,10 @@ def _dispatch_once_locked(
             missing_skills = _validate_task_skills(claimed, worker_home)
             if missing_skills:
                 with write_txn(conn):
-                    conn.execute(
-                        "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
-                        "completion_audit_at = ? WHERE id = ? AND status = 'done'",
-                        (int(time.time()), claimed.id),
+                    _rearm_completion_audit(
+                        conn,
+                        claimed.id,
+                        error=f"missing required skills: {', '.join(missing_skills)}",
                     )
                 continue
         audit_spawn = spawn_fn if spawn_fn is not None else _default_spawn
@@ -9993,13 +10027,9 @@ def _dispatch_once_locked(
                 _set_worker_pid(conn, claimed.id, int(pid))
             result.audited.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
-        except Exception:
+        except Exception as exc:
             with write_txn(conn):
-                conn.execute(
-                    "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
-                    "completion_audit_at = ? WHERE id = ? AND status = 'done'",
-                    (int(time.time()), claimed.id),
-                )
+                _rearm_completion_audit(conn, claimed.id, error=str(exc))
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after

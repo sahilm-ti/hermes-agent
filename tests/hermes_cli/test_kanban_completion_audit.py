@@ -282,6 +282,81 @@ def test_dispatch_completion_audit_no_double_spawn(kanban_home, all_assignees_sp
     assert spawn_count[0] == 1
 
 
+@pytest.mark.parametrize("failure", ["workspace", "spawn"])
+def test_dispatch_completion_audit_failure_closes_run_and_requeues(
+    kanban_home, all_assignees_spawnable, monkeypatch, failure
+):
+    """A failed audit dispatch leaves no running run behind before requeueing."""
+    def failing_spawn(task, workspace, board=None):
+        raise RuntimeError("audit worker unavailable")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="retry audit", assignee="alice")
+        _complete_task_no_pr(conn, task_id)
+        if failure == "workspace":
+            monkeypatch.setattr(
+                kb,
+                "resolve_workspace",
+                lambda task, board=None: (_ for _ in ()).throw(
+                    RuntimeError("workspace unavailable")
+                ),
+            )
+        else:
+            monkeypatch.setattr(kb, "resolve_workspace", lambda task, board=None: Path("/tmp"))
+
+        kb.dispatch_once(conn, spawn_fn=failing_spawn)
+        task = kb.get_task(conn, task_id)
+        run = kb.latest_run(conn, task_id)
+        audit_at = conn.execute(
+            "SELECT completion_audit_at FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()["completion_audit_at"]
+
+    assert task is not None
+    assert task.status == "done"
+    assert task.claim_lock is None
+    assert task.current_run_id is None
+    assert audit_at is not None
+    assert run is not None
+    assert run.status == "spawn_failed"
+    assert run.outcome == "spawn_failed"
+    assert run.ended_at is not None
+
+
+def test_queued_completion_audit_workspace_survives_gc(kanban_home):
+    """GC keeps a done scratch workspace while its completion audit is queued."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="audit before cleanup", assignee="alice")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, task_id, workspace)
+        _complete_task_no_pr(conn, task_id)
+
+        assert kb.gc_scratch_workspaces(conn) == 0
+
+    assert workspace.exists()
+
+
+def test_queued_completion_audit_worktree_survives_gc(kanban_home, monkeypatch):
+    """Worktree GC also keeps a done workspace while its audit is queued."""
+    removed = []
+    monkeypatch.setattr(kb, "remove_worktree", lambda task_id, path: removed.append(task_id))
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="audit before worktree cleanup",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(Path("/tmp") / "audit-worktree"),
+        )
+        _complete_task_no_pr(conn, task_id)
+
+        assert kb.gc_worktree_workspaces(conn, min_age_seconds=0) == 0
+
+    assert removed == []
+
+
 def test_dispatch_completion_audit_counts_toward_max_spawn(
     kanban_home, all_assignees_spawnable
 ):
