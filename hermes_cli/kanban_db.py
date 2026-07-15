@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -161,6 +161,15 @@ WORKER_ACTIVE_STATUSES = ("running", "merging")
 _WORKER_ACTIVE_STATUS_SQL = "status IN (" + ", ".join(
     f"'{_s}'" for _s in WORKER_ACTIVE_STATUSES
 ) + ")"
+
+# Completion-audit workers deliberately retain their parent task's terminal
+# ``done`` status while holding an active run. They must participate in the
+# same liveness and recovery paths as ordinary active workers, without being
+# transitioned back to ``ready`` by those paths.
+_ACTIVE_WORKER_OR_AUDIT_SQL = (
+    f"({_WORKER_ACTIVE_STATUS_SQL} "
+    "OR (status = 'done' AND current_run_id IS NOT NULL))"
+)
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 # Keyword fragments in a task's title/body that strongly suggest the worker
@@ -2195,6 +2204,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "no_heartbeat_required INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "completion_audit_at" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "completion_audit_at",
+            "completion_audit_at INTEGER",
+        )
+
     if "skip_merge" not in cols:
         _add_column_if_missing(
             conn, "tasks", "skip_merge", "skip_merge INTEGER NOT NULL DEFAULT 0"
@@ -2213,6 +2230,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_completion_audit "
+        "ON tasks(completion_audit_at) WHERE completion_audit_at IS NOT NULL"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -3942,7 +3963,7 @@ def heartbeat_claim(
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
-            f"WHERE id = ? AND {_WORKER_ACTIVE_STATUS_SQL} AND claim_lock = ?",
+            f"WHERE id = ? AND {_ACTIVE_WORKER_OR_AUDIT_SQL} AND claim_lock = ?",
             (expires, task_id, lock),
         )
         if cur.rowcount == 1:
@@ -3990,9 +4011,10 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
+        "SELECT id, status, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
         "FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
+        "WHERE (status = 'running' OR (status = 'done' AND current_run_id IS NOT NULL)) "
+        "  AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
         (now,),
     ).fetchall()
@@ -4018,11 +4040,11 @@ def release_stale_claims(
             with write_txn(conn):
                 cur = conn.execute(
                     "UPDATE tasks SET claim_expires = ? "
-                    "WHERE id = ? AND status = 'running' "
+                    "WHERE id = ? AND status = ? "
                     "  AND claim_lock IS ? "
                     "  AND claim_expires IS NOT NULL "
                     "  AND claim_expires < ?",
-                    (new_expires, row["id"], row["claim_lock"], now),
+                    (new_expires, row["id"], row["status"], row["claim_lock"], now),
                 )
                 if cur.rowcount != 1:
                     continue
@@ -4062,21 +4084,6 @@ def release_stale_claims(
             )
             continue
         with write_txn(conn):
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
-                "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
-            )
-            if cur.rowcount != 1:
-                continue
-            run_id = _end_run(
-                conn, row["id"],
-                outcome="reclaimed", status="reclaimed",
-                error=f"stale_lock={row['claim_lock']}",
-                metadata=termination,
-            )
             payload = {
                 "stale_lock": row["claim_lock"],
                 "worker_pid": (
@@ -4093,6 +4100,32 @@ def release_stale_claims(
                 "heartbeat_stale": bool(heartbeat_stale),
             }
             payload.update(termination)
+            if row["status"] == "done":
+                run_id = _recover_stale_completion_audit_claim(
+                    conn,
+                    row["id"],
+                    claim_lock=row["claim_lock"],
+                    error=f"stale_lock={row['claim_lock']}",
+                    metadata=payload,
+                )
+                if run_id is not None:
+                    reclaimed += 1
+                continue
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
+                "AND claim_expires IS NOT NULL AND claim_expires < ?",
+                (row["id"], row["claim_lock"], now),
+            )
+            if cur.rowcount != 1:
+                continue
+            run_id = _end_run(
+                conn, row["id"],
+                outcome="reclaimed", status="reclaimed",
+                error=f"stale_lock={row['claim_lock']}",
+                metadata=termination,
+            )
             _append_event(
                 conn, row["id"], "reclaimed",
                 payload,
@@ -4338,6 +4371,9 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+_SKIP_REVIEW_RE = re.compile(r"(?m)^skip-review\s*:", re.IGNORECASE)
+
+
 def _maybe_schedule_completion_audit(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4389,6 +4425,198 @@ def _maybe_schedule_completion_audit(
             )
     except Exception:
         pass  # never break completion on an audit-scheduling fault
+
+
+def claim_completion_audit_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    ttl_seconds: Optional[int] = None,
+    claimer: Optional[str] = None,
+) -> Optional[Task]:
+    """Atomically claim a done task for a read-only completion audit."""
+    now = int(time.time())
+    lock = claimer or _claimer_id()
+    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET completion_audit_at = NULL,
+                   claim_lock          = ?,
+                   claim_expires       = ?
+             WHERE id = ?
+               AND status = 'done'
+               AND completion_audit_at IS NOT NULL
+               AND claim_lock IS NULL
+            """,
+            (lock, expires, task_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        trow = conn.execute(
+            "SELECT assignee, max_runtime_seconds, current_step_key "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        run_cur = conn.execute(
+            """
+            INSERT INTO task_runs (
+                task_id, profile, step_key, status,
+                claim_lock, claim_expires, max_runtime_seconds, started_at
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                trow["assignee"] if trow else None,
+                trow["current_step_key"] if trow else None,
+                lock,
+                expires,
+                trow["max_runtime_seconds"] if trow else None,
+                now,
+            ),
+        )
+        run_id = run_cur.lastrowid
+        conn.execute(
+            "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+            (run_id, task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "claimed",
+            {
+                "lock": lock,
+                "expires": expires,
+                "run_id": run_id,
+                "source_status": "done",
+                "audit_kind": "completion_audit",
+            },
+            run_id=run_id,
+        )
+        return get_task(conn, task_id)
+
+
+def complete_completion_audit(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    claimer: Optional[str] = None,
+) -> bool:
+    """Release an audit claim while preserving the task's ``done`` status."""
+    lock = claimer or _claimer_id()
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET claim_lock = NULL,
+                   claim_expires = NULL
+             WHERE id = ?
+               AND status = 'done'
+               AND claim_lock = ?
+            """,
+            (task_id, lock),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="completed",
+            status="done",
+            summary=summary,
+            metadata=metadata,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "completion_audit_done",
+            {"summary": (summary or "")[:200] or None, "run_id": run_id},
+            run_id=run_id,
+        )
+    return True
+
+
+def _rearm_completion_audit(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    error: str,
+) -> None:
+    """Close a failed audit attempt and make its task eligible for retry.
+
+    Completion audits retain their task's ``done`` status, but claiming one
+    still opens a normal task-run record. Every failure before a worker starts
+    must therefore close that run before clearing the task claim; otherwise a
+    later reaper sees a completed task with a permanently running run.
+
+    The caller must hold ``write_txn(conn)``.
+    """
+    run_id = _end_run(
+        conn,
+        task_id,
+        outcome="spawn_failed",
+        status="spawn_failed",
+        error=error,
+    )
+    conn.execute(
+        "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+        "completion_audit_at = ? WHERE id = ? AND status = 'done'",
+        (int(time.time()), task_id),
+    )
+    _append_event(
+        conn,
+        task_id,
+        "completion_audit_requeued",
+        {"error": error[:200], "run_id": run_id},
+        run_id=run_id,
+    )
+
+
+def _recover_stale_completion_audit_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    claim_lock: Optional[str],
+    error: str,
+    metadata: dict,
+    outcome: str = "reclaimed",
+    event_kind: str = "reclaimed",
+) -> Optional[int]:
+    """Close and requeue a claimed completion audit after its worker disappears.
+
+    Completion-audit workers intentionally leave their parent task ``done``.
+    They still own an active ``task_runs`` row, so generic running-task
+    recovery cannot release a dead audit worker. The caller must hold
+    ``write_txn``.
+    """
+    cur = conn.execute(
+        "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+        "worker_pid = NULL, last_heartbeat_at = NULL, completion_audit_at = ? "
+        "WHERE id = ? AND status = 'done' AND claim_lock IS ?",
+        (int(time.time()), task_id, claim_lock),
+    )
+    if cur.rowcount != 1:
+        return None
+    run_id = _end_run(
+        conn,
+        task_id,
+        outcome=outcome,
+        status=outcome,
+        error=error,
+        metadata=metadata,
+    )
+    _append_event(conn, task_id, event_kind, metadata, run_id=run_id)
+    _append_event(
+        conn,
+        task_id,
+        "completion_audit_requeued",
+        {"error": error[:200], "run_id": run_id},
+        run_id=run_id,
+    )
+    return run_id
 
 
 def complete_task(
@@ -5019,7 +5247,8 @@ def gc_scratch_workspaces(conn: sqlite3.Connection) -> int:
         "WHERE workspace_kind = 'scratch' "
         "  AND workspace_path IS NOT NULL "
         "  AND status IN ('done', 'blocked', 'archived') "
-        "  AND claim_lock IS NULL"
+        "  AND claim_lock IS NULL "
+        "  AND completion_audit_at IS NULL"
     ).fetchall()
     reaped = 0
     for row in rows:
@@ -5072,6 +5301,7 @@ def gc_worktree_workspaces(
         "  AND workspace_path IS NOT NULL "
         "  AND status IN ('done', 'archived') "
         "  AND claim_lock IS NULL "
+        "  AND completion_audit_at IS NULL "
         "  AND (completed_at IS NULL OR completed_at <= ?)",
         (cutoff,),
     ).fetchall()
@@ -7690,7 +7920,7 @@ def _defer_reclaim_for_live_worker(
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
+            f"WHERE id = ? AND {_ACTIVE_WORKER_OR_AUDIT_SQL} AND claim_lock IS ?",
             (grace, task_id, claim_lock),
         )
         if cur.rowcount != 1:
@@ -7743,13 +7973,13 @@ def heartbeat_worker(
         if expected_run_id is None:
             cur = conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? "
-                f"WHERE id = ? AND {_WORKER_ACTIVE_STATUS_SQL}",
+                f"WHERE id = ? AND {_ACTIVE_WORKER_OR_AUDIT_SQL}",
                 (now, task_id),
             )
         else:
             cur = conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? "
-                f"WHERE id = ? AND {_WORKER_ACTIVE_STATUS_SQL} "
+                f"WHERE id = ? AND {_ACTIVE_WORKER_OR_AUDIT_SQL} "
                 "AND current_run_id = ?",
                 (now, task_id, int(expected_run_id)),
             )
@@ -7799,18 +8029,19 @@ def enforce_max_runtime(
     merger's judgment or risk a double-merge by re-queueing a half-finished
     merge.
     """
-    import signal
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, "
+        "SELECT t.id, t.status, t.worker_pid, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
+        "WHERE (t.status = 'running' "
+        "       OR (t.status = 'done' AND t.current_run_id IS NOT NULL)) "
+        "  AND t.max_runtime_seconds IS NOT NULL "
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
@@ -7827,31 +8058,39 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
-        # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
-        killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        termination = _terminate_reclaimed_worker(
+            pid, row["claim_lock"], signal_fn=signal_fn,
         )
-        if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
+        if row["status"] == "done" and _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, tid, row["claim_lock"], now, termination,
+                reason="max_runtime_worker_alive",
+            )
+            continue
+
+        payload = {
+            "pid": pid,
+            "elapsed_seconds": int(elapsed),
+            "limit_seconds": int(row["max_runtime_seconds"]),
+        }
+        payload.update(termination)
+        if row["status"] == "done":
+            with write_txn(conn):
+                run_id = _recover_stale_completion_audit_claim(
+                    conn,
+                    tid,
+                    claim_lock=row["claim_lock"],
+                    error=(
+                        f"elapsed {int(elapsed)}s > limit "
+                        f"{int(row['max_runtime_seconds'])}s"
+                    ),
+                    metadata=payload,
+                    outcome="timed_out",
+                    event_kind="timed_out",
+                )
+            if run_id is not None:
+                timed_out.append(tid)
+            continue
 
         with write_txn(conn):
             cur = conn.execute(
@@ -7867,8 +8106,8 @@ def enforce_max_runtime(
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
                     "limit_seconds": int(row["max_runtime_seconds"]),
-                    "sigkill": killed,
                 }
+                payload.update(termination)
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
@@ -7891,7 +8130,7 @@ def enforce_max_runtime(
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
-                event_payload_extra={"pid": pid, "sigkill": killed},
+                event_payload_extra={"pid": pid, **termination},
             )
     return timed_out
 
@@ -7908,6 +8147,7 @@ def enforce_missing_heartbeat(
     *,
     warn_after_seconds: int = MISSING_HB_WARN_SECONDS,
     block_after_seconds: int = MISSING_HB_BLOCK_SECONDS,
+    signal_fn=None,
 ) -> tuple[list[str], list[str]]:
     """Enforce the heartbeat protocol on workers that have never sent one.
 
@@ -7939,8 +8179,6 @@ def enforce_missing_heartbeat(
     Returns ``(warned_ids, blocked_ids)`` — the task IDs that received
     each action this tick.
     """
-    import signal as _signal_mod
-
     if warn_after_seconds <= 0 and block_after_seconds <= 0:
         return [], []
 
@@ -7948,12 +8186,13 @@ def enforce_missing_heartbeat(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.claim_lock, t.no_heartbeat_required, "
+        "SELECT t.id, t.status, t.worker_pid, t.claim_lock, t.no_heartbeat_required, "
         "       t.current_run_id, "
         "       COALESCE(tr.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs tr ON tr.id = t.current_run_id "
-        "WHERE t.status = 'running' "
+        "WHERE (t.status = 'running' "
+        "       OR (t.status = 'done' AND t.current_run_id IS NOT NULL)) "
         "  AND (tr.last_heartbeat_at IS NULL OR t.current_run_id IS NULL)"
     ).fetchall()
 
@@ -7976,20 +8215,41 @@ def enforce_missing_heartbeat(
 
         # Hard-block tier (30 min).
         if block_after_seconds > 0 and elapsed >= block_after_seconds:
-            # Terminate the worker if it's host-local and still alive.
-            if pid and lock.startswith(host_prefix) and _pid_alive(int(pid)):
-                kill = getattr(os, "kill", None)
-                if kill is not None:
-                    try:
-                        kill(int(pid), _signal_mod.SIGTERM)
-                    except (ProcessLookupError, OSError):
-                        pass
+            termination = _terminate_reclaimed_worker(
+                int(pid) if pid else None, row["claim_lock"], signal_fn=signal_fn,
+            )
+            if row["status"] == "done" and _worker_survived_termination(termination):
+                _defer_reclaim_for_live_worker(
+                    conn, tid, row["claim_lock"], now, termination,
+                    reason="missing_heartbeat_worker_alive",
+                )
+                continue
 
             reason = (
                 f"worker ran {elapsed // 60}m ({elapsed}s) without sending any "
                 f"kanban_heartbeat — protocol violation. "
                 f"Heartbeat every few minutes during long operations (skill: kanban-worker §3)."
             )
+            if row["status"] == "done":
+                with write_txn(conn):
+                    requeued_run_id = _recover_stale_completion_audit_claim(
+                        conn,
+                        tid,
+                        claim_lock=row["claim_lock"],
+                        error=reason,
+                        metadata={
+                            "elapsed_seconds": elapsed,
+                            "threshold_seconds": block_after_seconds,
+                            "action": "requeued",
+                            "pid": int(pid) if pid else None,
+                            **termination,
+                        },
+                        outcome="stuck",
+                        event_kind="stuck",
+                    )
+                if requeued_run_id is not None:
+                    blocked.append(tid)
+                continue
             ok = block_task(conn, tid, reason=reason, expected_run_id=run_id)
             if ok:
                 _append_event(
@@ -8095,8 +8355,6 @@ def detect_stuck_workers(
     Returns the list of re-queued task IDs.  ``signal_fn`` is a test hook;
     defaults to ``os.kill`` on POSIX.
     """
-    import signal as _signal_mod
-
     stuck_ids: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -8105,12 +8363,13 @@ def detect_stuck_workers(
     # differ from the board default.  We also need claim_lock to check
     # host-locality and worker_pid to kill the process.
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, tr.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.status, t.worker_pid, tr.last_heartbeat_at, t.claim_lock, "
         "       t.stuck_after_seconds, t.no_heartbeat_required, "
         "       t.current_run_id "
         "FROM tasks t "
         "JOIN task_runs tr ON tr.id = t.current_run_id "
-        "WHERE t.status = 'running' "
+        "WHERE (t.status = 'running' "
+        "       OR (t.status = 'done' AND t.current_run_id IS NOT NULL)) "
         "  AND t.worker_pid IS NOT NULL "
         "  AND tr.last_heartbeat_at IS NOT NULL"
     ).fetchall()
@@ -8144,27 +8403,15 @@ def detect_stuck_workers(
 
         tid = row["id"]
 
-        # Terminate: SIGTERM first, SIGKILL after grace window.
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        termination = _terminate_reclaimed_worker(
+            pid, lock, signal_fn=signal_fn,
         )
-        killed = False
-        if kill is not None:
-            try:
-                kill(pid, _signal_mod.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    _sigkill = getattr(_signal_mod, "SIGKILL", _signal_mod.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
+        if row["status"] == "done" and _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, tid, lock, now, termination,
+                reason="stuck_worker_alive",
+            )
+            continue
 
         error_msg = (
             f"worker silent for {hb_age // 60}m ({hb_age}s) despite live pid {pid}"
@@ -8174,10 +8421,23 @@ def detect_stuck_workers(
             "last_heartbeat_at": int(row["last_heartbeat_at"]),
             "heartbeat_age_seconds": hb_age,
             "stuck_after_seconds": effective,
-            "sigkill": killed,
         }
+        payload.update(termination)
 
         with write_txn(conn):
+            if row["status"] == "done":
+                run_id = _recover_stale_completion_audit_claim(
+                    conn,
+                    tid,
+                    claim_lock=lock,
+                    error=error_msg,
+                    metadata=payload,
+                    outcome="stuck",
+                    event_kind="stuck",
+                )
+                if run_id is not None:
+                    stuck_ids.append(tid)
+                continue
             # CAS: guard on current_run_id + worker_pid + claim_lock so a
             # racing heartbeat or reclaim between the SELECT and this UPDATE
             # makes the UPDATE a no-op (rowcount == 0) instead of stomping a
@@ -8261,11 +8521,12 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.status, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running'"
+        "WHERE (t.status = 'running' "
+        "       OR (t.status = 'done' AND t.current_run_id IS NOT NULL))"
     ).fetchall()
 
     for row in rows:
@@ -8298,6 +8559,34 @@ def detect_stale_running(
                 conn, tid, lock, now, termination,
                 reason="heartbeat_stale_worker_alive",
             )
+            continue
+
+        if row["status"] == "done":
+            payload = {
+                "elapsed_seconds": int(elapsed),
+                "last_heartbeat_at": int(last_hb) if last_hb is not None else None,
+                "heartbeat_age_seconds": int(hb_age) if hb_age is not None else None,
+                "timeout_seconds": stale_timeout_seconds,
+                "pid": int(pid) if pid else None,
+            }
+            payload.update(termination)
+            error = (
+                f"no heartbeat for {int(hb_age)}s "
+                if hb_age is not None
+                else "no heartbeat ever"
+            ) + f" after {int(elapsed)}s running"
+            with write_txn(conn):
+                run_id = _recover_stale_completion_audit_claim(
+                    conn,
+                    tid,
+                    claim_lock=row["claim_lock"],
+                    error=error,
+                    metadata=payload,
+                    outcome="stale",
+                    event_kind="stale",
+                )
+            if run_id is not None:
+                reclaimed.append(tid)
             continue
 
         with write_txn(conn):
@@ -8759,8 +9048,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "SELECT t.id, t.status, t.worker_pid, t.claim_lock, "
+            "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+            "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE (t.status = 'running' "
+            "       OR (t.status = 'done' AND t.current_run_id IS NOT NULL)) "
+            "  AND t.worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -8771,7 +9064,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             # Skip liveness check inside the launch-window grace period
             # so a freshly-spawned worker isn't reclaimed before its PID
             # is visible on /proc.
-            started_at = row["started_at"] if "started_at" in row.keys() else None
+            started_at = row["active_started_at"]
             if started_at is not None:
                 grace = _resolve_crash_grace_seconds()
                 if time.time() - started_at < grace:
@@ -8842,6 +9135,28 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
+
+            if row["status"] == "done":
+                outcome = "rate_limited" if rate_limited_exit else "crashed"
+                run_id = _recover_stale_completion_audit_claim(
+                    conn,
+                    row["id"],
+                    claim_lock=row["claim_lock"],
+                    error=error_text,
+                    metadata=dict(event_payload),
+                    outcome=outcome,
+                    event_kind=event_kind,
+                )
+                if run_id is not None:
+                    if rate_limited_exit:
+                        conn.execute(
+                            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                            (error_text[:500], row["id"]),
+                        )
+                        rate_limited.append(row["id"])
+                    else:
+                        crashed.append(row["id"])
+                continue
 
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -9888,6 +10203,94 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+
+    # ---- completion-audit column dispatch ----
+    audit_rows = conn.execute(
+        "SELECT id, assignee FROM tasks "
+        "WHERE status = 'done' AND completion_audit_at IS NOT NULL "
+        "AND claim_lock IS NULL ORDER BY completion_audit_at ASC"
+    ).fetchall()
+    for row in audit_rows:
+        if max_spawn is not None and running_count + spawned >= max_spawn:
+            break
+        if not row["assignee"]:
+            result.skipped_unassigned.append(row["id"])
+            continue
+        try:
+            from hermes_cli.profiles import profile_exists as audit_profile_exists
+        except Exception:
+            audit_profile_exists: Optional[Callable[[str], bool]] = None
+        if audit_profile_exists is not None and not audit_profile_exists(row["assignee"]):
+            result.skipped_nonspawnable.append(row["id"])
+            continue
+        if dry_run:
+            result.audited.append((row["id"], row["assignee"], ""))
+            continue
+        claimed = claim_completion_audit_task(
+            conn, row["id"], ttl_seconds=ttl_seconds
+        )
+        if claimed is None:
+            continue
+        try:
+            resolved_branch_name = None
+            if claimed.workspace_kind == "worktree":
+                workspace, resolved_branch_name = _resolve_worktree_workspace(
+                    claimed, board=board
+                )
+            else:
+                workspace = resolve_workspace(claimed, board=board)
+                pin_workspace_git_identity(workspace)
+            set_workspace_path(conn, claimed.id, str(workspace))
+            if claimed.workspace_kind == "worktree":
+                set_branch_name(
+                    conn,
+                    claimed.id,
+                    resolved_branch_name
+                    or (claimed.branch_name or "").strip()
+                    or f"wt/{claimed.id}",
+                )
+        except Exception as exc:
+            with write_txn(conn):
+                _rearm_completion_audit(conn, claimed.id, error=str(exc))
+            continue
+        claimed.skills = ["sdlc-completion-audit"]
+        if spawn_fn is None:
+            try:
+                from hermes_cli.profiles import resolve_profile_env
+
+                worker_home = (
+                    resolve_profile_env(claimed.assignee) if claimed.assignee else None
+                )
+            except Exception:
+                worker_home = None
+            missing_skills = _validate_task_skills(claimed, worker_home)
+            if missing_skills:
+                with write_txn(conn):
+                    _rearm_completion_audit(
+                        conn,
+                        claimed.id,
+                        error=f"missing required skills: {', '.join(missing_skills)}",
+                    )
+                continue
+        audit_spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        try:
+            import inspect
+
+            try:
+                sig = inspect.signature(audit_spawn)
+                if "board" in sig.parameters:
+                    pid = audit_spawn(claimed, str(workspace), board=board)
+                else:
+                    pid = audit_spawn(claimed, str(workspace))
+            except (TypeError, ValueError):
+                pid = audit_spawn(claimed, str(workspace))
+            if pid:
+                _set_worker_pid(conn, claimed.id, int(pid))
+            result.audited.append((claimed.id, claimed.assignee or "", str(workspace)))
+            spawned += 1
+        except Exception as exc:
+            with write_txn(conn):
+                _rearm_completion_audit(conn, claimed.id, error=str(exc))
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
