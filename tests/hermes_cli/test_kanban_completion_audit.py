@@ -284,25 +284,22 @@ def test_dispatch_completion_audit_no_double_spawn(kanban_home, all_assignees_sp
 
 @pytest.mark.parametrize("failure", ["workspace", "spawn"])
 def test_dispatch_completion_audit_failure_closes_run_and_requeues(
-    kanban_home, all_assignees_spawnable, monkeypatch, failure
+    kanban_home, all_assignees_spawnable, monkeypatch, failure, tmp_path
 ):
     """A failed audit dispatch leaves no running run behind before requeueing."""
     def failing_spawn(task, workspace, board=None):
         raise RuntimeError("audit worker unavailable")
 
+    def failing_resolve(task, board=None):
+        raise RuntimeError("workspace unavailable")
+
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="retry audit", assignee="alice")
         _complete_task_no_pr(conn, task_id)
         if failure == "workspace":
-            monkeypatch.setattr(
-                kb,
-                "resolve_workspace",
-                lambda task, board=None: (_ for _ in ()).throw(
-                    RuntimeError("workspace unavailable")
-                ),
-            )
+            monkeypatch.setattr(kb, "resolve_workspace", failing_resolve)
         else:
-            monkeypatch.setattr(kb, "resolve_workspace", lambda task, board=None: Path("/tmp"))
+            monkeypatch.setattr(kb, "resolve_workspace", lambda task, board=None: tmp_path)
 
         kb.dispatch_once(conn, spawn_fn=failing_spawn)
         task = kb.get_task(conn, task_id)
@@ -337,7 +334,7 @@ def test_queued_completion_audit_workspace_survives_gc(kanban_home):
     assert workspace.exists()
 
 
-def test_queued_completion_audit_worktree_survives_gc(kanban_home, monkeypatch):
+def test_queued_completion_audit_worktree_survives_gc(kanban_home, monkeypatch, tmp_path):
     """Worktree GC also keeps a done workspace while its audit is queued."""
     removed = []
     monkeypatch.setattr(kb, "remove_worktree", lambda task_id, path: removed.append(task_id))
@@ -348,7 +345,7 @@ def test_queued_completion_audit_worktree_survives_gc(kanban_home, monkeypatch):
             title="audit before worktree cleanup",
             assignee="alice",
             workspace_kind="worktree",
-            workspace_path=str(Path("/tmp") / "audit-worktree"),
+            workspace_path=str(tmp_path / "audit-worktree"),
         )
         _complete_task_no_pr(conn, task_id)
 
