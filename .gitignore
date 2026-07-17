@@ -111,6 +111,8 @@ models-dev-upstream/
 .codex/
 .cursor/
 .gemini/
+# Generated local Kanban worker Git-identity guard.
+.hermes-hooks/
 .zed/
 .mcp.json
 opencode.json
