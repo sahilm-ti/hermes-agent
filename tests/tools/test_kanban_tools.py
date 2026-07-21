@@ -2275,6 +2275,31 @@ def test_worker_complete_after_review_handoff_reconciles_noop(worker_env, monkey
     assert late_complete.get("status") == "review"
 
 
+def test_worker_block_duplicate_terminal_cas_reconciles_noop(worker_env, monkeypatch):
+    """A duplicate legitimate blocker preserves the first terminal outcome."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+
+    first = json.loads(
+        kt._handle_block({"reason": "need a human decision", "kind": "needs_input"})
+    )
+    assert first.get("ok") is True
+    second = json.loads(
+        kt._handle_block({"reason": "duplicate blocker", "kind": "needs_input"})
+    )
+    assert second.get("ok") is True
+    assert second.get("noop") is True
+    assert second.get("status") == "blocked"
+
+
 def test_worker_human_review_duplicate_terminal_cas_reconciles_noop(monkeypatch, tmp_path):
     from pathlib import Path as _Path
     from hermes_cli import kanban_db as kb
