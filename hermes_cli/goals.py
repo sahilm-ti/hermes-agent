@@ -1658,6 +1658,22 @@ KANBAN_GOAL_FINALIZE_TEMPLATE = (
     "kanban_block with the reason instead."
 )
 
+# Bounded recovery contract when a worker keeps producing "done" prose but
+# still exits without a terminal lifecycle call. This does NOT block the task;
+# callers should persist this contract as recovery context and let normal
+# worker retry logic pick it up.
+KANBAN_GOAL_FINALIZATION_RECOVERY_TEMPLATE = (
+    "[Recovery contract: finalize this kanban task cleanly]\n"
+    "Judge reason: {reason}\n\n"
+    "The previous run appears to have finished the work but did not end the "
+    "task lifecycle correctly. Re-open the existing workspace state, verify "
+    "artifacts, and end with exactly one terminal lifecycle call:\n"
+    "- call kanban_complete with an evidence-backed summary if done, OR\n"
+    "- call kanban_block(kind='dependency' or 'needs_input', reason=...) if "
+    "human/external input is still required.\n"
+    "Do not exit without one of those lifecycle calls."
+)
+
 
 def run_kanban_goal_loop(
     *,
@@ -1693,9 +1709,14 @@ def run_kanban_goal_loop(
     (str -> str), ``task_status_fn`` (() -> str|None), and ``block_fn``
     (reason: str -> None).
 
-    Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
-    outcome is one of ``"completed_by_worker"``, ``"blocked_budget"``,
-    ``"blocked_by_worker"``, or ``"stopped"``.
+    Returns a decision dict with ``{"outcome", "turns_used", "reason"}``.
+    ``outcome`` is one of:
+      - ``"completed_by_worker"``
+      - ``"blocked_budget"``
+      - ``"blocked_by_worker"``
+      - ``"handed_off_by_worker"`` (worker moved task to review/human_review)
+      - ``"finalization_recovery"`` (done prose, missing lifecycle finalizer)
+      - ``"stopped"``
     """
 
     def _log(msg: str) -> None:
@@ -1728,6 +1749,16 @@ def run_kanban_goal_loop(
         if status == "blocked":
             _log(f"kanban goal loop: task {task_id} blocked by worker after {turns_used} turn(s)")
             return {"outcome": "blocked_by_worker", "turns_used": turns_used, "reason": "worker blocked the task"}
+        if status in {"review", "human_review"}:
+            _log(
+                f"kanban goal loop: task {task_id} handed off by worker to "
+                f"{status} after {turns_used} turn(s)"
+            )
+            return {
+                "outcome": "handed_off_by_worker",
+                "turns_used": turns_used,
+                "reason": f"worker moved task to {status}",
+            }
         if status not in ("running", "ready"):
             # Reclaimed / archived / unexpected — let the dispatcher own it.
             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
@@ -1743,25 +1774,51 @@ def run_kanban_goal_loop(
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
 
         if verdict == "done":
+            recovery_contract = KANBAN_GOAL_FINALIZATION_RECOVERY_TEMPLATE.format(
+                reason=_truncate(reason, 500)
+            )
             if nudged_to_finalize:
-                # Already asked once to call kanban_complete and it still
-                # didn't — block for review rather than spin.
-                _log(f"kanban goal loop: task {task_id} judged done but worker won't finalize; blocking")
-                try:
-                    block_fn(
-                        f"Goal-mode worker's output looked complete but it never "
-                        f"called kanban_complete after a finalize nudge ({reason})."
-                    )
-                except Exception as exc:
-                    _log(f"kanban goal loop: block_fn failed ({exc})")
-                return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "judged done, never finalized"}
+                # Bounded recovery route: never hard-block solely because prose
+                # omitted a lifecycle tool call. The dispatcher's protocol-
+                # violation retry path can recover this in a fresh run.
+                _log(
+                    f"kanban goal loop: task {task_id} judged done after finalize "
+                    "nudge but still not finalized; returning recoverable "
+                    "finalization contract (no block)"
+                )
+                return {
+                    "outcome": "finalization_recovery",
+                    "turns_used": turns_used,
+                    "reason": (
+                        "judged done after finalize nudge, but worker never "
+                        "called kanban_complete/kanban_block"
+                    ),
+                    "recovery_contract": recovery_contract,
+                }
+            if turns_used >= max_turns:
+                # Out of turn budget before we can spend a dedicated finalizer
+                # nudge turn: emit recovery contract rather than hard-block.
+                _log(
+                    f"kanban goal loop: task {task_id} judged done at budget edge "
+                    f"({turns_used}/{max_turns}) before finalize nudge; "
+                    "returning recoverable finalization contract (no block)"
+                )
+                return {
+                    "outcome": "finalization_recovery",
+                    "turns_used": turns_used,
+                    "reason": (
+                        "judged done at turn-budget edge without a lifecycle "
+                        "finalizer call"
+                    ),
+                    "recovery_contract": recovery_contract,
+                }
             prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
             nudged_to_finalize = True
         else:
             prompt = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(reason=_truncate(reason, 400))
 
         # Budget check BEFORE spending another turn.
-        if turns_used >= max_turns:
+        if verdict != "done" and turns_used >= max_turns:
             _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
             try:
                 block_fn(
@@ -1797,6 +1854,7 @@ __all__ = [
     "DRAFT_CONTRACT_SYSTEM_PROMPT",
     "KANBAN_GOAL_CONTINUATION_TEMPLATE",
     "KANBAN_GOAL_FINALIZE_TEMPLATE",
+    "KANBAN_GOAL_FINALIZATION_RECOVERY_TEMPLATE",
     "DEFAULT_MAX_TURNS",
     "load_goal",
     "save_goal",

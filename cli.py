@@ -16020,7 +16020,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
-    _run_loop(
+    loop_result = _run_loop(
         task_id=task_id,
         goal_text=goal_text,
         run_turn=_run_turn,
@@ -16030,6 +16030,61 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
     )
+    if not isinstance(loop_result, dict):
+        return
+    if loop_result.get("outcome") != "finalization_recovery":
+        return
+
+    recovery_contract = str(loop_result.get("recovery_contract") or "").strip()
+    recovery_reason = str(loop_result.get("reason") or "").strip()
+    run_id_raw = (_os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    expected_run_id = int(run_id_raw) if run_id_raw.isdigit() else None
+    c = _kb.connect()
+    try:
+        saved = _kb.record_finalization_recovery(
+            c,
+            task_id,
+            reason=recovery_reason,
+            contract=recovery_contract,
+            expected_run_id=expected_run_id,
+        )
+        if saved:
+            logger.info(
+                "kanban goal loop: recorded finalization recovery contract for "
+                "task %s (run_id=%s)",
+                task_id,
+                expected_run_id,
+            )
+            return
+        task_after = _kb.get_task(c, task_id)
+        if task_after is not None and task_after.status in {
+            "done",
+            "blocked",
+            "review",
+            "human_review",
+            "triage",
+            "todo",
+            "scheduled",
+        }:
+            logger.info(
+                "kanban goal loop: finalization recovery contract became a "
+                "no-op for task %s (already in %s)",
+                task_id,
+                task_after.status,
+            )
+        else:
+            logger.info(
+                "kanban goal loop: skipped finalization recovery contract for "
+                "task %s due to ownership/state drift (status=%s, run_id=%s)",
+                task_id,
+                task_after.status if task_after is not None else None,
+                expected_run_id,
+            )
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
 
 
 def main(
