@@ -171,6 +171,41 @@ def test_spawn_no_goal_env_for_plain_task(kanban_home, monkeypatch):
     assert "HERMES_KANBAN_GOAL_MAX_TURNS" not in env
 
 
+def test_finalization_recovery_contract_event_is_non_terminal(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="goal task", assignee="worker")
+        kb.claim_task(conn, tid)
+        task_before = kb.get_task(conn, tid)
+        assert task_before is not None
+        workspace = kanban_home / "scratch-recovery"
+        workspace.mkdir()
+        kb.set_workspace_path(conn, tid, workspace)
+        run_id = task_before.current_run_id
+        assert run_id is not None
+
+        saved = kb.record_finalization_recovery(
+            conn,
+            tid,
+            reason="judge says done but lifecycle call missing",
+            contract="retry and end with kanban_complete/kanban_block",
+            expected_run_id=run_id,
+        )
+        assert saved is True
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.current_run_id is None
+        assert workspace.exists(), "recovery must retain the worker workspace"
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        assert run.outcome == "finalization_recovery"
+        event = kb.list_events(conn, tid)[-1]
+        assert event.kind == "finalization_recovery_requested"
+        comments = kb.list_comments(conn, tid)
+        assert comments
+        assert "Goal-mode finalization recovery requested" in comments[-1].body
+
+
 # ---------------------------------------------------------------------------
 # Goal loop logic (callback-injected, no live model)
 # ---------------------------------------------------------------------------
@@ -267,22 +302,56 @@ def test_loop_finalize_nudge_when_judge_done_but_open(monkeypatch):
 
 
 def test_loop_blocks_when_judge_done_but_never_finalizes(monkeypatch):
-    # Judge keeps saying done, worker never calls kanban_complete → block
-    # after the single finalize nudge.
+    # Judge keeps saying done, worker never calls kanban_complete.
+    # Regression guard: this must go to recoverable finalization (no hard block).
     _patch_judge(monkeypatch, ["done", "done"])
-    blocked = {}
+    blocked_calls = []
 
     res = goals.run_kanban_goal_loop(
         task_id="t5",
         goal_text="task",
         run_turn=lambda p: "still not finalizing",
         task_status_fn=lambda: "running",
-        block_fn=lambda r: blocked.update(reason=r),
+        block_fn=lambda r: blocked_calls.append(r),
         max_turns=10,
         first_response="looks done",
     )
-    assert res["outcome"] == "blocked_budget"
-    assert "finalize" in blocked["reason"].lower()
+    assert res["outcome"] == "finalization_recovery"
+    assert "never called kanban_complete/kanban_block" in res["reason"]
+    assert "Recovery contract" in res["recovery_contract"]
+    assert blocked_calls == []
+
+
+def test_loop_done_at_budget_edge_uses_recovery_not_block(monkeypatch):
+    _patch_judge(monkeypatch, ["done"])
+    blocked_calls = []
+    res = goals.run_kanban_goal_loop(
+        task_id="t5b",
+        goal_text="task",
+        run_turn=lambda p: pytest.fail("should not run extra turn"),
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: blocked_calls.append(r),
+        max_turns=1,
+        first_response="looks done",
+    )
+    assert res["outcome"] == "finalization_recovery"
+    assert "turn-budget edge" in res["reason"]
+    assert blocked_calls == []
+
+
+@pytest.mark.parametrize("handoff_status", ["review", "human_review"])
+def test_loop_stops_cleanly_on_review_handoff(monkeypatch, handoff_status):
+    _patch_judge(monkeypatch, ["continue"])  # should not matter once status flips
+    res = goals.run_kanban_goal_loop(
+        task_id=f"t_handoff_{handoff_status}",
+        goal_text="task",
+        run_turn=lambda p: pytest.fail("should not continue after handoff"),
+        task_status_fn=lambda: handoff_status,
+        block_fn=lambda r: pytest.fail("should not block on review handoff"),
+        first_response="handoff triggered",
+    )
+    assert res["outcome"] == "handed_off_by_worker"
+    assert handoff_status in res["reason"]
 
 
 def test_loop_stops_if_task_reclaimed(monkeypatch):

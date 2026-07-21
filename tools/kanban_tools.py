@@ -295,6 +295,47 @@ def _ok(**fields: Any) -> str:
     return json.dumps({"ok": True, **fields})
 
 
+_TERMINAL_RECONCILIATION_STATUSES = (
+    "done",
+    "blocked",
+    "todo",
+    "triage",
+    "review",
+    "human_review",
+)
+
+
+def _terminal_transition_noop(
+    kb,
+    conn,
+    task_id: str,
+    *,
+    terminal_statuses: tuple[str, ...],
+    action: str,
+    extra: Optional[dict] = None,
+) -> Optional[str]:
+    """Reconcile a lost CAS race when the desired terminal state already won."""
+    task = kb.get_task(conn, task_id)
+    if task is None or task.status not in terminal_statuses:
+        return None
+    run = kb.latest_run(conn, task_id)
+    payload = {
+        "task_id": task_id,
+        "run_id": run.id if run else None,
+        "status": task.status,
+        "noop": True,
+    }
+    if isinstance(extra, dict):
+        payload.update(extra)
+    logger.info(
+        "%s: reconciled as no-op for task %s already in %s",
+        action,
+        task_id,
+        task.status,
+    )
+    return _ok(**payload)
+
+
 def _normalize_profile(value: Any) -> Optional[str]:
     """Normalize CLI-compatible assignee sentinels for the tool surface."""
     if value is None:
@@ -632,12 +673,14 @@ def _handle_complete(args: dict, **kw) -> str:
                         exc_info=True,
                     )
                 if verdict != "done":
+                    judge_reason = (reason or "judge did not provide a reason").strip()
                     return tool_error(
-                        f"Goal completion rejected by judge: {reason}. "
-                        f"To proceed, either: (1) provide explicit acceptance "
-                        f"evidence in your summary matching the task's criteria, "
-                        f"or (2) create continuation tasks with parents=[{tid}] "
-                        f"and keep this task alive."
+                        f"Goal completion rejected by judge: {judge_reason}. "
+                        "Continue this task, address that exact gap, then retry "
+                        "kanban_complete with evidence proving the acceptance "
+                        "criteria. If progress now depends on external input, "
+                        "call kanban_block(kind='dependency' or 'needs_input', "
+                        "reason=...) instead of exiting."
                     )
 
             try:
@@ -678,6 +721,15 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"created_cards=[] to skip the card-claim check entirely."
                 )
             if not ok:
+                reconciled = _terminal_transition_noop(
+                    kb,
+                    conn,
+                    tid,
+                    terminal_statuses=_TERMINAL_RECONCILIATION_STATUSES,
+                    action="kanban_complete",
+                )
+                if reconciled is not None:
+                    return reconciled
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
@@ -746,6 +798,16 @@ def _handle_block(args: dict, **kw) -> str:
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
+                reconciled = _terminal_transition_noop(
+                    kb,
+                    conn,
+                    tid,
+                    terminal_statuses=_TERMINAL_RECONCILIATION_STATUSES,
+                    action="kanban_block",
+                    extra={"block_kind": kind},
+                )
+                if reconciled is not None:
+                    return reconciled
                 return tool_error(
                     f"could not block {tid} (unknown id or not in " f"running/ready)"
                 )
@@ -1458,6 +1520,15 @@ def _handle_review(args: dict, **kw) -> str:
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
+                reconciled = _terminal_transition_noop(
+                    kb,
+                    conn,
+                    tid,
+                    terminal_statuses=_TERMINAL_RECONCILIATION_STATUSES,
+                    action="kanban_review",
+                )
+                if reconciled is not None:
+                    return reconciled
                 return tool_error(
                     f"could not move {tid} to review (unknown id or "
                     f"not in running/ready)"
@@ -1496,6 +1567,15 @@ def _handle_human_review(args: dict, **kw) -> str:
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
+                reconciled = _terminal_transition_noop(
+                    kb,
+                    conn,
+                    tid,
+                    terminal_statuses=_TERMINAL_RECONCILIATION_STATUSES,
+                    action="kanban_human_review",
+                )
+                if reconciled is not None:
+                    return reconciled
                 return tool_error(
                     f"could not move {tid} to human_review (unknown id or "
                     f"not in running/review)"

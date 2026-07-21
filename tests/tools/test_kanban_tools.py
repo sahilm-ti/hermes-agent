@@ -752,7 +752,7 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     assert "error" in d
     assert "Goal completion rejected by judge" in d["error"]
     assert "missing verification evidence" in d["error"]
-    assert f"parents=[{goal_task_id}]" in d["error"]
+    assert "retry kanban_complete with evidence" in d["error"]
 
     # Verify the task is NOT completed in the DB
     conn2 = kb.connect()
@@ -2205,6 +2205,112 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
     out = kt._handle_complete({"summary": "current completion"})
     d = json.loads(out)
     assert d.get("ok") is True
+
+
+def test_worker_complete_duplicate_terminal_cas_reconciles_noop(worker_env, monkeypatch):
+    """If completion already won, a duplicate completion call is a no-op success."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+
+    first = json.loads(kt._handle_complete({"summary": "done once"}))
+    assert first.get("ok") is True
+    second = json.loads(kt._handle_complete({"summary": "duplicate done"}))
+    assert second.get("ok") is True
+    assert second.get("noop") is True
+    assert second.get("status") == "done"
+
+
+def test_worker_review_duplicate_terminal_cas_reconciles_noop(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+
+    first = json.loads(
+        kt._handle_review({"task_id": worker_env, "reason": "https://github.com/o/r/pull/1"})
+    )
+    assert first.get("ok") is True
+    second = json.loads(
+        kt._handle_review({"task_id": worker_env, "reason": "retry same handoff"})
+    )
+    assert second.get("ok") is True
+    assert second.get("noop") is True
+    assert second.get("status") == "review"
+
+
+def test_worker_complete_after_review_handoff_reconciles_noop(worker_env, monkeypatch):
+    """A competing completion loses cleanly when review already owns the handoff."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+
+    handoff = json.loads(
+        kt._handle_review({"task_id": worker_env, "reason": "https://github.com/o/r/pull/1"})
+    )
+    assert handoff.get("ok") is True
+    late_complete = json.loads(kt._handle_complete({"summary": "late duplicate completion"}))
+    assert late_complete.get("ok") is True
+    assert late_complete.get("noop") is True
+    assert late_complete.get("status") == "review"
+
+
+def test_worker_human_review_duplicate_terminal_cas_reconciles_noop(monkeypatch, tmp_path):
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="reviewed", assignee="test-worker")
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
+        claimed = kb.claim_review_task(conn, tid)
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    first = json.loads(
+        kt._handle_human_review({"task_id": tid, "reason": "ready for human merge decision"})
+    )
+    assert first.get("ok") is True
+    second = json.loads(
+        kt._handle_human_review({"task_id": tid, "reason": "duplicate handoff"})
+    )
+    assert second.get("ok") is True
+    assert second.get("noop") is True
+    assert second.get("status") == "human_review"
 
 
 def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):

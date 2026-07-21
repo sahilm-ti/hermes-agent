@@ -3220,6 +3220,108 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
     ]
 
 
+def record_finalization_recovery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str],
+    contract: Optional[str],
+    expected_run_id: Optional[int] = None,
+    author: str = "kanban-goal-loop",
+) -> bool:
+    """Persist a deterministic recovery contract for missed lifecycle finalizers.
+
+    Used by goal-mode workers when the judge says the work appears complete but
+    the run still did not call ``kanban_complete``/``kanban_block`` after the
+    finalize nudge. This is intentionally non-terminal: it records context,
+    closes the abandoned run, and moves the card back to ``ready`` so the
+    dispatcher deterministically gives a recovery worker the existing
+    workspace. It never forces ``blocked`` / ``done`` from outside the worker
+    lifecycle tools.
+
+    CAS guard: when ``expected_run_id`` is supplied, we only write if the task
+    still points at that run. If another writer already transitioned the task,
+    this becomes a no-op (False) and callers can reconcile based on the current
+    status.
+    """
+    clean_reason = (
+        (reason or "").strip()
+        or "judge marked work as done but the lifecycle finalizer call was missing"
+    )
+    clean_contract = (contract or "").strip()
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        cur_run_id = int(row["current_run_id"]) if row["current_run_id"] else None
+        if expected_run_id is not None and cur_run_id != int(expected_run_id):
+            return False
+        if row["status"] != "running":
+            return False
+
+        # Release this run before a recovery worker can be claimed. Leaving the
+        # task running here strands its current_run_id until the stale-claim
+        # reaper fires, then turns an ordinary missed finalizer into a timeout
+        # failure. ``current_run_id`` is the CAS ownership token, so this update
+        # and the subsequent _end_run are one serialized transition.
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'ready',
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL,
+                   last_heartbeat_at = NULL
+             WHERE id = ?
+               AND status = 'running'
+            """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+            (task_id,) if expected_run_id is None else (task_id, int(expected_run_id)),
+        )
+        if cur.rowcount != 1:
+            return False
+
+        contract_preview = clean_contract[:2000] if clean_contract else ""
+        comment_body = (
+            "Goal-mode finalization recovery requested.\n"
+            f"Judge reason: {clean_reason[:500]}\n\n"
+            f"{contract_preview}"
+        ).strip()
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, author, comment_body, now),
+        )
+        ended_run_id = _end_run(
+            conn,
+            task_id,
+            outcome="finalization_recovery",
+            status="finalization_recovery",
+            summary=clean_reason[:500],
+            metadata={"recovery_contract": contract_preview or None},
+        )
+        _append_event(
+            conn,
+            task_id,
+            "finalization_recovery_requested",
+            {
+                "reason": clean_reason[:500],
+                "contract": contract_preview or None,
+            },
+            run_id=ended_run_id,
+        )
+    _log.info(
+        "record_finalization_recovery: task=%s run_id=%s reason=%s",
+        task_id,
+        cur_run_id,
+        clean_reason[:120],
+    )
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Attachments
 # ---------------------------------------------------------------------------
