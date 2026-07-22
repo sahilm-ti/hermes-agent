@@ -23154,6 +23154,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # risky work like model switching refused) instead of crashing on a stale
     # in-memory module.
     from gateway.code_skew import record_boot_fingerprint
+    from hermes_constants import get_hermes_home
     record_boot_fingerprint()
 
     # ── Duplicate-instance guard ──────────────────────────────────────
@@ -23323,7 +23324,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # rely exclusively on root-home skills via ``skills.external_dirs``
     # without sync re-seeding stale local copies that collide on name.
     try:
-        from hermes_constants import get_hermes_home
         from hermes_cli.profiles import NO_BUNDLED_SKILLS_MARKER
         from pathlib import Path as _SkipPath
         _opt_out = (_SkipPath(get_hermes_home()) / NO_BUNDLED_SKILLS_MARKER).exists()

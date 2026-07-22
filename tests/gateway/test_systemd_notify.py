@@ -36,7 +36,11 @@ def test_notify_sends_real_unix_datagram(tmp_path, monkeypatch):
 def test_notify_supports_systemd_abstract_socket(monkeypatch):
     name = "\0hermes-test-notify"
     receiver = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    receiver.bind(name)
+    try:
+        receiver.bind(name)
+    except OSError:
+        receiver.close()
+        pytest.skip("Abstract AF_UNIX sockets are unsupported on this host")
     receiver.settimeout(1.0)
     monkeypatch.setenv("NOTIFY_SOCKET", "@hermes-test-notify")
 

@@ -356,10 +356,11 @@ def test_default_spawn_injects_hermes_max_iterations(
     except Exception:
         pass  # May fail on missing hermes binary; env is still captured
 
-    if captured_envs:
-        assert captured_envs[0].get("HERMES_MAX_ITERATIONS") == "200", (
+    worker_envs = [env for env in captured_envs if env.get("HERMES_KANBAN_TASK") == task.id]
+    if worker_envs:
+        assert worker_envs[0].get("HERMES_MAX_ITERATIONS") == "200", (
             f"Expected HERMES_MAX_ITERATIONS=200, got "
-            f"{captured_envs[0].get('HERMES_MAX_ITERATIONS')!r}"
+            f"{worker_envs[0].get('HERMES_MAX_ITERATIONS')!r}"
         )
     else:
         # Popen not reached — verify the task object at least holds the value
@@ -403,9 +404,10 @@ def test_default_spawn_does_not_inject_max_iterations_when_none(
     except Exception:
         pass
 
-    if captured_envs:
+    worker_envs = [env for env in captured_envs if env.get("HERMES_KANBAN_TASK") == task.id]
+    if worker_envs:
         assert (
-            "HERMES_MAX_ITERATIONS" not in captured_envs[0]
+            "HERMES_MAX_ITERATIONS" not in worker_envs[0]
         ), "HERMES_MAX_ITERATIONS should not appear when max_iterations is None"
 
 
