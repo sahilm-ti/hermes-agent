@@ -153,6 +153,22 @@ async def test_startup_aborts_when_restart_begins_during_platform_connect(tmp_pa
     patch_startup_side_effects(monkeypatch, tmp_path)
 
     runner = make_startup_runner(tmp_path)
+    # This test exercises startup-abort ordering. Its in-memory adapter's
+    # cleanup is immediate, so do not couple the ordering contract to the
+    # production five-second network-cleanup budget.
+    runner._adapter_disconnect_timeout_secs = lambda: 0
+
+    async def stop_after_startup_abort(*, restart=False, detached_restart=False, service_restart=False):
+        assert restart is True
+        assert detached_restart is False
+        assert service_restart is True
+        runner._running = False
+        runner._draining = False
+        runner.adapters.clear()
+        runner._shutdown_event.set()
+        runner._update_runtime_status("stopped")
+
+    runner.stop = AsyncMock(side_effect=stop_after_startup_abort)
     first_disconnected = asyncio.Event()
     telegram = StartupRaceAdapter(
         Platform.TELEGRAM,
