@@ -28,6 +28,12 @@ def _clean_inference_env(monkeypatch):
         "HERMES_INFERENCE_PROVIDER",
     ):
         monkeypatch.delenv(key, raising=False)
+    # Keep host-level AWS credentials from hijacking provider auto-detect.
+    monkeypatch.setattr(
+        "agent.bedrock_adapter.has_aws_credentials",
+        lambda: False,
+        raising=False,
+    )
 
 
 def _seed_openrouter_pool(token: str = "sk-or-FAKEKEY123") -> None:
