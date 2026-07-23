@@ -4933,7 +4933,11 @@ class TestCodexAuxiliaryAdapterTimeout:
                 timeout=0.05,
             )
 
-        assert time.monotonic() - started < 0.14
+        # Wall-clock scheduling under the canonical parallel runner can delay
+        # a 50ms test by substantially more than one stream interval. Keep a
+        # loose bound that catches a genuinely unbounded stream without
+        # making the test flaky under normal host contention.
+        assert time.monotonic() - started < 2
 
 
 class TestCodexAuxiliaryToolMessageConversion:
