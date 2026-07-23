@@ -95,7 +95,12 @@ async def test_cleanup_off_loop_does_not_block_event_loop():
     assert close_started.is_set(), "close() never ran"
 
     ticks_at_block = ticks["n"]
-    await asyncio.sleep(0.1)
+    # Keep this observation window deliberately loose: under the fully
+    # concurrent canonical runner, scheduling can delay individual 5ms
+    # heartbeat wakes.  A blocked event loop still yields zero ticks, while
+    # 200ms gives an offloaded cleanup ample opportunity to demonstrate it
+    # remains responsive.
+    await asyncio.sleep(0.2)
     ticks_during_block = ticks["n"] - ticks_at_block
 
     release.set()
