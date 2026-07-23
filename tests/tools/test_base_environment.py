@@ -151,16 +151,18 @@ class TestAtomicSnapshotWrite:
         assert f"export -p > '{snap}'" not in wrapped
 
     def test_temp_path_uses_bashpid_not_dollardollar(self):
-        """The temp name MUST use ``$BASHPID`` (the real subshell PID), not
-        ``$$``.  In ``&``-launched concurrent subshells ``$$`` stays the parent
-        shell's PID, so two writers would pick the same temp name, clobber each
-        other mid-write, and mv would publish a torn file — the corruption is
-        only narrowed, not closed.  This is the bug shared by every prior PR in
-        the #38249 cluster."""
+        """Temp names must avoid a bare ``$$`` token.
+
+        In ``&``-launched concurrent subshells ``$$`` stays the parent shell's
+        PID, so multiple writers can collide. We keep ``$BASHPID`` in the token
+        and add a random nonce so legacy bash versions (where BASHPID is unset)
+        still produce distinct temp names.
+        """
         env = _TestableEnv()
         env._snapshot_ready = True
         wrapped = env._wrap_command("echo hi", "/tmp")
         assert "$BASHPID" in wrapped
+        assert "$RANDOM$RANDOM" in wrapped
         # The bare $$ temp form must be gone.
         assert ".tmp.$$" not in wrapped
 
@@ -245,8 +247,9 @@ class TestAtomicSnapshotConcurrencyBehavioral:
     the emitted script's guarantee holds under real concurrency: N concurrent
     writers + readers, and the snapshot is ALWAYS a complete, parseable env
     dump — never truncated mid-line with a ``declare -x`` / ``export`` fragment
-    that would corrupt PATH.  Crucially it uses ``$BASHPID`` (per-subshell
-    unique), which is what closes the race; ``$$`` would still tear here.
+    that would corrupt PATH. The temp token mirrors BaseEnvironment:
+    ``$BASHPID`` when available plus a random suffix for bash 3.2 where
+    BASHPID is unset.
     """
 
     def _run(self, script):
@@ -261,13 +264,14 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         import shlex
         snap = str(tmp_path / "hermes-snap-x.sh")
         _q = shlex.quote
-        _snap_tmp = _q(snap + ".tmp.") + "$BASHPID"
+        _snap_tmp_expr = _q(snap + ".tmp.") + "$BASHPID.$RANDOM$RANDOM"
         # One writer iteration = the exact atomic sequence _wrap_command emits.
         writer = (
             "for i in $(seq 1 80); do "
             "export BIG_$i=$(head -c 600 /dev/zero | tr '\\0' x); "
-            f"{{ export -p > {_snap_tmp} && mv -f {_snap_tmp} {_q(snap)}; }} "
-            f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true; "
+            f"__snap_tmp={_snap_tmp_expr}; "
+            f"{{ export -p > \"$__snap_tmp\" && mv -f \"$__snap_tmp\" {_q(snap)}; }} "
+            "2>/dev/null || rm -f \"$__snap_tmp\" 2>/dev/null || true; "
             "done"
         )
         # Reader: repeatedly source the snapshot and check PATH never absorbs
@@ -302,10 +306,11 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         self._run(f"echo 'export GOOD=1' > {_q(snap)}")  # seed good snapshot
         # Redirect export into an unwritable dir so the export side fails; mv
         # must then NOT run (&&) and not clobber snap.
-        bad_tmp = _q("/nonexistent-dir/snap.tmp.") + "$BASHPID"
+        bad_tmp_expr = _q("/nonexistent-dir/snap.tmp.") + "$BASHPID.$RANDOM$RANDOM"
         script = (
-            f"{{ export -p > {bad_tmp} && mv -f {bad_tmp} {_q(snap)}; }} "
-            f"2>/dev/null || rm -f {bad_tmp} 2>/dev/null || true"
+            f"__snap_tmp={bad_tmp_expr}; "
+            f"{{ export -p > \"$__snap_tmp\" && mv -f \"$__snap_tmp\" {_q(snap)}; }} "
+            "2>/dev/null || rm -f \"$__snap_tmp\" 2>/dev/null || true"
         )
         self._run(script)
         out = self._run(f"cat {_q(snap)}")

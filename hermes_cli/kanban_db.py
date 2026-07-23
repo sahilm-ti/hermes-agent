@@ -11966,6 +11966,40 @@ def add_notify_sub(
             )
 
 
+def backfill_null_notifier_profile(
+    conn: sqlite3.Connection, notifier_profile: Optional[str]
+) -> int:
+    """Claim ownerless notify-sub rows for ``notifier_profile``.
+
+    Only rows with ``notifier_profile IS NULL`` or ``''`` are assigned.
+    Existing owned rows are left untouched. Returns number of updated rows.
+    """
+    profile = (notifier_profile or "").strip()
+    if not profile:
+        _log.debug(
+            "backfill_null_notifier_profile: empty profile; no rows claimed"
+        )
+        return 0
+
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET notifier_profile = ?
+             WHERE notifier_profile IS NULL OR notifier_profile = ''
+            """,
+            (profile,),
+        )
+        changed = int(cur.rowcount or 0)
+
+    _log.debug(
+        "backfill_null_notifier_profile: claimed %d ownerless rows for profile=%s",
+        changed,
+        profile,
+    )
+    return changed
+
+
 def list_notify_subs(
     conn: sqlite3.Connection, task_id: Optional[str] = None,
 ) -> list[dict]:
