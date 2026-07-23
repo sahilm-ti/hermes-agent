@@ -271,6 +271,7 @@ class GatewayKanbanWatchersMixin:
                             # a legacy DB. `_add_column_if_missing` now
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
+                            _kb.backfill_null_notifier_profile(conn, notifier_profile)
                             subs = _kb.list_notify_subs(conn)
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)

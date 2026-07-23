@@ -294,6 +294,48 @@ def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypat
     assert [ev.kind for ev in _unseen_terminal_events_for(tid, "chat-beta")] == ["completed"]
 
 
+def test_notifier_claims_legacy_ownerless_sub_for_active_profile(tmp_path, monkeypatch):
+    """A legacy ownerless sub is claimed and delivered via its active profile.
+
+    Before notifier ownership was persisted, auto-subscribe rows had no
+    ``notifier_profile``. On startup the active gateway must claim those rows
+    before routing, otherwise a secondary profile's terminal event is sent by
+    the default profile adapter.
+    """
+    db_path = tmp_path / "legacy-ownerless-sub.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="legacy ownerless", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-legacy")
+        # Crashed events keep their subscription so we can assert the stored
+        # owner after delivery; completed tasks intentionally unsubscribe.
+        kb._append_event(conn, tid, kind="crashed")
+    finally:
+        conn.close()
+
+    default_adapter = RecordingAdapter()
+    active_profile_adapter = RecordingAdapter()
+    runner = _make_runner(default_adapter)
+    runner._kanban_notifier_profile = "braintrusteng"
+    runner._profile_adapters = {
+        "braintrusteng": {Platform.TELEGRAM: active_profile_adapter},
+    }
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    conn = kb.connect()
+    try:
+        sub = kb.list_notify_subs(conn, tid)[0]
+    finally:
+        conn.close()
+    assert sub["notifier_profile"] == "braintrusteng"
+    assert default_adapter.sent == []
+    assert len(active_profile_adapter.sent) == 1
+
+
 def _unseen_terminal_events_for(tid, chat_id):
     conn = kb.connect()
     try:
