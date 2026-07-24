@@ -690,6 +690,7 @@ def _live_system_guard(request, monkeypatch):
         "daemon-reload", "try-restart", "reload-or-restart",
     )
     _PROCESS_KILLERS = ("pkill", "killall", "taskkill", "skill", "fuser")
+    _LOCAL_AUDIO_PLAYERS = ("afplay", "ffplay", "aplay")
 
     def _cmd_to_string(cmd) -> str:
         if cmd is None:
@@ -747,6 +748,20 @@ def _live_system_guard(request, monkeypatch):
                     return True
         return False
 
+    def _is_local_audio_player_cmd(cmd) -> bool:
+        cmd_str = _cmd_to_string(cmd)
+        try:
+            tokens = _shlex.split(cmd_str)
+        except ValueError:
+            tokens = cmd_str.split()
+        if not tokens:
+            return False
+        for tok in tokens:
+            head = tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+            if head in _LOCAL_AUDIO_PLAYERS:
+                return True
+        return False
+
     def _check_subprocess_cmd(name, cmd):
         if _is_blocked_systemctl(cmd):
             raise RuntimeError(
@@ -755,6 +770,13 @@ def _live_system_guard(request, monkeypatch):
                 "live hermes-gateway systemd unit. Mock "
                 "subprocess.run / _run_systemctl in the test, or "
                 "mark with @pytest.mark.live_system_guard_bypass."
+            )
+        if _is_local_audio_player_cmd(cmd):
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked "
+                f"subprocess.{name}({cmd!r}) — local audio playback is not "
+                "allowed during tests. Mock tools.voice_mode.play_audio_file "
+                "or subprocess in the test."
             )
         if _is_process_killer(cmd):
             raise RuntimeError(
