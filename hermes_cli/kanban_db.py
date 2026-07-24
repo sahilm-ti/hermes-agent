@@ -188,6 +188,27 @@ _WORKTREE_KEYWORDS = (
     "tests/",
 )
 
+# Auto-decompose guardrails for durable single-card workflows.
+# These are intentionally conservative: when a triage card already carries
+# concrete delivery / review signals, we keep it as one durable card unless a
+# human explicitly decomposes it.
+_AUTO_DECOMPOSE_ACCEPTANCE_MARKER_RE = re.compile(
+    r"(?im)^\s*(?:[-*]\s*(?:\[[ xX]\]\s*)?)?"
+    r"(?:code|deploy(?:ment)?|e2e|end[- ]to[- ]end|"
+    r"acceptance(?:\s+criteria)?|verification)\s*[:\-]"
+)
+_AUTO_DECOMPOSE_DEPLOYMENT_EVIDENCE_RE = re.compile(
+    r"\b(deploy(?:ed|ment|ing)?|rollout|released?)\b",
+    re.IGNORECASE,
+)
+_AUTO_DECOMPOSE_HUMAN_REVIEW_KINDS = (
+    "review_requested",
+    "human_review_requested",
+    "merge_requested",
+    "approved",
+    "rejected",
+)
+
 
 def _infer_workspace_kind(title: Optional[str], body: Optional[str]) -> str:
     """Pick a default workspace_kind from task title/body keywords.
@@ -1078,6 +1099,11 @@ class Task:
     # or the worker explicitly blocks/completes. ``False`` (default) =
     # the classic single-shot worker. ``goal_max_turns`` bounds the loop.
     goal_mode: bool = False
+    # Per-card opt-in for the gateway auto-decomposer. ``False`` (default)
+    # keeps the card in durable single-card mode even when it lands in
+    # triage (e.g. unblock-loop escalation), preserving task/workspace/comment
+    # continuity until an operator explicitly opts in.
+    auto_decompose: bool = False
     # Goal-loop turn budget for ``goal_mode`` workers. ``None`` falls
     # through to the goals engine default (``goals.DEFAULT_MAX_TURNS``).
     goal_max_turns: Optional[int] = None
@@ -1184,6 +1210,11 @@ class Task:
             ),
             goal_mode=(
                 bool(row["goal_mode"]) if "goal_mode" in keys and row["goal_mode"] else False
+            ),
+            auto_decompose=(
+                bool(row["auto_decompose"])
+                if "auto_decompose" in keys and row["auto_decompose"]
+                else False
             ),
             goal_max_turns=(
                 row["goal_max_turns"] if "goal_max_turns" in keys and row["goal_max_turns"] else None
@@ -1374,6 +1405,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- or ``goal_max_turns`` is exhausted. NULL/0 = classic single-shot
     -- worker (the default).
     goal_mode            INTEGER NOT NULL DEFAULT 0,
+    -- Per-card opt-in for automatic triage decomposition. 0 (default)
+    -- preserves durable single-card workflows; 1 allows the gateway's
+    -- auto-decomposer to fan this triage card out on dispatcher ticks.
+    auto_decompose       INTEGER NOT NULL DEFAULT 0,
     -- Goal-loop turn budget for ``goal_mode`` workers. NULL = use the
     -- goals-engine default.
     goal_max_turns       INTEGER,
@@ -2539,6 +2574,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "goal_mode", "goal_mode INTEGER NOT NULL DEFAULT 0"
         )
 
+    if "auto_decompose" not in cols:
+        # Per-card opt-in for automatic decomposition. Existing rows default
+        # to 0 (off) so historical triage cards keep durable single-card
+        # behaviour until explicitly opted in.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "auto_decompose",
+            "auto_decompose INTEGER NOT NULL DEFAULT 0",
+        )
+
     if "goal_max_turns" not in cols:
         # Per-task goal-loop turn budget. NULL = goals-engine default.
         _add_column_if_missing(
@@ -3025,6 +3071,7 @@ def create_task(
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
     goal_mode: bool = False,
+    auto_decompose: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
@@ -3059,6 +3106,10 @@ def create_task(
     model (and optionally its provider) without touching the profile's
     config — passed to the worker as ``-m <model> [--provider <name>]``.
     ``provider_override`` requires ``model_override``.
+
+    ``auto_decompose`` is a per-card opt-in for the gateway auto-decomposer.
+    Default ``False`` keeps triage cards in single-card mode unless a human
+    explicitly requests fan-out.
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
@@ -3293,9 +3344,9 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
-                        goal_mode, goal_max_turns, session_id,
+                        goal_mode, auto_decompose, goal_max_turns, session_id,
                         max_iterations
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3318,6 +3369,7 @@ def create_task(
                         model_override,
                         provider_override,
                         1 if goal_mode else 0,
+                        1 if auto_decompose else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
                         int(max_iterations) if max_iterations is not None else None,
@@ -3340,6 +3392,7 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "auto_decompose": bool(auto_decompose) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
                     },
@@ -3435,6 +3488,170 @@ def list_tasks(
         query += f" LIMIT {int(limit)}"
     rows = conn.execute(query, params).fetchall()
     return [Task.from_row(r) for r in rows]
+
+
+def _auto_decompose_payload_text(payload_raw: Optional[str]) -> str:
+    """Best-effort payload text extraction for marker scans.
+
+    Payloads are JSON dicts in normal paths, but historical/hand-edited rows
+    can hold arbitrary strings. We scan both safely.
+    """
+    if not payload_raw:
+        return ""
+    try:
+        parsed = json.loads(payload_raw)
+    except (TypeError, ValueError):
+        return str(payload_raw)
+    if isinstance(parsed, (dict, list)):
+        try:
+            return json.dumps(parsed, ensure_ascii=False)
+        except Exception:
+            return str(parsed)
+    return str(parsed)
+
+
+def _task_has_acceptance_markers(conn: sqlite3.Connection, task: Task) -> bool:
+    if _AUTO_DECOMPOSE_ACCEPTANCE_MARKER_RE.search(task.title or ""):
+        return True
+    if _AUTO_DECOMPOSE_ACCEPTANCE_MARKER_RE.search(task.body or ""):
+        return True
+    rows = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT 20",
+        (task.id,),
+    ).fetchall()
+    for row in rows:
+        if _AUTO_DECOMPOSE_ACCEPTANCE_MARKER_RE.search(row["body"] or ""):
+            return True
+    run_rows = conn.execute(
+        "SELECT summary FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 20",
+        (task.id,),
+    ).fetchall()
+    for row in run_rows:
+        if _AUTO_DECOMPOSE_ACCEPTANCE_MARKER_RE.search(row["summary"] or ""):
+            return True
+    return False
+
+
+def _task_has_human_review_evidence(conn: sqlite3.Connection, task_id: str) -> bool:
+    placeholders = ",".join(["?"] * len(_AUTO_DECOMPOSE_HUMAN_REVIEW_KINDS))
+    row = conn.execute(
+        f"SELECT 1 FROM task_events WHERE task_id = ? "
+        f"AND kind IN ({placeholders}) LIMIT 1",
+        (task_id, *_AUTO_DECOMPOSE_HUMAN_REVIEW_KINDS),
+    ).fetchone()
+    return bool(row)
+
+
+def _task_has_deployment_evidence(conn: sqlite3.Connection, task: Task) -> bool:
+    if _AUTO_DECOMPOSE_DEPLOYMENT_EVIDENCE_RE.search(task.title or ""):
+        return True
+    if _AUTO_DECOMPOSE_DEPLOYMENT_EVIDENCE_RE.search(task.body or ""):
+        return True
+    comment_rows = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT 30",
+        (task.id,),
+    ).fetchall()
+    for row in comment_rows:
+        if _AUTO_DECOMPOSE_DEPLOYMENT_EVIDENCE_RE.search(row["body"] or ""):
+            return True
+    run_rows = conn.execute(
+        "SELECT summary, metadata FROM task_runs "
+        "WHERE task_id = ? ORDER BY id DESC LIMIT 30",
+        (task.id,),
+    ).fetchall()
+    for row in run_rows:
+        if _AUTO_DECOMPOSE_DEPLOYMENT_EVIDENCE_RE.search(row["summary"] or ""):
+            return True
+        meta_text = ""
+        if row["metadata"]:
+            try:
+                meta_text = json.dumps(json.loads(row["metadata"]), ensure_ascii=False)
+            except (TypeError, ValueError):
+                meta_text = str(row["metadata"])
+        if meta_text and _AUTO_DECOMPOSE_DEPLOYMENT_EVIDENCE_RE.search(meta_text):
+            return True
+    ev_rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 40",
+        (task.id,),
+    ).fetchall()
+    for row in ev_rows:
+        payload_text = _auto_decompose_payload_text(row["payload"])
+        if payload_text and _AUTO_DECOMPOSE_DEPLOYMENT_EVIDENCE_RE.search(payload_text):
+            return True
+    return False
+
+
+def auto_decompose_skip_reason(
+    conn: sqlite3.Connection,
+    task: Task,
+) -> Optional[str]:
+    """Return a short skip reason when auto-decompose must not run."""
+    if task.status != "triage":
+        return "not_triage"
+    if not task.auto_decompose:
+        return "not_opted_in"
+    if task.goal_mode:
+        return "goal_mode"
+    if task.workspace_kind == "worktree":
+        return "worktree"
+    if task.workspace_path:
+        try:
+            candidate = Path(task.workspace_path).expanduser()
+            if candidate.is_absolute() and candidate.exists():
+                if _is_linked_worktree_checkout(candidate):
+                    return "existing_worktree_checkout"
+        except Exception:
+            pass
+    if _extract_pr_url(conn, task.id):
+        return "open_pr"
+    if _task_has_human_review_evidence(conn, task.id):
+        return "human_review"
+    if _task_has_deployment_evidence(conn, task):
+        return "deployment_evidence"
+    if _task_has_acceptance_markers(conn, task):
+        return "acceptance_markers"
+    return None
+
+
+def list_auto_decompose_triage_ids(
+    conn: sqlite3.Connection,
+    *,
+    tenant: Optional[str] = None,
+    limit: int = 1000,
+) -> list[str]:
+    """Return triage task ids that are eligible for automatic decomposition."""
+    candidates = list_tasks(
+        conn,
+        status="triage",
+        tenant=tenant,
+        limit=limit,
+        include_archived=False,
+    )
+    selected: list[str] = []
+    skipped = 0
+    for task in candidates:
+        reason = auto_decompose_skip_reason(conn, task)
+        if reason is not None:
+            skipped += 1
+            _log.debug(
+                "kanban auto-decompose: skip task=%s reason=%s status=%s auto_decompose=%s goal_mode=%s workspace_kind=%s",
+                task.id,
+                reason,
+                task.status,
+                task.auto_decompose,
+                task.goal_mode,
+                task.workspace_kind,
+            )
+            continue
+        selected.append(task.id)
+    _log.debug(
+        "kanban auto-decompose: triage_scan tenant=%r candidates=%d selected=%d skipped=%d",
+        tenant,
+        len(candidates),
+        len(selected),
+        skipped,
+    )
+    return selected
 
 
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
@@ -6308,6 +6525,17 @@ def block_task(
                 },
                 run_id=run_id,
             )
+            _append_event(
+                conn, task_id, "orchestrator_intervention_required",
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "source": "block_loop_detected",
+                    "recurrences": recurrences,
+                    "limit": BLOCK_RECURRENCE_LIMIT,
+                },
+                run_id=run_id,
+            )
             routed_to = "triage"
         else:
             if expected_run_id is None:
@@ -7328,6 +7556,10 @@ def decompose_triage_task(
             for p_idx in child.get("parents") or []:
                 parent_id = child_ids[p_idx]
                 child_id = child_ids[idx]
+                if _would_cycle(conn, parent_id, child_id):
+                    raise ValueError(
+                        f"decompose graph rejected: linking {parent_id} -> {child_id} would create a cycle"
+                    )
                 conn.execute(
                     "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
                     "VALUES (?, ?)",
@@ -7338,11 +7570,14 @@ def decompose_triage_task(
                     {"parent": parent_id, "child": child_id},
                 )
 
-        # Link the ROOT task as a child of every leaf child — i.e. the
-        # root waits for the whole graph. Simpler than computing leaves:
-        # link root under every child. Cycle-free because the root is
-        # only ever a child here, never a parent of children.
+        # Link the ROOT task as a child of every child — i.e. the root waits
+        # for the full graph. We still verify each edge with _would_cycle so
+        # legacy/manual link state cannot introduce a root↔child cycle.
         for cid in child_ids:
+            if _would_cycle(conn, cid, task_id):
+                raise ValueError(
+                    f"decompose graph rejected: linking {cid} -> {task_id} would create a cycle"
+                )
             conn.execute(
                 "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
                 "VALUES (?, ?)",

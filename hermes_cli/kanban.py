@@ -77,6 +77,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "result": t.result,
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
+        "auto_decompose": t.auto_decompose,
         "model_override": t.model_override,
         "provider_override": t.provider_override,
         "session_id": t.session_id,
@@ -372,6 +373,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
                                "Ignored without --goal.")
+    p_create.add_argument(
+        "--auto-decompose",
+        action="store_true",
+        dest="auto_decompose",
+        help=(
+            "Per-card opt-in for gateway automatic decomposition when this "
+            "card is in triage. Default is off."
+        ),
+    )
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -1548,6 +1558,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 model_override=getattr(args, "model_override", None),
                 provider_override=getattr(args, "provider_override", None),
                 goal_mode=bool(getattr(args, "goal_mode", False)),
+                auto_decompose=bool(getattr(args, "auto_decompose", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
                 max_iterations=getattr(args, "max_iterations", None),
                 initial_status=getattr(args, "initial_status", "running"),
@@ -1729,6 +1740,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         print(f"  model:     {task.model_override}{_prov}")
+    if task.auto_decompose:
+        print("  auto-decompose: enabled")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
     # default if config doesn't set it either). Helps operators see

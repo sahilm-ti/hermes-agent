@@ -349,3 +349,79 @@ def test_decompose_no_aux_client_configured(kanban_home):
     assert outcome.ok is False
     # call_llm's no-provider RuntimeError surfaces via the LLM-error branch.
     assert "LLM error" in outcome.reason
+
+
+def test_auto_decompose_candidates_require_explicit_opt_in(kanban_home):
+    with kb.connect() as conn:
+        no_opt_in = kb.create_task(conn, title="leave me single-card", triage=True)
+        opted_in = kb.create_task(
+            conn,
+            title="allow fanout",
+            triage=True,
+            auto_decompose=True,
+        )
+    ids = decomp.list_auto_decompose_ids()
+    assert opted_in in ids
+    assert no_opt_in not in ids
+
+
+def test_auto_decompose_candidates_skip_pr_and_verification_evidence(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="stabilize release card",
+            body=(
+                "Code: merged changes\n"
+                "Deploy: staged rollout complete\n"
+                "E2E: smoke tests passed"
+            ),
+            triage=True,
+            auto_decompose=True,
+        )
+        kb.add_comment(
+            conn,
+            tid,
+            author="dev",
+            body=(
+                "PR https://github.com/acme/repo/pull/42 is deployed to staging "
+                "for verification."
+            ),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'human_review_requested', ?, ?)",
+            (tid, jsonlib.dumps({"pr_url": "https://github.com/acme/repo/pull/42"}), 123456789),
+        )
+        conn.commit()
+    ids = decomp.list_auto_decompose_ids()
+    assert tid not in ids
+
+
+def test_auto_decompose_candidates_skip_goal_mode_and_worktree(kanban_home):
+    worktree_path = (kanban_home / "worktrees" / "candidate").resolve()
+    with kb.connect() as conn:
+        goal_mode_tid = kb.create_task(
+            conn,
+            title="goal loop card",
+            triage=True,
+            auto_decompose=True,
+            goal_mode=True,
+        )
+        worktree_tid = kb.create_task(
+            conn,
+            title="worktree card",
+            triage=True,
+            auto_decompose=True,
+            workspace_kind="worktree",
+            workspace_path=str(worktree_path),
+        )
+        plain_tid = kb.create_task(
+            conn,
+            title="plain triage card",
+            triage=True,
+            auto_decompose=True,
+        )
+    ids = decomp.list_auto_decompose_ids()
+    assert plain_tid in ids
+    assert goal_mode_tid not in ids
+    assert worktree_tid not in ids

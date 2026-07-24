@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_decompose as decomp
 
 
 @pytest.fixture
@@ -128,6 +129,43 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
         payload = events[-1].payload or {}
         assert payload.get("recurrences") == 2
         assert payload.get("kind") == "capability"
+        intervention = [
+            e for e in kb.list_events(conn, tid)
+            if e.kind == "orchestrator_intervention_required"
+        ]
+        assert intervention, "expected an orchestrator intervention event"
+        intervention_payload = intervention[-1].payload or {}
+        assert intervention_payload.get("source") == "block_loop_detected"
+        assert intervention_payload.get("recurrences") == 2
+
+
+def test_blocked_pr_verification_card_stays_one_durable_card(kanban_home: Path) -> None:
+    """A repeated block must not fan out an in-flight implementation card."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, title="implement deploy verification")
+        conn.execute("UPDATE tasks SET auto_decompose = 1 WHERE id = ?", (tid,))
+        kb.add_comment(
+            conn,
+            tid,
+            author="worker",
+            body=(
+                "PR https://github.com/acme/repo/pull/42 is deployed to dev.\n"
+                "Code: implementation is ready.\n"
+                "Deploy: verify the dev runtime.\n"
+                "E2E: run the required smoke test."
+            ),
+        )
+        assert kb.block_task(conn, tid, reason="dev verification pending", kind="capability")
+        assert kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        assert kb.block_task(conn, tid, reason="dev verification still pending", kind="capability")
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "triage"
+        assert tid not in decomp.list_auto_decompose_ids()
+        assert kb.child_ids(conn, tid) == []
+        assert any("pull/42" in comment.body for comment in kb.list_comments(conn, tid))
 
 
 # ---------------------------------------------------------------------------

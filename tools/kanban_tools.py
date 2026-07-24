@@ -429,6 +429,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "created_at": task.created_at,
         "started_at": task.started_at,
         "completed_at": task.completed_at,
+        "auto_decompose": task.auto_decompose,
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
         "provider_override": task.provider_override,
@@ -1254,6 +1255,11 @@ def _handle_create(args: dict, **kw) -> str:
     goal_mode, goal_bool_error = _parse_bool_arg(args, "goal_mode")
     if goal_bool_error:
         return tool_error(goal_bool_error)
+    auto_decompose, auto_decompose_bool_error = _parse_bool_arg(
+        args, "auto_decompose"
+    )
+    if auto_decompose_bool_error:
+        return tool_error(auto_decompose_bool_error)
     goal_max_turns = args.get("goal_max_turns")
     model_override = args.get("model")
     provider_override = args.get("provider")
@@ -1307,6 +1313,7 @@ def _handle_create(args: dict, **kw) -> str:
                 model_override=model_override,
                 provider_override=provider_override,
                 goal_mode=goal_mode,
+                auto_decompose=auto_decompose,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
@@ -2288,6 +2295,13 @@ KANBAN_CREATE_SCHEMA = {
                     "If true, task lands in 'triage' instead of 'todo' "
                     "— a specifier profile is expected to flesh out "
                     "the body before work starts."
+                ),
+            },
+            "auto_decompose": {
+                "type": "boolean",
+                "description": (
+                    "Per-card opt-in for gateway automatic decomposition. "
+                    "Only used when the task is in triage. Default false."
                 ),
             },
             "idempotency_key": {

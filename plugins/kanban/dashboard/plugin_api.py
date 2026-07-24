@@ -607,6 +607,7 @@ class CreateTaskBody(BaseModel):
     max_runtime_seconds: Optional[int] = None
     skills: Optional[list[str]] = None
     goal_mode: bool = False
+    auto_decompose: bool = False
     goal_max_turns: Optional[int] = None
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
@@ -633,6 +634,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             max_runtime_seconds=payload.max_runtime_seconds,
             skills=payload.skills,
             goal_mode=payload.goal_mode,
+            auto_decompose=payload.auto_decompose,
             goal_max_turns=payload.goal_max_turns,
             model_override=payload.model_override,
             provider_override=payload.provider_override,
@@ -2410,7 +2412,7 @@ def get_orchestration_settings():
     kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
     explicit_orch = (kanban_cfg.get("orchestrator_profile") or "").strip()
     explicit_default = (kanban_cfg.get("default_assignee") or "").strip()
-    auto_decompose = bool(kanban_cfg.get("auto_decompose", True))
+    auto_decompose = bool(kanban_cfg.get("auto_decompose", False))
     auto_promote_children = bool(kanban_cfg.get("auto_promote_children", True))
 
     # Resolve fallbacks the same way the decomposer does.
