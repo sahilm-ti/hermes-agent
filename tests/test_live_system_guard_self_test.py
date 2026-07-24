@@ -179,6 +179,12 @@ def test_subprocess_popen_systemctl_blocked():
         subprocess.Popen(["systemctl", "--user", "stop", "hermes-gateway"])
 
 
+def test_subprocess_popen_local_audio_player_blocked():
+    """Audio player commands must never execute while the suite runs."""
+    with pytest.raises(RuntimeError, match="local audio playback"):
+        subprocess.Popen(["afplay", "/tmp/test.mp3"])
+
+
 def test_subprocess_call_systemctl_blocked():
     with pytest.raises(RuntimeError, match="live-system guard"):
         subprocess.call(["systemctl", "--user", "restart", "hermes-gateway"])

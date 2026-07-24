@@ -1552,6 +1552,32 @@ class TestAutoTtsEmptyTextGuard:
 class TestStreamTtsToSpeaker:
     """Functional tests for the streaming TTS pipeline."""
 
+    @pytest.fixture(autouse=True)
+    def _stream_tts_test_audio_guard(self, monkeypatch):
+        """Keep stream-to-speaker tests hermetic: no real TTS playback."""
+        from tools import tts_tool
+
+        playback_calls = []
+        tts_calls = []
+
+        def _fake_tts_tool(text, output_path, **_kwargs):
+            tts_calls.append(text)
+            with open(output_path, "wb") as audio_file:
+                audio_file.write(b"fake audio bytes")
+            return json.dumps({"success": True, "file_path": output_path})
+
+        def _fake_play_audio(file_path):
+            playback_calls.append(file_path)
+            return True
+
+        monkeypatch.setattr(tts_tool, "text_to_speech_tool", _fake_tts_tool)
+        monkeypatch.setattr(
+            "tools.tts_streaming.resolve_streaming_provider",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr("tools.voice_mode.play_audio_file", _fake_play_audio)
+        return {"playback_calls": playback_calls, "tts_calls": tts_calls}
+
     def test_none_sentinel_flushes_buffer(self):
         """None sentinel causes remaining buffer to be spoken."""
         from tools.tts_tool import stream_tts_to_speaker
@@ -1710,6 +1736,35 @@ class TestStreamTtsToSpeaker:
         t.join(timeout=5)
         assert done_evt.is_set()
         assert len(spoken) >= 1
+
+    def test_stream_path_never_spawns_system_audio_player(
+        self,
+        _stream_tts_test_audio_guard,
+        monkeypatch,
+    ):
+        """Regression: stream tests must not launch afplay/ffplay/aplay."""
+        from tools.tts_tool import stream_tts_to_speaker
+
+        text_q = queue.Queue()
+        stop_evt = threading.Event()
+        done_evt = threading.Event()
+        popen_calls = []
+
+        def _record_popen(cmd, *_args, **_kwargs):
+            popen_calls.append(cmd)
+            raise AssertionError(
+                "stream_tts_to_speaker test path must not spawn a real audio player"
+            )
+
+        text_q.put("This sentence should use mocked playback. ")
+        text_q.put(None)
+
+        monkeypatch.setattr("subprocess.Popen", _record_popen)
+        stream_tts_to_speaker(text_q, stop_evt, done_evt)
+
+        assert done_evt.is_set()
+        assert _stream_tts_test_audio_guard["playback_calls"]
+        assert popen_calls == []
 
 
 # =====================================================================
