@@ -466,3 +466,13 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             limit=1000,
         )
     return [row.id for row in rows]
+
+
+def list_auto_decompose_ids(*, tenant: Optional[str] = None) -> list[str]:
+    """Return triage ids eligible for gateway automatic decomposition.
+
+    Manual `hermes kanban decompose` intentionally bypasses these
+    filters; this list is only for the dispatcher's auto path.
+    """
+    with kb.connect_closing() as conn:
+        return kb.list_auto_decompose_triage_ids(conn, tenant=tenant, limit=1000)

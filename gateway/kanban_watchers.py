@@ -56,8 +56,7 @@ def _resolve_auto_decompose_settings(
     silently ignoring that change is the bug reported in #49638.
 
     Fails **safe**: if the config read raises, return ``(False, 3)`` — a
-    transient read error must never re-enable a feature the user turned off,
-    nor fall back to the burst-prone default-on behaviour. ``per_tick`` is
+    transient read error must never re-enable the feature. ``per_tick`` is
     clamped to ``>= 1``.
     """
     try:
@@ -65,7 +64,7 @@ def _resolve_auto_decompose_settings(
     except Exception:
         return False, 3
     kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-    enabled = bool(kcfg.get("auto_decompose", True))
+    enabled = bool(kcfg.get("auto_decompose", False))
     try:
         per_tick = int(kcfg.get("auto_decompose_per_tick", 3) or 3)
     except (TypeError, ValueError):
@@ -186,7 +185,7 @@ class GatewayKanbanWatchersMixin:
             "completed", "blocked", "gave_up", "crashed", "timed_out",
             "status", "archived", "unblocked",
             "human_review_requested", "approved", "rejected", "quarantined",
-            "merge_requested",
+            "merge_requested", "orchestrator_intervention_required",
         )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
@@ -492,6 +491,16 @@ class GatewayKanbanWatchersMixin:
                                 f"🚨 @{who_q} quarantined: {crashes} crashes "
                                 f"in {window}s on {sub['task_id']}{tail}. "
                                 f"Cooling {cooldown}s."
+                            )
+                        elif kind == "orchestrator_intervention_required":
+                            note = ""
+                            if ev.payload and ev.payload.get("reason"):
+                                note = (
+                                    f": {str(ev.payload['reason'])[:NOTIFY_BLOCKED_REASON_MAX]}"
+                                )
+                            msg = (
+                                f"🧭 {board_tag}{tag}Kanban {sub['task_id']} needs "
+                                f"orchestrator intervention{note}"
                             )
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
@@ -1281,7 +1290,7 @@ class GatewayKanbanWatchersMixin:
 
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
-        # ``kanban.auto_decompose`` (default True). Capped by
+        # ``kanban.auto_decompose`` (default False). Capped by
         # ``kanban.auto_decompose_per_tick`` (default 3) so a bulk-load
         # of triage tasks doesn't burst-spend the aux LLM in one tick;
         # remainder defers to subsequent ticks.
@@ -1328,13 +1337,20 @@ class GatewayKanbanWatchersMixin:
                 try:
                     os.environ["HERMES_KANBAN_BOARD"] = slug
                     try:
-                        triage_ids = _decomp.list_triage_ids()
+                        triage_ids = _decomp.list_auto_decompose_ids()
                     except Exception as exc:
                         logger.debug(
-                            "kanban auto-decompose: list_triage_ids failed on board %s (%s)",
+                            "kanban auto-decompose: candidate list failed on board %s (%s)",
                             slug, exc,
                         )
                         triage_ids = []
+                    logger.debug(
+                        "kanban auto-decompose [%s]: candidate_count=%d attempted=%d cap=%d",
+                        slug,
+                        len(triage_ids),
+                        attempted,
+                        auto_decompose_per_tick,
+                    )
                     for tid in triage_ids:
                         if attempted >= auto_decompose_per_tick:
                             break

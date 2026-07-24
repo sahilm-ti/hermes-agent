@@ -148,6 +148,33 @@ def test_decompose_rejects_cyclic_parents(kanban_home):
             )
 
 
+def test_decompose_rejects_root_child_cycle_before_linking(kanban_home, monkeypatch):
+    """Reject root↔child cycles even when legacy links already exist."""
+    reserved_child = "t_deadbeef"
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        # Simulate a malformed/legacy edge root -> reserved_child that bypassed
+        # normal link guards. A new decomposition child reusing this id would
+        # create reserved_child -> root and close the cycle.
+        conn.execute(
+            "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+            (tid, reserved_child),
+        )
+        conn.commit()
+        monkeypatch.setattr(kb, "_new_task_id", lambda: reserved_child)
+        with pytest.raises(ValueError, match="would create a cycle"):
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orch",
+                children=[{"title": "new child"}],
+                author="me",
+            )
+        # Atomic rollback: no child row inserted, root remains triage.
+        assert kb.get_task(conn, reserved_child) is None
+        assert kb.get_task(conn, tid).status == "triage"
+
+
 def test_decompose_records_audit_comment_and_event(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn)
