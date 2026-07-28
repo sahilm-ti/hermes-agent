@@ -60,6 +60,7 @@ def make_startup_runner(tmp_path):
             Platform.SLACK: PlatformConfig(enabled=True, token="***"),
         },
         sessions_dir=tmp_path / "sessions",
+        loop_watchdog=False,
     )
     runner.adapters = {}
     runner._running = False
@@ -169,19 +170,34 @@ async def test_startup_aborts_when_restart_begins_during_platform_connect(tmp_pa
         runner._update_runtime_status("stopped")
 
     runner.stop = AsyncMock(side_effect=stop_after_startup_abort)
+
+    def begin_restart():
+        runner._restart_requested = True
+        runner._restart_detached = False
+        runner._restart_via_service = True
+        runner._restart_task_started = True
+        runner._stop_task = asyncio.current_task()
+
     first_disconnected = asyncio.Event()
-    telegram = StartupRaceAdapter(
-        Platform.TELEGRAM,
-        on_connect=lambda: runner.request_restart(detached=False, via_service=True),
-    )
+    telegram = StartupRaceAdapter(Platform.TELEGRAM)
     slack = StartupRaceAdapter(Platform.SLACK, wait_for_disconnect=first_disconnected)
 
     async def disconnect_and_release():
         telegram.disconnected = True
         first_disconnected.set()
 
-    telegram.disconnect = disconnect_and_release
+    monkeypatch.setattr(telegram, "disconnect", disconnect_and_release)
     runner._create_adapter = MagicMock(side_effect=[telegram, slack])
+
+    async def connect_then_begin_restart(adapter, platform):
+        assert adapter is telegram
+        assert platform is Platform.TELEGRAM
+        begin_restart()
+        return True
+
+    runner._connect_initial_adapter_with_timeout = AsyncMock(
+        side_effect=connect_then_begin_restart
+    )
 
     result = await asyncio.wait_for(runner.start(), timeout=2)
 
