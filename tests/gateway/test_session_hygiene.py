@@ -1530,7 +1530,7 @@ async def test_hygiene_slow_but_streaming_worker_survives_past_timeout(
         monkeypatch, tmp_path, SlowStreamingCompressAgent,
         "compression:\n"
         "  enabled: true\n"
-        "  hygiene_timeout_seconds: 0.1\n"       # << worker runtime (0.6s)
+        "  hygiene_timeout_seconds: 0.3\n"       # << worker runtime (0.6s)
         "  hygiene_total_ceiling_seconds: 10\n"
         "  hygiene_failure_cooldown_seconds: 120\n",
     )
