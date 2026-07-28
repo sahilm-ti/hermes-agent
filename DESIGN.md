@@ -9,8 +9,8 @@
 
 
 
-**Task:** t_5a521a19  
-**Phase:** Design (no code — approval gate before implementing)  
+**Task:** t_5a521a19
+**Phase:** Design (no code — approval gate before implementing)
 **Author:** braintrusteng (hermes worker)
 
 ---
@@ -27,7 +27,7 @@ Reasoning:
 - Single-responsibility makes the profile easy to reason about, debug, and replace. If the merging logic needs to change (e.g. migrate from squash to merge commits), only this profile changes.
 - The dispatch pattern is already proven for the `review` column (dispatcher claims → spawns `sdlc-review`). The `merging` column can use the identical pattern with a different profile name.
 
-**Profile name:** `post-approve-merger`  
+**Profile name:** `post-approve-merger`
 **Skills force-loaded by dispatcher:** a new `post-approve-merger` skill (analogous to how `sdlc-review` is force-loaded for review tasks).
 
 ---
