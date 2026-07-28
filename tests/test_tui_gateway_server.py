@@ -871,12 +871,19 @@ class _BrokenStdout:
         return None
 
 
-def test_write_json_serializes_concurrent_writes(monkeypatch):
+def test_write_json_serializes_concurrent_writes():
     out = _ChunkyStdout()
-    monkeypatch.setattr(server, "_real_stdout", out)
+    transport = server.StdioTransport(lambda: out, threading.Lock())
+
+    def _write(payload: dict) -> None:
+        token = server.bind_transport(transport)
+        try:
+            assert server.write_json(payload) is True
+        finally:
+            server.reset_transport(token)
 
     threads = [
-        threading.Thread(target=server.write_json, args=({"seq": i, "text": "x" * 24},))
+        threading.Thread(target=_write, args=({"seq": i, "text": "x" * 24},))
         for i in range(8)
     ]
 
@@ -887,7 +894,6 @@ def test_write_json_serializes_concurrent_writes(monkeypatch):
         t.join()
 
     lines = "".join(out.parts).splitlines()
-
     assert len(lines) == 8
     assert {json.loads(line)["seq"] for line in lines} == set(range(8))
 
