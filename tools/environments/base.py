@@ -555,10 +555,11 @@ class BaseEnvironment(ABC):
             self._quote_shell_path(self._snapshot_path + ".tmp.")
             + "$BASHPID.$RANDOM$RANDOM"
         )
+        _snap_tmp_ref = '"$__hermes_snap_tmp"'
         bootstrap = (
             f"__hermes_snap_tmp={_snap_tmp_expr}\n"
             f"umask 077\n"
-            f"{_export_dump_excluding_session_vars(_snap_tmp)}\n"
+            f"{_export_dump_excluding_session_vars(_snap_tmp_ref)}\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
             # — by NAME, not by line.  A naive ``declare -f | grep -vE '^_[^_]'``
@@ -672,6 +673,7 @@ class BaseEnvironment(ABC):
             self._quote_shell_path(self._snapshot_path + ".tmp.")
             + "$BASHPID.$RANDOM$RANDOM"
         )
+        _snap_tmp_ref = '"$__hermes_snap_tmp"'
 
         parts = []
 
@@ -703,7 +705,7 @@ class BaseEnvironment(ABC):
         # Chain mv on the export succeeding so a failed/partial dump never
         # replaces a good snapshot; drop the temp on failure so it isn't
         # orphaned (cleaned up wholesale in LocalEnvironment.cleanup too).
-        # NOTE: the redirection must be attached to a brace group — ``_snap_tmp``
+        # NOTE: the redirection must be attached to a brace group — ``__hermes_snap_tmp``
         # embeds ``$BASHPID``, and a redirect on a pipeline segment expands
         # inside that segment's subshell (a different PID than the parent that
         # expands the ``mv`` operand), silently orphaning the dump. See
@@ -711,9 +713,9 @@ class BaseEnvironment(ABC):
         if self._snapshot_ready:
             parts.append(f"__hermes_snap_tmp={_snap_tmp_expr}")
             parts.append(
-                f"{{ {_export_dump_excluding_session_vars(_snap_tmp)} "
-                f"&& mv -f {_snap_tmp} {_quoted_snap}; }} "
-                f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
+                f"{{ {_export_dump_excluding_session_vars(_snap_tmp_ref)} "
+                f"&& mv -f {_snap_tmp_ref} {_quoted_snap}; }} "
+                f"2>/dev/null || rm -f {_snap_tmp_ref} 2>/dev/null || true"
             )
 
         # Emit the CWD stdout marker; all backends (including local, since
