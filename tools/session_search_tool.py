@@ -872,11 +872,12 @@ def session_search(
             session_id = emb_id
             if emb_profile and (profile is None or not str(profile).strip()):
                 profile = emb_profile
+    profile_requested = profile is not None and bool(str(profile).strip())
 
     # Cross-profile read: swap in the named profile's DB (read-only) for every
     # shape below. The current-session-lineage guards no longer apply across
     # profiles, but they key off ids that won't collide, so they stay inert.
-    if profile is not None and str(profile).strip():
+    if profile_requested:
         try:
             profile_db = _resolve_profile_db(profile)
         except Exception as e:
@@ -902,7 +903,10 @@ def session_search(
         if json.loads(result).get("success"):
             return result
 
-        # Miss in the target profile — the model may have dropped the owning
+        if profile_requested:
+            return result
+
+        # No profile was requested, so the model may have dropped the owning
         # profile from the link. Scan every profile and read it from wherever
         # it lives, tagging the profile it was found in.
         located, owner = _locate_session_db(sid)
