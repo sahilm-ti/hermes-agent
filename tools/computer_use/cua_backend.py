@@ -335,11 +335,11 @@ def _select_capture_target(
     """
     candidates = [w for w in windows if not w["off_screen"]]
     pool = candidates
-    if not exact_target and not app_requested and sys.platform == "linux":
+    if not exact_target and not app_requested:
         real_apps = [w for w in candidates if _is_real_app_window(w)]
         if real_apps:
             pool = real_apps
-        if pool and _z_index_uninformative(pool):
+        if pool and sys.platform == "linux" and _z_index_uninformative(pool):
             active_id = _linux_x11_active_window_id()
             if active_id is not None:
                 for w in pool:

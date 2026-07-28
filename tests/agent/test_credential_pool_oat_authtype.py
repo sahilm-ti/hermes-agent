@@ -113,6 +113,16 @@ def test_profile_global_fallback_normalizes_in_memory_without_writing(tmp_path, 
     profile_home = global_root / "profiles" / "coder"
     profile_home.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_hermes_oauth_credentials",
+        lambda: None,
+    )
     token = "sk-ant-oat-global-fallback"
     global_auth = global_root / "auth.json"
     global_auth.write_text(json.dumps({

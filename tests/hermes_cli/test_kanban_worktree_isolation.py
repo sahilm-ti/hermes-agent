@@ -158,6 +158,7 @@ def test_resolve_worktree_same_branch_still_reuses(kanban_home, tmp_path):
             conn,
             title="returning task",
             workspace_kind="worktree",
+            workspace_path=str(repo),
         )
         own = _add_worktree(repo, repo / ".worktrees" / tid, f"wt/{tid}")
         conn.execute(
@@ -182,6 +183,7 @@ def test_resolve_worktree_own_path_on_foreign_branch_keeps_legacy_reuse(
             conn,
             title="foreign-branch checkout",
             workspace_kind="worktree",
+            workspace_path=str(repo),
         )
         own = _add_worktree(repo, repo / ".worktrees" / tid, "wt/foreign")
         conn.execute(

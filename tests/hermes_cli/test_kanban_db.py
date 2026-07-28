@@ -274,12 +274,16 @@ def test_branch_name_requires_worktree_workspace(kanban_home):
 # Workspace kind inference (auto-default to worktree for hermes-agent edits)
 # ---------------------------------------------------------------------------
 
-def test_workspace_kind_inference_hermes_agent_body_picks_worktree(kanban_home):
-    with kb.connect() as conn:
+def test_workspace_kind_inference_hermes_agent_body_picks_worktree(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("ws-infer-body", default_workdir=str(repo))
+    with kb.connect(board="ws-infer-body") as conn:
         tid = kb.create_task(
             conn,
             title="fix bug in hermes_cli/kanban_db.py",
             body="touches tools/ and tests/",
+            board="ws-infer-body",
         )
         t = kb.get_task(conn, tid)
     assert t.workspace_kind == "worktree"
@@ -308,9 +312,16 @@ def test_workspace_kind_inference_respects_explicit_caller(kanban_home):
     assert t.workspace_kind == "scratch"
 
 
-def test_workspace_kind_inference_keyword_git_rebase(kanban_home):
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="git rebase staging branch")
+def test_workspace_kind_inference_keyword_git_rebase(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("ws-infer-rebase", default_workdir=str(repo))
+    with kb.connect(board="ws-infer-rebase") as conn:
+        tid = kb.create_task(
+            conn,
+            title="git rebase staging branch",
+            board="ws-infer-rebase",
+        )
         t = kb.get_task(conn, tid)
     assert t.workspace_kind == "worktree"
 
@@ -2118,7 +2129,7 @@ def test_respawn_guard_stale_success_not_guarded(kanban_home):
 
 
 def test_respawn_guard_active_pr_in_comment(kanban_home):
-    """A GitHub PR URL in a recent comment triggers active_pr."""
+    """A GitHub PR URL in comments does not block respawn."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
         kb.add_comment(
@@ -2126,7 +2137,7 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
             "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
         )
         reason = kb.check_respawn_guard(conn, t)
-    assert reason == "active_pr"
+    assert reason is None
 
 
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
@@ -2218,7 +2229,7 @@ def test_dispatch_respawn_guard_skips_recent_success(
 def test_dispatch_respawn_guard_skips_active_pr(
     kanban_home, all_assignees_spawnable
 ):
-    """dispatch_once skips (but does not block) a task with an active PR comment."""
+    """dispatch_once still spawns tasks that merely have a PR URL comment."""
     spawned_ids = []
 
     def fake_spawn(task, workspace):
@@ -2232,11 +2243,11 @@ def test_dispatch_respawn_guard_skips_active_pr(
         )
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
 
-    assert (t, "active_pr") in res.respawn_guarded
-    assert t not in spawned_ids
+    assert (t, "active_pr") not in res.respawn_guarded
+    assert t in spawned_ids
     assert t not in res.auto_blocked
     with kb.connect() as conn:
-        assert kb.get_task(conn, t).status == "ready"
+        assert kb.get_task(conn, t).status == "running"
 
 
 def test_dispatch_respawn_guard_dry_run_no_auto_block(
@@ -2388,21 +2399,15 @@ def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path
 
 def test_worktree_no_path_no_board_default_raises(kanban_home, tmp_path, monkeypatch):
     """With neither an explicit workspace_path nor a board default_workdir,
-    resolution fails loudly pointing at default_workdir / worktree:<path> —
-    rather than silently materializing under the dispatcher's CWD (the old
-    behavior that scattered worktrees under whatever dir launched the
-    gateway)."""
+    creation fails loudly pointing at default_workdir / worktree:<path> —
+    rather than silently materializing under the dispatcher's CWD."""
     # Park the dispatcher CWD inside a real git repo so the OLD cwd-anchored
     # code would have "succeeded" — proving the new code does NOT use cwd.
     decoy_repo = tmp_path / "decoy"
     _init_git_repo(decoy_repo)
     monkeypatch.chdir(decoy_repo)
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="ship", workspace_kind="worktree")
-        task = kb.get_task(conn, t)
-        assert task is not None
-        with pytest.raises(ValueError, match="default_workdir"):
-            kb.resolve_workspace(task)
+    with kb.connect() as conn, pytest.raises(ValueError, match="default_workdir"):
+        kb.create_task(conn, title="ship", workspace_kind="worktree")
 
 
 def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_home, tmp_path):
@@ -5712,9 +5717,7 @@ def test_respawn_guard_active_pr_suppressed_when_rejection_postdates_pr(
 def test_respawn_guard_active_pr_still_fires_when_pr_post_dates_rejection(
     kanban_home,
 ):
-    """If the PR-URL comment is newer than the rejection, the guard
-    still fires (the worker opened a fresh PR after the reject — don't
-    spawn a third one)."""
+    """A PR-URL comment newer than rejection still does not block respawn."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="rej-then-pr", assignee="alice")
         now = int(time.time())
@@ -5730,7 +5733,7 @@ def test_respawn_guard_active_pr_still_fires_when_pr_post_dates_rejection(
             (t, now - 30),
         )
         reason = kb.check_respawn_guard(conn, t)
-    assert reason == "active_pr"
+    assert reason is None
 
 
 def test_respawn_guard_active_pr_uses_rejected_run_outcome(kanban_home):

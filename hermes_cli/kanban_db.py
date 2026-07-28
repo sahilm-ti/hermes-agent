@@ -246,6 +246,8 @@ def _check_hermes_config_on_main() -> Optional[str]:
             ["git", "-C", str(hermes_config), "branch", "--show-current"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=5,
         )
@@ -7957,7 +7959,12 @@ def ensure_worktree(task: Task, path: Path) -> None:
     try:
         existing = subprocess.run(
             ["git", "-C", str(live), "worktree", "list", "--porcelain"],
-            capture_output=True, text=True, check=False, timeout=15,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=15,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
         raise RuntimeError(f"git worktree list failed: {exc}") from exc
@@ -7979,7 +7986,12 @@ def ensure_worktree(task: Task, path: Path) -> None:
     base_ref = os.environ.get("HERMES_KANBAN_WORKTREE_BASE_REF", "").strip() or "myfork/main"
     branch_exists = subprocess.run(
         ["git", "-C", str(live), "rev-parse", "--verify", branch],
-        capture_output=True, text=True, check=False, timeout=15,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=15,
     ).returncode == 0
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -7988,7 +8000,15 @@ def ensure_worktree(task: Task, path: Path) -> None:
     else:
         cmd = ["git", "-C", str(live), "worktree", "add", str(path), "-b", branch, base_ref]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=60,
+        )
     except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
         raise RuntimeError(f"git worktree add failed: {exc}") from exc
     if result.returncode != 0:
@@ -8036,7 +8056,12 @@ def pin_workspace_git_identity(path: Path) -> None:
     # Detect whether the workspace is already inside a git repo.
     detect = subprocess.run(
         ["git", "-C", str(path), "rev-parse", "--git-dir"],
-        capture_output=True, text=True, check=False, timeout=10,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=10,
     )
     in_git_repo = detect.returncode == 0
 
@@ -8046,7 +8071,12 @@ def pin_workspace_git_identity(path: Path) -> None:
             try:
                 subprocess.run(
                     ["git", "-C", str(path), "config", key, value],
-                    capture_output=True, text=True, check=True, timeout=10,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=True,
+                    timeout=10,
                 )
             except Exception as exc:
                 _log.warning("pin_workspace_git_identity: git config %s failed: %s", key, exc)
@@ -8094,7 +8124,12 @@ def pin_workspace_git_identity(path: Path) -> None:
             subprocess.run(
                 ["git", "-C", str(path), "config", "core.hooksPath",
                  str(hooks_dir)],
-                capture_output=True, text=True, check=True, timeout=10,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+                timeout=10,
             )
         except Exception as exc:
             _log.warning(
@@ -8140,7 +8175,12 @@ def remove_worktree(task_id: str, path: Path) -> None:
     try:
         subprocess.run(
             ["git", "-C", str(live), "worktree", "remove", str(path), "--force"],
-            capture_output=True, text=True, check=False, timeout=30,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=30,
         )
     except Exception as exc:
         _log.debug("worktree remove failed for %s: %s", path, exc)
@@ -8151,14 +8191,24 @@ def remove_worktree(task_id: str, path: Path) -> None:
     try:
         subprocess.run(
             ["git", "-C", str(live), "branch", "-D", branch],
-            capture_output=True, text=True, check=False, timeout=15,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=15,
         )
     except Exception as exc:
         _log.debug("branch delete failed for %s: %s", branch, exc)
     try:
         subprocess.run(
             ["git", "-C", str(live), "worktree", "prune"],
-            capture_output=True, text=True, check=False, timeout=15,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=15,
         )
     except Exception:
         pass
