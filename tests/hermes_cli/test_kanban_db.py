@@ -3326,4 +3326,3 @@ def test_pin_workspace_git_identity_non_git_dir_is_noop(
     hooks_dir = plain_dir / ".hermes-hooks"
     assert hooks_dir.exists()
     assert (hooks_dir / "pre-commit").exists()
-
