@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -73,6 +74,7 @@ def _patch_profiles(monkeypatch, caller_home, target_home):
     from hermes_cli import profiles as profiles_mod
 
     Info = namedtuple("Info", "name path")
+    monkeypatch.setattr(Path, "home", lambda: caller_home.parent)
     monkeypatch.setattr(profiles_mod, "normalize_profile_name", lambda n: n)
     monkeypatch.setattr(profiles_mod, "validate_profile_name", lambda n: None)
     monkeypatch.setattr(profiles_mod, "profile_exists", lambda n: n in {"default", "target"})
