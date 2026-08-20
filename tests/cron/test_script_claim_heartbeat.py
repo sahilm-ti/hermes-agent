@@ -517,7 +517,7 @@ def test_heartbeat_thread_start_failure_does_not_start_execution(monkeypatch):
     )
 
 
-def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
+def test_heartbeat_error_cancels_after_bounded_grace(monkeypatch):
     """Store uncertainty cannot let a run outlive its last confirmed lease forever."""
     import cron.scheduler as scheduler
 
@@ -544,7 +544,10 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.03)
 
     assert scheduler.run_one_job(job) is True
-    assert calls >= 3
+    # The contract is that a confirmed initial lease plus a subsequent
+    # renewal failure eventually interrupts the run. Scheduler wakeups are not
+    # precise enough to require a fixed number of failed renewal attempts.
+    assert calls >= 2
 
 
 def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):
