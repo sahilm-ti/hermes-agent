@@ -13754,6 +13754,30 @@ def add_notify_sub(
             )
 
 
+def backfill_null_notifier_profile(
+    conn: sqlite3.Connection, notifier_profile: Optional[str]
+) -> int:
+    """Claim ownerless notification subscriptions for one profile.
+
+    Existing profile-owned subscriptions remain untouched. The notifier calls
+    this during startup before filtering subscriptions by profile ownership.
+    """
+    profile = (notifier_profile or "").strip()
+    if not profile:
+        return 0
+
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET notifier_profile = ?
+             WHERE notifier_profile IS NULL OR notifier_profile = ''
+            """,
+            (profile,),
+        )
+        return int(cur.rowcount or 0)
+
+
 def _notify_profile_filter(
     notifier_profiles: Optional[Iterable[str]],
     *,
