@@ -176,12 +176,15 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 # Workspace kind inference (auto-default to worktree for hermes-agent edits)
 # ---------------------------------------------------------------------------
 
-def test_workspace_kind_inference_hermes_agent_body_picks_worktree(kanban_home):
+def test_workspace_kind_inference_hermes_agent_body_picks_worktree(
+    kanban_home, tmp_path,
+):
     with kb.connect() as conn:
         tid = kb.create_task(
             conn,
             title="fix bug in hermes_cli/kanban_db.py",
             body="touches tools/ and tests/",
+            workspace_path=str(tmp_path / "infer-worktree-hermes-agent"),
         )
         t = kb.get_task(conn, tid)
     assert t.workspace_kind == "worktree"
@@ -210,9 +213,13 @@ def test_workspace_kind_inference_respects_explicit_caller(kanban_home):
     assert t.workspace_kind == "scratch"
 
 
-def test_workspace_kind_inference_keyword_git_rebase(kanban_home):
+def test_workspace_kind_inference_keyword_git_rebase(kanban_home, tmp_path):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="git rebase staging branch")
+        tid = kb.create_task(
+            conn,
+            title="git rebase staging branch",
+            workspace_path=str(tmp_path / "infer-worktree-git-rebase"),
+        )
         t = kb.get_task(conn, tid)
     assert t.workspace_kind == "worktree"
 
@@ -1038,11 +1045,10 @@ def test_cleanup_workspace_honors_workspaces_root_env_override(tmp_path, monkeyp
 
 
 def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_path):
-    """A non-scratch ('dir') child completing must still sweep its scratch parent.
+    """A non-scratch child completion must unblock parent scratch reaping.
 
-    Regression for the gap where ``_cleanup_workspace`` returned early for a
-    non-scratch task and never ran the parent sweep — leaking the parent's
-    deferred scratch dir forever.
+    Scratch cleanup is dispatcher-owned; the child completion path must still
+    leave the deferred parent eligible for ``gc_scratch_workspaces``.
     """
     child_dir = tmp_path / "persistent-child"
     child_dir.mkdir()
@@ -1061,10 +1067,12 @@ def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_
         assert parent_ws.exists(), "deferred while dir child active"
 
         kb.complete_task(conn, child, result="built")
+        reaped = kb.gc_scratch_workspaces(conn)
 
     assert not parent_ws.exists(), (
-        "A 'dir' child completing must trigger the parent scratch sweep"
+        "A 'dir' child completing must make the parent scratch workspace reapable"
     )
+    assert reaped == 1
     assert child_dir.exists(), "Non-scratch 'dir' child workspace is never deleted"
 
 
@@ -2537,9 +2545,11 @@ def test_respawn_guard_active_pr_suppressed_when_rejection_postdates_pr(
 def test_respawn_guard_active_pr_still_fires_when_pr_post_dates_rejection(
     kanban_home,
 ):
-    """If the PR-URL comment is newer than the rejection, the guard
-    still fires (the worker opened a fresh PR after the reject — don't
-    spawn a third one)."""
+    """PR URL comments never block respawn in the retained fork behavior.
+
+    Even if a PR comment is newer than the rejection, the task must respawn so
+    the worker can continue iterating on the same PR.
+    """
     with kb.connect() as conn:
         t = kb.create_task(conn, title="rej-then-pr", assignee="alice")
         now = int(time.time())
@@ -2555,7 +2565,7 @@ def test_respawn_guard_active_pr_still_fires_when_pr_post_dates_rejection(
             (t, now - 30),
         )
         reason = kb.check_respawn_guard(conn, t)
-    assert reason == "active_pr"
+    assert reason is None
 
 
 def test_respawn_guard_active_pr_uses_rejected_run_outcome(kanban_home):
