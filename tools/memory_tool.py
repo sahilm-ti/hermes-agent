@@ -1500,18 +1500,14 @@ def _build_memory_schema_overrides() -> Dict[str, Any]:
     description = MEMORY_SCHEMA["description"]
     if targets == ["memory"]:
         target_schema["description"] = "The enabled built-in store: 'memory' for personal notes."
-        description = description.replace(
-            "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
-            "notes (environment, conventions, tool quirks, lessons).",
-            "TARGET: only 'memory' is enabled for personal notes (environment, conventions, "
-            "tool quirks, lessons).",
+        description += (
+            "\n\nTARGET: only 'memory' is enabled for personal notes (environment, conventions, "
+            "tool quirks, lessons)."
         )
     elif targets == ["user"]:
         target_schema["description"] = "The enabled built-in store: 'user' for user profile."
-        description = description.replace(
-            "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
-            "notes (environment, conventions, tool quirks, lessons).",
-            "TARGET: only 'user' is enabled for user profile facts (name, role, preferences, style).",
+        description += (
+            "\n\nTARGET: only 'user' is enabled for user profile facts (name, role, preferences, style)."
         )
 
     return {"description": description, "parameters": parameters}
