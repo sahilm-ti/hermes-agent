@@ -798,6 +798,13 @@ class TestLaunchdServiceRecovery:
                 "<string>/Users/alice/.hermes</string></plist>"
             ),
         )
+        fixed_domain = f"gui/{os.getuid()}"
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: fixed_domain)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_domain_for_existing_job",
+            lambda label: fixed_domain,
+        )
         monkeypatch.setattr("gateway.status.get_running_pid", lambda *a, **k: 4242)
 
         def boom(cmd, **kwargs):
@@ -1641,7 +1648,7 @@ class TestGatewaySystemServiceRouting:
         monkeypatch.setattr(
             gateway_cli,
             "_wait_for_systemd_service_restart",
-            lambda system=False, previous_pid=None: calls.append(
+            lambda system=False, previous_pid=None, replacement_observed=None: calls.append(
                 ("wait", system, previous_pid)
             )
             or True,
