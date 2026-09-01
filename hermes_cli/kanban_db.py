@@ -8855,6 +8855,72 @@ def _resolve_worktree_workspace(
         # than failing dispatch.
         return requested_resolved, actual_branch or branch_name
 
+    # Project-linked tasks persist a canonical unresolved destination:
+    # ``<project-primary>/.worktrees/<task-id>``. Dispatch must materialize
+    # this worktree before worker spawn/preflight validates the workspace as a
+    # repo checkout.
+    if (
+        task.project_id
+        and requested.name == task.id
+        and requested.parent.name == ".worktrees"
+    ):
+        project_root = requested.parent.parent.resolve(strict=False)
+        destination = requested_resolved
+        if not project_root.exists():
+            _log.warning(
+                "kanban dispatch: project worktree root missing "
+                "(task=%s project_id=%s project_root=%s destination=%s)",
+                task.id,
+                task.project_id,
+                project_root,
+                destination,
+            )
+            raise ValueError(
+                f"task {task.id} project-linked worktree destination "
+                f"{str(destination)!r} cannot be materialized: project root "
+                f"{str(project_root)!r} does not exist"
+            )
+        if not project_root.is_dir():
+            _log.warning(
+                "kanban dispatch: project worktree root is not a directory "
+                "(task=%s project_id=%s project_root=%s destination=%s)",
+                task.id,
+                task.project_id,
+                project_root,
+                destination,
+            )
+            raise ValueError(
+                f"task {task.id} project-linked worktree destination "
+                f"{str(destination)!r} cannot be materialized: project root "
+                f"{str(project_root)!r} is not a directory"
+            )
+        project_repo = _git_toplevel(project_root)
+        if project_repo is None:
+            _log.warning(
+                "kanban dispatch: project worktree root is not in a git repo "
+                "(task=%s project_id=%s project_root=%s destination=%s)",
+                task.id,
+                task.project_id,
+                project_root,
+                destination,
+            )
+            raise ValueError(
+                f"task {task.id} project-linked worktree destination "
+                f"{str(destination)!r} cannot be materialized: project root "
+                f"{str(project_root)!r} is not inside a git repo"
+            )
+        _log.debug(
+            "kanban dispatch: materializing project worktree "
+            "(task=%s project_id=%s project_root=%s destination=%s branch=%s)",
+            task.id,
+            task.project_id,
+            project_root,
+            destination,
+            branch_name,
+        )
+        _ensure_git_worktree(project_repo, destination, branch_name)
+        return destination, branch_name
+
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
