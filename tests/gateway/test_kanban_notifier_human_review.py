@@ -43,6 +43,7 @@ def _make_runner(adapter):
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = object()
     return runner
 
 
